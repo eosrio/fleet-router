@@ -1,0 +1,21 @@
+[package]
+name = "fleet-router"
+version = "0.2.0"
+edition = "2021"
+description = """
+Fleet Router - Antelope SHiP Reverse Proxy & Load Balancer
+"""
+authors = ["Igor Lins e Silva", "EOS Rio"]
+repository = "https://github.com/eosrio/fleet-router"
+license = "MIT"
+categories = ["network-programming"]
+keywords = ["antelope", "ship", "state-history", "load-balancer", "websockets"]
+
+[dependencies]
+chrono = "0.4.37"
+futures = { version = "0.3.30", features = ["compat"] }
+rs_abieos = "0.1.5"
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "1.0.115"
+tokio = { version = "1.37.0", features = ["full"] }
+tokio-tungstenite = "0.21.0"

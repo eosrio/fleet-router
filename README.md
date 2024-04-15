@@ -2,6 +2,14 @@
 
 ![CI](https://github.com/eosrio/fleet-router/actions/workflows/cargo-build.yml/badge.svg)
 
+The `fleet-router` is a reverse proxy and load balancer dedicated to the Antelope SHiP protocol. The Fleet SHiP Router is built with Rust using [rs_abieos](https://github.com/eosrio/rs-abieos) for maximum efficiency.
+
+Major Features include:
+
+- **Resilient Connections:** the Fleet SHiP Router maintains persistent client-side connections even when backend servers go offline while there are other backend servers available. This eliminates the need for developers to manually handle reconnections, simplifying application logic.
+- **Intelligent Upstream Selection:** The router dynamically routes requests to the most appropriate SHiP server based on factors like data availability and server load. If a server lacks the requested data range, the router seamlessly redirects to a suitable alternative, ensuring a successful response for the user.
+
+
 ### Fleet Router - Antelope SHiP Reverse Proxy &amp; Load Balancer
 
 Installing Rust

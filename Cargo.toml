@@ -12,7 +12,10 @@ categories = ["network-programming"]
 keywords = ["antelope", "ship", "state-history", "load-balancer", "websockets"]
 
 [dependencies]
+anyhow = "1.0.82"
 chrono = "0.4.37"
+clap = { version = "4.5.4", features = ["derive", "string", "wrap_help", "unicode"] }
+color-print = "0.3.5"
 futures = { version = "0.3.30", features = ["compat"] }
 rs_abieos = "0.1.5"
 serde = { version = "1.0.197", features = ["derive"] }

@@ -1,54 +1,19 @@
-# fleet-router
-
-![CI](https://github.com/eosrio/fleet-router/actions/workflows/cargo-build.yml/badge.svg)
-
-### Fleet Router - Antelope SHiP Reverse Proxy &amp; Load Balancer
-
-Installing Rust
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-Installing  Fleet Router from `crates.io`
-
-```bash
-cargo install fleet-router
-```
-
-Installing Fleet Router from GitHub
-
-```bash
-git clone https://github.com/eosrio/fleet-router.git
-cd fleet-router
-cargo install --path .
-```
-
-Create the configuration file
-
-```bash
-fleet-router config init /path/to/config.json
-```
-
-Configuration Reference
-
-```json5
 {
   // Address to Listen for client connections
   "listen_address": "0.0.0.0",
-  
+
   // Port to listen for client connections
   "listen_port": 17000,
-  
+
   // Interval to attempt reconnection to the backend servers
   "upstream_reconnect_ms": 3000,
-  
+
   // Interval to log upstream status
   "upstream_monitoring_ms": 5000,
-  
+
   // Interval to send status requests to upstream servers
   "upstream_status_ms": 5000,
-  
+
   // Array of upstream SHiP nodes
   "servers": [
     {
@@ -63,11 +28,3 @@ Configuration Reference
     }
   ]
 }
-```
-
-Usage
-
-```
-fleet-router run --config /path/to/config.json
-```
-

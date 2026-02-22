@@ -262,15 +262,16 @@ fn process_args() -> Result<Option<(bool, ServerConfig)>> {
                     if let Some(config_out_path) = init.get_one::<PathBuf>("CONFIG_OUT") {
                         config_out_path.to_owned()
                     } else {
-                        PathBuf::from("./config.json").canonicalize().unwrap()
+                        PathBuf::from("./config.json")
                     }
                 };
+                write(&path, CONFIG_SAMPLE).unwrap();
+                let display_path = path.canonicalize().unwrap_or(path);
                 cprintln!(
                     "Creating new config file: <bright-cyan>{:?}</>",
-                    path.canonicalize().unwrap()
+                    display_path
                 );
-                write(&path, CONFIG_SAMPLE).unwrap();
-                cprintln!("Configuration saved!\nPlease edit and test it with: <green>fleet-router config test {}</>", path.canonicalize().unwrap().display());
+                cprintln!("Configuration saved!\nPlease edit and test it with: <green>fleet-router config test {}</>", display_path.display());
                 return Ok(None);
             }
             Some(("test", test)) => match test.get_one::<PathBuf>("CONFIG") {

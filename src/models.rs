@@ -57,20 +57,6 @@ impl ServerState {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GetStatusResultV0 {
-    pub head_block_num: u32,
-    pub head_block_id: String,
-    pub last_irreversible_block_num: u32,
-    pub last_irreversible_block_id: String,
-    pub trace_begin_block: u32,
-    pub trace_end_block: u32,
-    pub chain_state_begin_block: u32,
-    pub chain_state_end_block: u32,
-    pub chain_id: String,
-}
-
 
 #[derive(Debug, Clone)]
 pub struct StaticConfig {

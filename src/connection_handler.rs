@@ -29,14 +29,17 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         let endpoint = self.endpoint.clone();
         let db = self.backend_servers.clone();
-        tokio::spawn(async move {
-            let mut lock = db.lock().await;
-            if let Some(server) = lock.get_mut(&endpoint) {
-                if server.connections > 0 {
-                    server.connections -= 1;
+        // Only spawn if the Tokio runtime is still alive (prevents panic during shutdown)
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut lock = db.lock().await;
+                if let Some(server) = lock.get_mut(&endpoint) {
+                    if server.connections > 0 {
+                        server.connections -= 1;
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 }
 
@@ -46,7 +49,7 @@ async fn get_socket(
     max_attempts: u32,
 ) -> Option<(ConnectionGuard, WebSocketStream<MaybeTlsStream<TcpStream>>)> {
     for _ in 0..max_attempts {
-        // Select a backend server
+        // Select a backend server and optimistically increment counter
         let server = {
             let backend_servers_lock = &mut backend_servers.lock().await;
             let selected_backend = match select_backend_server(backend_servers_lock) {
@@ -55,8 +58,16 @@ async fn get_socket(
                     continue;
                 }
             };
+            // Optimistic increment — prevents thundering herd
+            if let Some(s) = backend_servers_lock.get_mut(&selected_backend) {
+                s.connections += 1;
+            }
             let server_config = server_config_db.lock().await;
             let Some(cfg) = server_config.get(&selected_backend) else {
+                // Rollback optimistic increment
+                if let Some(s) = backend_servers_lock.get_mut(&selected_backend) {
+                    s.connections -= 1;
+                }
                 continue;
             };
             cfg.clone()
@@ -71,13 +82,7 @@ async fn get_socket(
         match connect_async_with_config(server.ws_url(), Some(config), true).await {
             Ok((ws_stream, _)) => {
                 println!("[client_handler] Connected to the server {}", server.name);
-                {
-                    // Increment the connection counter
-                    let backend_server_lock = &mut backend_servers.lock().await;
-                    if let Some(s) = backend_server_lock.get_mut(&server.endpoint) {
-                        s.connections += 1;
-                    }
-                }
+                // Counter was already incremented optimistically
                 return Some((
                     ConnectionGuard {
                         endpoint: server.endpoint.clone(),
@@ -88,10 +93,11 @@ async fn get_socket(
             }
             Err(e) => {
                 eprintln!("[client_handler] Error connecting to the server: {}", e);
-                // mark this server as unavailable
+                // Rollback optimistic increment and mark offline
                 {
                     let backend_server_lock = &mut backend_servers.lock().await;
                     if let Some(s) = backend_server_lock.get_mut(&server.endpoint) {
+                        s.connections -= 1;
                         s.online = false;
                     }
                 }
@@ -195,7 +201,7 @@ pub async fn handle_client(
             let mut server_writer = server_writer_arc.lock().await;
             if let Err(e) = server_writer.send(msg).await {
                 eprintln!("[client_handler] Error sending to server: {}", e);
-                break;
+                continue; // Don't break — failover may swap the socket
             }
         }
 
@@ -275,8 +281,10 @@ pub async fn handle_client(
                     if b_num < expected {
                         continue; // drop duplicate block
                     }
+                    restarting = false;
+                } else {
+                    continue; // skip non-block frames until we sync up
                 }
-                restarting = false;
             }
 
             if let Some(b_num) = current_block {

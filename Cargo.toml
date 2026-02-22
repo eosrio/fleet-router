@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "mock-ship"]
+
 [package]
 name = "fleet-router"
 version = "0.2.0"
@@ -17,8 +20,14 @@ chrono = "0.4.37"
 clap = { version = "4.5.4", features = ["derive", "string", "wrap_help", "unicode"] }
 color-print = "0.3.5"
 futures = { version = "0.3.30", features = ["compat"] }
-rs_abieos = "0.1.5"
+rs_abieos = "0.3.0"
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.115"
 tokio = { version = "1.37.0", features = ["full"] }
-tokio-tungstenite = "0.21.0"
+tokio-tungstenite = "0.28.0"
+
+[dev-dependencies]
+mock-ship = { path = "mock-ship" }
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3"
+serde_json = "1"

@@ -9,11 +9,13 @@ use rs_abieos::Abieos;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream, tungstenite::Message};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 use crate::models::{Server, ServerState, StaticConfig};
 use crate::zcd;
 use crate::zcd::ZCDValues;
+
+type WsSender = Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>;
 
 pub async fn state_monitoring_loop(
     server_state_db_clone: Arc<Mutex<HashMap<String, ServerState>>>,
@@ -32,8 +34,12 @@ pub async fn state_monitoring_loop(
                 stale_counter.insert(server.clone(), 0);
             }
 
-            let last_block_number = last_block.get_mut(server).unwrap();
-            let stale_counter = stale_counter.get_mut(server).unwrap();
+            let Some(last_block_number) = last_block.get_mut(server) else {
+                continue;
+            };
+            let Some(stale_counter) = stale_counter.get_mut(server) else {
+                continue;
+            };
 
             if state.chain_state_end_block > *last_block_number {
                 *last_block_number = state.chain_state_end_block;
@@ -54,13 +60,10 @@ pub async fn state_monitoring_loop(
     }
 }
 
-pub async fn send_status_loop(
-    sender: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
-    interval_ms: u64,
-) -> () {
+pub async fn send_status_loop(sender: WsSender, interval_ms: u64) -> () {
     loop {
         sleep(Duration::from_millis(interval_ms)).await;
-        let message = Message::Binary(vec![0]);
+        let message = Message::Binary(vec![0u8].into());
         let mut s = sender.lock().await;
         match s.send(message).await {
             Ok(_) => (),
@@ -118,9 +121,10 @@ pub async fn monitoring_connection(
                     ship_abi = None;
 
                     // mark the server as offline
-                    let server_state_db = &mut server_state_db_clone.lock().await;
-                    let state = server_state_db.get_mut(&server.endpoint).unwrap();
-                    state.online = false;
+                    let mut db = server_state_db_clone.lock().await;
+                    if let Some(state) = db.get_mut(&server.endpoint) {
+                        state.online = false;
+                    }
                     break;
                 }
                 _ => {
@@ -138,7 +142,7 @@ pub async fn monitoring_connection(
                 &server_state_db_clone,
                 &server,
             )
-                .await;
+            .await;
 
             if server_closed {
                 break;
@@ -163,20 +167,20 @@ async fn handle_monitoring_msg(
     server_closed: &mut bool,
     ship_abi: &mut Option<String>,
     abieos_arc_clone: &Arc<Mutex<Abieos>>,
-    sender: &Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
+    sender: &WsSender,
     server_state_db_clone: &Arc<Mutex<HashMap<String, ServerState>>>,
     server: &Server,
 ) -> () {
     match message {
         Message::Text(msg) => {
             if ship_abi.is_none() {
-                *ship_abi = Some(msg);
+                *ship_abi = Some(msg.to_string());
                 let abieos = abieos_arc_clone.lock().await;
-                println!("Abieos Context: {:?}", abieos.context.unwrap());
-                match abieos.set_abi_json_native(0u64, ship_abi.clone().unwrap()) {
+                println!("Abieos Context: {:?}", abieos.as_ptr());
+                match abieos.set_abi_json_native(0u64, ship_abi.as_deref().unwrap()) {
                     Ok(x) => {
                         if x {
-                            let message = Message::Binary(vec![0]);
+                            let message = Message::Binary(vec![0u8].into());
                             let mut s = sender.lock().await;
                             s.send(message).await.unwrap_or_else(|e| {
                                 eprintln!("Error sending message: {}", e);
@@ -193,40 +197,51 @@ async fn handle_monitoring_msg(
         }
         Message::Binary(bin_msg) => {
             let result_message = zcd::deserialize_result(&bin_msg);
-            let variant = result_message.get("variant").unwrap();
-            match variant {
-                ZCDValues::U8(v) => {
-                    let data = result_message.get("data").unwrap();
-                    match data {
-                        ZCDValues::Bytes(bytes) => {
-                            if v == 0 {
-                                let result = zcd::deserialize_status_result(&bytes);
-                                let head_block_num: u32 =
-                                    result.get("head_block_num").unwrap().into();
-                                if head_block_num > 0 {
-                                    let server_state_db = &mut server_state_db_clone.lock().await;
-                                    let state = server_state_db.get_mut(&server.endpoint).unwrap();
-                                    state.enabled = true;
-                                    state.online = true;
-                                    state.trace_begin_block =
-                                        result.get("trace_begin_block").unwrap().into();
-                                    state.trace_end_block =
-                                        result.get("trace_end_block").unwrap().into();
-                                    state.chain_state_begin_block =
-                                        result.get("chain_state_begin_block").unwrap().into();
-                                    state.chain_state_end_block =
-                                        result.get("chain_state_end_block").unwrap().into();
+
+            let Some(variant) = result_message.get("variant") else {
+                return;
+            };
+            if let ZCDValues::U8(v) = variant {
+                if v == 0 {
+                    let Some(data) = result_message.get("data") else {
+                        return;
+                    };
+                    if let ZCDValues::Bytes(bytes) = data {
+                        let result = zcd::deserialize_status_result(&bytes);
+
+                        let Some(ZCDValues::U32(head_block_num)) = result.get("head_block_num")
+                        else {
+                            return;
+                        };
+                        if head_block_num > 0 {
+                            let mut server_state_db = server_state_db_clone.lock().await;
+                            if let Some(state) = server_state_db.get_mut(&server.endpoint) {
+                                state.enabled = true;
+                                state.online = true;
+                                if let Some(ZCDValues::U32(tb)) = result.get("trace_begin_block") {
+                                    state.trace_begin_block = tb;
+                                }
+                                if let Some(ZCDValues::U32(te)) = result.get("trace_end_block") {
+                                    state.trace_end_block = te;
+                                }
+                                if let Some(ZCDValues::U32(cb)) =
+                                    result.get("chain_state_begin_block")
+                                {
+                                    state.chain_state_begin_block = cb;
+                                }
+                                if let Some(ZCDValues::U32(ce)) =
+                                    result.get("chain_state_end_block")
+                                {
+                                    state.chain_state_end_block = ce;
                                 }
                             }
                         }
-                        _ => {
-                            eprintln!("Received unexpected type for variant");
-                        }
+                    } else {
+                        eprintln!("Received unexpected type for status data");
                     }
                 }
-                _ => {
-                    eprintln!("Received unexpected binary message");
-                }
+            } else {
+                eprintln!("Received unexpected type for variant");
             }
         }
         Message::Close(_) => {

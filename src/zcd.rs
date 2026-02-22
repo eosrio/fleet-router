@@ -107,9 +107,9 @@ impl From<ZCDValues> for String {
     }
 }
 
-impl Into<ZCDValues> for u8 {
-    fn into(self) -> ZCDValues {
-        ZCDValues::U8(self)
+impl From<u8> for ZCDValues {
+    fn from(val: u8) -> Self {
+        ZCDValues::U8(val)
     }
 }
 
@@ -154,6 +154,7 @@ impl ZCDField<'_> {
     }
 }
 
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug)]
 pub struct ZCD<'a> {
     pub buffer: &'a [u8],
@@ -181,7 +182,7 @@ impl ZCD<'_> {
                 ZCDType::Checksum256 => Some(ZCDValues::Checksum256(f.as_checksum256())),
                 ZCDType::String => Some(ZCDValues::String(f.as_string())),
                 ZCDType::Bytes => Some(ZCDValues::Bytes(f.slice.to_vec())),
-                ZCDType::Array => Some(ZCDValues::Array(f.slice.to_vec()))
+                ZCDType::Array => Some(ZCDValues::Array(f.slice.to_vec())),
             },
         }
     }
@@ -202,7 +203,7 @@ pub const GET_BLOCKS_ACK_REQUEST_V0_FIELDS: [(&ZCDType, &str, usize); 1] =
     [(&U32, "num_messages", 4)];
 
 // Field Name, Field Size, is bounded
-pub const RESULT_V0_FIELDS: [(&'static ZCDType, &str, usize); 2] =
+pub const RESULT_V0_FIELDS: [(&ZCDType, &str, usize); 2] =
     [(&U8, "variant", 1), (&Bytes, "data", 0)];
 
 pub const STATUS_RESULT_V0_FIELDS: [(&ZCDType, &str, usize); 9] = [
@@ -220,20 +221,21 @@ pub const STATUS_RESULT_V0_FIELDS: [(&ZCDType, &str, usize); 9] = [
 fn zcd_builder<'a>(buffer: &'a [u8], fields: &'a [(&ZCDType, &str, usize)]) -> ZCD<'a> {
     let mut offset = 0;
     let mut hash_map = HashMap::new();
-    let mut index = 0;
-    for (f_type, field, size) in fields.iter() {
+    for (index, (f_type, field, size)) in fields.iter().enumerate() {
         match f_type {
             Array => {
                 // unbounded fields in the middle of the array
+                if offset >= buffer.len() { break; }
                 let elements = buffer[offset];
                 let full_size = 1 + size * elements as usize;
+                if offset + full_size > buffer.len() { break; }
                 let field_buffer = &buffer[offset..offset + full_size];
                 hash_map.insert(
                     field.to_string(),
                     ZCDField {
                         slice: field_buffer,
                         size: full_size,
-                        f_type: *f_type,
+                        f_type,
                     },
                 );
                 offset += full_size;
@@ -250,27 +252,27 @@ fn zcd_builder<'a>(buffer: &'a [u8], fields: &'a [(&ZCDType, &str, usize)]) -> Z
                             ZCDField {
                                 slice: field_buffer,
                                 size: buffer.len() - offset,
-                                f_type: *f_type,
+                                f_type,
                             },
                         );
                         break;
                     }
                 } else {
                     // bounded fields
+                    if offset + size > buffer.len() { break; }
                     let field_buffer = &buffer[offset..offset + size];
                     hash_map.insert(
                         field.to_string(),
                         ZCDField {
                             slice: field_buffer,
                             size: *size,
-                            f_type: *f_type,
+                            f_type,
                         },
                     );
                     offset += size;
                 }
             }
         }
-        index += 1;
     }
     ZCD::from(buffer, hash_map)
 }
@@ -282,10 +284,10 @@ pub fn deserialize_with<'a, 'b: 'a>(
     zcd_builder(buffer, fields)
 }
 
-pub fn deserialize_status_result(buffer: &[u8]) -> ZCD {
+pub fn deserialize_status_result(buffer: &[u8]) -> ZCD<'_> {
     zcd_builder(buffer, &STATUS_RESULT_V0_FIELDS)
 }
 
-pub fn deserialize_result(buffer: &[u8]) -> ZCD {
+pub fn deserialize_result(buffer: &[u8]) -> ZCD<'_> {
     zcd_builder(buffer, &RESULT_V0_FIELDS)
 }

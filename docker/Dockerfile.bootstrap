@@ -1,0 +1,40 @@
+# Multi-stage build: compile reference-contracts, then run bootstrap
+FROM ubuntu:22.04 AS builder
+
+ARG CDT_VERSION=4.1.1
+ARG CDT_DEB=https://github.com/AntelopeIO/cdt/releases/download/v${CDT_VERSION}/cdt_${CDT_VERSION}-1_amd64.deb
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    curl ca-certificates git cmake build-essential && \
+    curl -fsSL -o /tmp/cdt.deb "${CDT_DEB}" && \
+    apt-get install -y /tmp/cdt.deb && \
+    rm /tmp/cdt.deb && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Clone and build reference-contracts
+RUN git clone --depth 1 https://github.com/AntelopeIO/reference-contracts.git /contracts
+WORKDIR /contracts/build
+RUN cmake .. && make -j$(nproc)
+
+# --- Runtime stage ---
+FROM ubuntu:22.04
+
+ARG SPRING_VERSION=1.2.2
+ARG DEB_URL=https://github.com/AntelopeIO/spring/releases/download/v${SPRING_VERSION}/antelope-spring_${SPRING_VERSION}_amd64.deb
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl ca-certificates jq && \
+    curl -fsSL -o /tmp/spring.deb "${DEB_URL}" && \
+    apt-get install -y /tmp/spring.deb && \
+    rm /tmp/spring.deb && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Copy compiled contracts from builder
+COPY --from=builder /contracts/build/contracts/eosio.boot /opt/contracts/eosio.boot
+COPY --from=builder /contracts/build/contracts/eosio.token /opt/contracts/eosio.token
+
+COPY bootstrap.sh /opt/bootstrap.sh
+RUN chmod +x /opt/bootstrap.sh
+
+ENTRYPOINT ["/opt/bootstrap.sh"]

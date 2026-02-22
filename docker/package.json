@@ -1,0 +1,8 @@
+{
+    "name": "fleet-router-loadgen",
+    "version": "1.0.0",
+    "private": true,
+    "dependencies": {
+        "@wharfkit/antelope": "^1.0.0"
+    }
+}

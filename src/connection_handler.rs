@@ -1,26 +1,50 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use rs_abieos::Abieos;
+use tokio::sync::Notify;
 use tokio::net::TcpStream;
 use tokio::spawn;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tokio_tungstenite::{accept_async, connect_async_with_config, MaybeTlsStream, tungstenite, WebSocketStream};
-use tungstenite::Message;
-use tungstenite::protocol::{CloseFrame, WebSocketConfig};
+use tokio_tungstenite::{
+    accept_async, connect_async_with_config, tungstenite, MaybeTlsStream, WebSocketStream,
+};
 use tungstenite::protocol::frame::coding::CloseCode;
+use tungstenite::protocol::{CloseFrame, WebSocketConfig};
+use tungstenite::Message;
 
 use crate::functions::select_backend_server;
-use crate::models::{GetBlocksRequest, ServerConfigDb, ServerStateDb};
-use crate::zcd::{deserialize_result, ZCDValues};
+use crate::models::{ServerConfigDb, ServerStateDb};
+
+
+pub struct ConnectionGuard {
+    pub endpoint: String,
+    pub backend_servers: ServerStateDb,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let endpoint = self.endpoint.clone();
+        let db = self.backend_servers.clone();
+        tokio::spawn(async move {
+            let mut lock = db.lock().await;
+            if let Some(server) = lock.get_mut(&endpoint) {
+                if server.connections > 0 {
+                    server.connections -= 1;
+                }
+            }
+        });
+    }
+}
 
 async fn get_socket(
     backend_servers: &ServerStateDb,
     server_config_db: &ServerConfigDb,
     max_attempts: u32,
-) -> Option<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+) -> Option<(ConnectionGuard, WebSocketStream<MaybeTlsStream<TcpStream>>)> {
     for _ in 0..max_attempts {
         // Select a backend server
         let server = {
@@ -32,7 +56,10 @@ async fn get_socket(
                 }
             };
             let server_config = server_config_db.lock().await;
-            server_config.get(&selected_backend).unwrap().clone()
+            let Some(cfg) = server_config.get(&selected_backend) else {
+                continue;
+            };
+            cfg.clone()
         };
 
         let mut config = WebSocketConfig::default();
@@ -47,22 +74,26 @@ async fn get_socket(
                 {
                     // Increment the connection counter
                     let backend_server_lock = &mut backend_servers.lock().await;
-                    backend_server_lock
-                        .get_mut(&server.endpoint)
-                        .unwrap()
-                        .connections += 1;
+                    if let Some(s) = backend_server_lock.get_mut(&server.endpoint) {
+                        s.connections += 1;
+                    }
                 }
-                return Some(ws_stream);
+                return Some((
+                    ConnectionGuard {
+                        endpoint: server.endpoint.clone(),
+                        backend_servers: backend_servers.clone(),
+                    },
+                    ws_stream,
+                ));
             }
             Err(e) => {
                 eprintln!("[client_handler] Error connecting to the server: {}", e);
                 // mark this server as unavailable
                 {
                     let backend_server_lock = &mut backend_servers.lock().await;
-                    backend_server_lock
-                        .get_mut(&server.endpoint)
-                        .unwrap()
-                        .online = false;
+                    if let Some(s) = backend_server_lock.get_mut(&server.endpoint) {
+                        s.online = false;
+                    }
                 }
                 continue;
             }
@@ -75,10 +106,6 @@ async fn get_socket(
     None
 }
 
-enum DSChannelEvent {
-    Binary(Vec<u8>),
-    Text(String),
-}
 
 pub async fn handle_client(
     client_stream: TcpStream,
@@ -98,9 +125,9 @@ pub async fn handle_client(
 
     println!("New incoming WebSocket connection: {}", client_address);
 
-    let server_socket = get_socket(&backend_servers, &server_config_db, 3).await;
-
-    if server_socket.is_none() {
+    let Some((mut _active_conn, server_socket)) =
+        get_socket(&backend_servers, &server_config_db, 3).await
+    else {
         eprintln!("[client_handler] No upstream server available! Closing connection.");
         // Gracefully close the client connection
         let _ = client_websocket
@@ -110,7 +137,7 @@ pub async fn handle_client(
             }))
             .await;
         return;
-    }
+    };
 
     // Split the client websocket
     let (client_writer, mut client_reader) = client_websocket.split();
@@ -118,12 +145,13 @@ pub async fn handle_client(
     // Add the client writer to a Mutex
     let client_writer = Arc::new(Mutex::new(client_writer));
     let server_ship_abi: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let last_request: Arc<Mutex<Option<GetBlocksRequest>>> = Arc::new(Mutex::new(None));
+    // Store raw binary request bytes (V0 or V1) for failover replay
+    let last_request: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
 
     // Get the server WebSocket reader and writer
-    let (server_writer, server_reader) = server_socket.unwrap().split();
+    let (server_writer, server_reader_stream) = server_socket.split();
     // Add the server reader and writer to a Mutex
-    let server_reader = Arc::new(Mutex::new(server_reader));
+    let server_reader = Arc::new(Mutex::new(server_reader_stream));
     let server_writer = Arc::new(Mutex::new(server_writer));
 
     // Store the server's ABI
@@ -131,14 +159,15 @@ pub async fn handle_client(
     {
         let ship_abi_arc = server_ship_abi.clone();
         let server_reader_arc = server_reader.clone();
-        let mut server_reader = server_reader_arc.lock().await;
-        if let Some(Ok(Message::Text(text))) = server_reader.next().await {
+        let mut server_reader_guard = server_reader_arc.lock().await;
+        if let Some(Ok(Message::Text(text))) = server_reader_guard.next().await {
             let abieos = shared_abieos_arc.lock().await;
-            abieos
-                .set_abi_json("0", text.clone())
-                .expect("Error setting ABI");
+            if let Err(e) = abieos.set_abi_json("0", &text) {
+                eprintln!("[client_handler] Error setting ABI: {}", e);
+                return;
+            }
             let mut server_ship_abi = ship_abi_arc.lock().await;
-            *server_ship_abi = Some(text);
+            *server_ship_abi = Some(text.to_string());
         } else {
             eprintln!("[client_handler] Error reading first message from server");
             return;
@@ -148,49 +177,31 @@ pub async fn handle_client(
     // Client loop on a sub-task
     let last_request_arc = last_request.clone();
     let server_writer_arc = server_writer.clone();
-    let shared_abieos_arc = shared_abieos.clone();
+    let client_disconnected = Arc::new(AtomicBool::new(false));
+    let client_disconnect_notify = Arc::new(Notify::new());
 
+    let client_disconnected_tx = client_disconnected.clone();
+    let client_disconnect_notify_tx = client_disconnect_notify.clone();
     // Forward messages from the client to the server, with request inspection
     spawn(async move {
         while let Some(Ok(msg)) = client_reader.next().await {
-            // println!("[client_handler] Received message from client: {:?}", msg);
-
-            // decode the message
-            if let Message::Binary(bin_msg) = &msg {
-                let result_message = deserialize_result(&bin_msg);
-
-                let variant: Option<u8> = match result_message.get("variant") {
-                    Some(ZCDValues::U8(v)) => Some(v),
-                    _ => None,
-                };
-
-                if let Some(v) = variant {
-                    if let Some(ZCDValues::Bytes(data)) = result_message.get("data") {
-                        if v == 1 {
-                            // deserialize the request with abieos + serde
-                            let abieos = shared_abieos_arc.lock().await;
-                            let request = abieos
-                                .bin_to_json("0", "get_blocks_request_v0", data)
-                                .expect("[ABIEOS] Error deserializing request");
-
-                            let request: GetBlocksRequest = serde_json::from_str(request.as_str())
-                                .expect("[SERDE] Error deserializing request");
-
-                            let mut last_request = last_request_arc.lock().await;
-                            *last_request = Some(request);
-                        }
-                    }
+            // Intercept V0 (variant 1) and V1 (variant 3) block requests — store raw bytes
+            if let Message::Binary(ref bin_msg) = msg {
+                if bin_msg.len() >= 5 && (bin_msg[0] == 1 || bin_msg[0] == 3) {
+                    *last_request_arc.lock().await = Some(bin_msg.to_vec());
                 }
             }
 
             let mut server_writer = server_writer_arc.lock().await;
-            server_writer
-                .send(msg)
-                .await
-                .expect("Error sending message to server");
+            if let Err(e) = server_writer.send(msg).await {
+                eprintln!("[client_handler] Error sending to server: {}", e);
+                break;
+            }
         }
 
         println!("Client stream ended");
+        client_disconnected_tx.store(true, Ordering::Release);
+        client_disconnect_notify_tx.notify_one();
     });
 
     // Send the server's ABI to the client
@@ -198,109 +209,20 @@ pub async fn handle_client(
     {
         let server_ship_abi = ship_abi_arc.lock().await;
         let client_writer_clone = client_writer.clone();
-        match &*server_ship_abi {
-            Some(abi) => {
-                println!("[client_handler] Sending ABI to client...");
-                let mut client_writer = client_writer_clone.lock().await;
-                client_writer
-                    .send(Message::Text(abi.clone()))
-                    .await
-                    .expect("Error sending ABI to client");
+        if let Some(abi) = &*server_ship_abi {
+            println!("[client_handler] Sending ABI to client...");
+            let mut client_writer = client_writer_clone.lock().await;
+            if let Err(e) = client_writer
+                .send(Message::Text(abi.as_str().into()))
+                .await
+            {
+                eprintln!("[client_handler] Error sending ABI to client: {}", e);
+                return;
             }
-            None => {}
         }
     }
 
-    // create channel to async handle deserialization for forwarded blocks from server to client
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<DSChannelEvent>(32);
-    let (forward_tx, mut forward_rx) = tokio::sync::mpsc::channel::<Option<Vec<u8>>>(32);
-
-    let shared_abieos_arc = shared_abieos.clone();
-    let last_request_arc = last_request.clone();
-    spawn(async move {
-        let mut last_block: u32 = 0;
-        let mut saved_message: Box<Vec<u8>> = Box::new(vec![]);
-        let mut hold_message = false;
-        loop {
-            match rx.recv().await {
-                Some(DSChannelEvent::Text(txt)) => {
-                    if txt == "update_last_request".to_string() {
-                        let mut last_request = last_request_arc.lock().await;
-                        if let Some(req) = &*last_request {
-                            let mut updated_req = req.clone();
-                            updated_req.start_block_num = last_block + 1;
-                            *last_request = Some(updated_req);
-                            hold_message = true;
-                        }
-                    } else if txt == "forward_limited".to_string() {
-                        // send message to client
-                        let last_request = last_request_arc.lock().await;
-                        if let Some(req) = &*last_request {
-                            println!(
-                                "last_block: {} | req.start_block_num: {}",
-                                last_block, req.start_block_num
-                            );
-
-                            // send None to client if the last block is less than the start block
-                            if last_block >= req.start_block_num {
-                                forward_tx
-                                    .send(Some(*saved_message.clone()))
-                                    .await
-                                    .expect("Error sending message to channel");
-                            } else {
-                                forward_tx
-                                    .send(None)
-                                    .await
-                                    .expect("Error sending message to channel");
-                                println!("Ignored block number: {}", last_block);
-                            }
-                        }
-                    }
-                }
-                Some(DSChannelEvent::Binary(msg)) => {
-                    if hold_message {
-                        saved_message = Box::new(msg.clone());
-                    }
-
-                    // use zero copy deserialization
-                    let result = deserialize_result(&msg);
-                    match result.get("variant") {
-                        Some(ZCDValues::U8(v)) => {
-                            if v == 1 {
-                                let data = result.get("data").unwrap();
-                                if let ZCDValues::Bytes(data) = data {
-                                    let abieos = shared_abieos_arc.lock().await;
-
-                                    // decode block result
-                                    let result = abieos
-                                        .bin_to_json("0", "get_blocks_result_v0", data)
-                                        .expect("[ABIEOS] Error deserializing result");
-
-                                    // parse to object
-                                    let block_result: serde_json::Value =
-                                        serde_json::from_str(&result.as_str())
-                                            .expect("[SERDE] Error deserializing result");
-
-                                    // inspect the result
-                                    last_block = block_result["this_block"]["block_num"]
-                                        .as_u64()
-                                        .take()
-                                        .unwrap()
-                                        as u32;
-
-                                    // println!("Last Received Block: {}", &last_block);
-                                }
-                            }
-                        }
-                        _ => {}
-                    };
-                }
-                None => {}
-            }
-        }
-    });
-
-    // Server loop
+    // Server loop — inline block tracking (zero-copy, no background task)
     let client_writer_arc = client_writer.clone();
     let server_reader_arc = server_reader.clone();
     let ship_abi_arc = server_ship_abi.clone();
@@ -310,41 +232,61 @@ pub async fn handle_client(
     let mut server_reader = server_reader_arc.lock().await;
 
     let mut restarting = false;
+    let mut last_seen_block: Option<u32> = None;
 
-    let tx1 = tx.clone();
+    let client_disconnected_rx = client_disconnected.clone();
+    let client_disconnect_notify_rx = client_disconnect_notify.clone();
     loop {
         // Keep forwarding messages from the server to the client
         let mut client_down = false;
-        while let Some(Ok(msg)) = server_reader.next().await {
-            match msg.clone() {
-                Message::Binary(bin_data) => {
-                    tx1.send(DSChannelEvent::Binary(bin_data))
-                        .await
-                        .expect("Error sending message to channel");
-                }
-                _ => {}
+        loop {
+            // Check if client already disconnected before blocking on server
+            if client_disconnected_rx.load(Ordering::Acquire) {
+                println!("[client_handler] Client already disconnected");
+                client_down = true;
+                break;
             }
-
-            let mut final_msg = msg;
-
-            if restarting {
-                tx1.send(DSChannelEvent::Text(String::from("forward_limited")))
-                    .await
-                    .expect("Error sending message to channel");
-                let processed_data = forward_rx.recv().await;
-                if let Some(Some(data)) = processed_data {
-                    final_msg = Message::Binary(data);
-                    restarting = false;
-                }
-            }
-
-            match client_writer.send(final_msg).await {
-                Err(e) => {
-                    eprintln!("[client_handler] Error sending message to client: {}", e);
+            let msg = tokio::select! {
+                msg = server_reader.next() => msg,
+                _ = client_disconnect_notify_rx.notified() => {
+                    println!("[client_handler] Client disconnected while waiting for server data");
                     client_down = true;
                     break;
                 }
-                _ => {}
+            };
+            let Some(Ok(msg)) = msg else { break; };
+
+            // Extract block_num from binary layout (zero-copy):
+            // get_blocks_result_v0 (variant 1) or v1 (variant 2)
+            // variant(1) + head(4+32) + lib(4+32) + this_block_flag(1) = offset 74
+            let mut current_block: Option<u32> = None;
+            if let Message::Binary(ref bin) = msg {
+                if bin.len() >= 78 && (bin[0] == 1 || bin[0] == 2) && bin[73] == 1 {
+                    if let Ok(bytes) = bin[74..78].try_into() {
+                        current_block = Some(u32::from_le_bytes(bytes));
+                    }
+                }
+            }
+
+            // Inline dedup during failover (no clones, no channels)
+            if restarting {
+                if let Some(b_num) = current_block {
+                    let expected = last_seen_block.map_or(0, |b| b + 1);
+                    if b_num < expected {
+                        continue; // drop duplicate block
+                    }
+                }
+                restarting = false;
+            }
+
+            if let Some(b_num) = current_block {
+                last_seen_block = Some(b_num);
+            }
+
+            if let Err(e) = client_writer.send(msg).await {
+                eprintln!("[client_handler] Error sending message to client: {}", e);
+                client_down = true;
+                break;
             }
         } // end of server reader loop
 
@@ -353,34 +295,46 @@ pub async fn handle_client(
             break;
         }
 
-        tx1.send(DSChannelEvent::Text("update_last_request".to_string()))
-            .await
-            .expect("Error sending update_last_request to channel");
+        // Update last_request with the actual next block for failover replay
+        {
+            let mut lr = last_request.lock().await;
+            if let Some(ref mut req_bytes) = *lr {
+                if let Some(lb) = last_seen_block {
+                    let next_block = lb + 1;
+                    if req_bytes.len() >= 5 {
+                        req_bytes[1..5].copy_from_slice(&next_block.to_le_bytes());
+                    }
+                }
+                // If last_seen_block is None, keep original start_block (no blocks were sent)
+            }
+        }
 
         println!("[client_handler] Server stream ended");
 
         // now we must select another server to reconnect
-        let server_socket = get_socket(&backend_servers, &server_config_db, 3).await;
-        if server_socket.is_none() {
+        let Some((new_conn, new_stream)) = get_socket(&backend_servers, &server_config_db, 3).await
+        else {
             eprintln!("[client_handler] No upstream server available! Closing connection.");
             break;
-        }
+        };
+        _active_conn = new_conn; // drops the old guard, decrementing its counter
 
         // Re-split and update mutexes
-        let mut server_writer = server_writer.lock().await;
-        let (writer, reader) = server_socket.unwrap().split();
+        let mut server_writer_lock = server_writer.lock().await;
+        let (writer, reader) = new_stream.split();
         *server_reader = reader;
-        *server_writer = writer;
+        *server_writer_lock = writer;
+        drop(server_writer_lock);
 
         // Get the first message from the server
         let first_message = server_reader.next().await;
         if let Some(Ok(Message::Text(text))) = first_message {
             // Use abieos to set the ABI and confirm that the server response is valid
             let abieos = shared_abieos_arc.lock().await;
-            match abieos.set_abi_json("0", text.clone()) {
+            match abieos.set_abi_json("0", &text) {
                 Ok(_) => {
                     let mut server_ship_abi = ship_abi_arc.lock().await;
-                    *server_ship_abi = Some(text);
+                    *server_ship_abi = Some(text.to_string());
                     println!("[client_handler] ABI set successfully");
                 }
                 Err(e) => {
@@ -393,31 +347,20 @@ pub async fn handle_client(
             break;
         }
 
-        // Sleep for 1 second before resuming
+        // Sleep briefly before resuming
         sleep(Duration::from_millis(100)).await;
 
-        // Replay the last request
-        let last_request = last_request.lock().await;
-        if let Some(req) = &*last_request {
-            // serialize the request
-            let request_payload = ("get_blocks_request_v0", req);
-            let json = serde_json::to_string(&request_payload).unwrap();
-            // encode to ship format
-            let abieos = shared_abieos_arc.lock().await;
-            match abieos.json_to_bin("0", "request", json) {
-                Ok(serialized) => {
-                    let msg = Message::Binary(serialized);
-                    // send the message to the server
-                    server_writer
-                        .send(msg)
-                        .await
-                        .expect("Error sending message to server");
-                }
-                Err(e) => {
-                    eprintln!("[ABIEOS] Error serializing request: {}", e);
-                }
+        // Replay the last request (raw bytes, already patched with next block)
+        let lr = last_request.lock().await;
+        if let Some(req_bytes) = &*lr {
+            let msg = Message::Binary(req_bytes.clone().into());
+            let mut server_writer_lock = server_writer.lock().await;
+            if let Err(e) = server_writer_lock.send(msg).await {
+                eprintln!("[client_handler] Error replaying request: {}", e);
+                break;
             }
         }
+        drop(lr);
 
         println!("Reconnected to the server");
         restarting = true;

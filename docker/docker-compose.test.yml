@@ -1,0 +1,125 @@
+# Fleet Router Test Chain
+#
+# Architecture:
+#   nodeos-1:        Producer node (eosio), HTTP API, P2P source of truth
+#   nodeos-2:        SHiP peer (trace + chain-state history), syncs from nodeos-1
+#   nodeos-3:        SHiP peer (trace + chain-state history), syncs from nodeos-1
+#   bootstrap:       Deploys contracts & creates accounts (exits after completion)
+#   load-generator:  REST-controlled transaction generator (port 3000)
+#   fleet-router:    SHiP load balancer under test (port 9000)
+#
+# Flow:
+#   1. Start producer + peers
+#   2. Bootstrap contracts and accounts
+#   3. Load generator waits for sync, exposes REST API
+#   4. Fleet router connects to SHiP peers as upstreams
+#   5. Tests connect to fleet-router and control load via REST
+#
+# Usage:
+#   docker compose -f docker/docker-compose.test.yml up --build -d
+#   curl http://localhost:3000/status                         # Check sync
+#   curl -X POST http://localhost:3000/start -d '{"tps":10}'  # Start load
+#   cargo test --test stress_test -- --ignored                # Run tests
+#   curl -X POST http://localhost:3000/stop                   # Stop load
+
+services:
+
+  # Producer node — produces blocks, serves HTTP API for cleos
+  nodeos-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: eosrio/spring:v1.2.2
+    command: >
+      --genesis-json /etc/genesis.json --plugin eosio::producer_plugin --plugin eosio::producer_api_plugin --plugin eosio::chain_api_plugin --plugin eosio::http_plugin --plugin eosio::state_history_plugin --state-history-endpoint 0.0.0.0:8080 --trace-history --chain-state-history --producer-name eosio --enable-stale-production --access-control-allow-origin=* --http-server-address 0.0.0.0:8888 --http-validate-host=false
+    volumes:
+      - ./genesis.json:/etc/genesis.json:ro
+    ports:
+      - "8080:8080"
+      - "8888:8888"
+    healthcheck:
+      test: [ "CMD", "curl", "-sf", "http://localhost:8888/v1/chain/get_info" ]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # SHiP peer node 2 — non-producing, syncs from nodeos-1
+  nodeos-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: eosrio/spring:v1.2.2
+    command: >
+      --genesis-json /etc/genesis.json --plugin eosio::state_history_plugin --state-history-endpoint 0.0.0.0:8080 --trace-history --chain-state-history --plugin eosio::chain_api_plugin --plugin eosio::http_plugin --p2p-peer-address nodeos-1:9876 --http-server-address 0.0.0.0:8888 --http-validate-host=false
+    volumes:
+      - ./genesis.json:/etc/genesis.json:ro
+    ports:
+      - "8081:8080"
+      - "8889:8888"
+    depends_on:
+      nodeos-1:
+        condition: service_healthy
+
+  # SHiP peer node 3 — non-producing, syncs from nodeos-1
+  nodeos-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: eosrio/spring:v1.2.2
+    command: >
+      --genesis-json /etc/genesis.json --plugin eosio::state_history_plugin --state-history-endpoint 0.0.0.0:8080 --trace-history --chain-state-history --plugin eosio::chain_api_plugin --plugin eosio::http_plugin --p2p-peer-address nodeos-1:9876 --http-server-address 0.0.0.0:8888 --http-validate-host=false
+    volumes:
+      - ./genesis.json:/etc/genesis.json:ro
+    ports:
+      - "8082:8080"
+      - "8890:8888"
+    depends_on:
+      nodeos-1:
+        condition: service_healthy
+
+  # Bootstrap — deploys contracts, creates accounts (one-shot, exits when done)
+  bootstrap:
+    build:
+      context: .
+      dockerfile: Dockerfile.bootstrap
+    environment:
+      - NODEOS_URL=http://nodeos-1:8888
+      - NUM_TRANSFERS=200
+    depends_on:
+      nodeos-1:
+        condition: service_healthy
+
+  # Load Generator — REST-controlled transaction pusher
+  load-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile.loadgen
+    environment:
+      - NODEOS_URL=http://nodeos-1:8888
+      - PEER_URLS=http://nodeos-2:8888,http://nodeos-3:8888
+      - PORT=3000
+    ports:
+      - "3333:3000"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      nodeos-2:
+        condition: service_started
+      nodeos-3:
+        condition: service_started
+
+  # Fleet Router — SHiP load balancer under test
+  fleet-router:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: [ "run", "--config", "/etc/fleet-router.json" ]
+    volumes:
+      - ./fleet-router.json:/etc/fleet-router.json:ro
+    ports:
+      - "9100:9000"
+    depends_on:
+      nodeos-2:
+        condition: service_started
+      nodeos-3:
+        condition: service_started

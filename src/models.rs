@@ -57,6 +57,7 @@ impl ServerState {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetStatusResultV0 {
     pub head_block_num: u32,
@@ -70,35 +71,6 @@ pub struct GetStatusResultV0 {
     pub chain_id: String,
 }
 
-// pub const GET_BLOCKS_REQUEST_V0_FIELDS: [(&ZCDType, &str, usize); 8] = [
-//     (&U32, "start_block_num", 4),
-//     (&U32, "end_block_num", 4),
-//     (&U32, "max_messages_in_flight", 4),
-//     (&Array, "have_positions", 4 + 32),
-//     (&Bool, "irreversible_only", 1),
-//     (&Bool, "fetch_block", 1),
-//     (&Bool, "fetch_traces", 1),
-//     (&Bool, "fetch_deltas", 1)
-// ];
-
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct BlockPosition {
-    pub block_num: u32,
-    pub block_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct GetBlocksRequest {
-    pub start_block_num: u32,
-    pub end_block_num: u32,
-    pub max_messages_in_flight: u32,
-    pub have_positions: Vec<BlockPosition>,
-    pub irreversible_only: bool,
-    pub fetch_block: bool,
-    pub fetch_traces: bool,
-    pub fetch_deltas: bool,
-}
 
 #[derive(Debug, Clone)]
 pub struct StaticConfig {
@@ -110,19 +82,22 @@ pub struct StaticConfig {
 }
 
 pub fn build_state_db(servers: Vec<Server>) -> Arc<Mutex<HashMap<String, ServerState>>> {
-    Arc::new(Mutex::new(servers
-        .clone()
-        .iter()
-        .filter(|s| s.enabled)
-        .map(|s| (s.endpoint.clone(), ServerState::new()))
-        .collect::<HashMap<String, ServerState>>()))
+    Arc::new(Mutex::new(
+        servers
+            .clone()
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| (s.endpoint.clone(), ServerState::new()))
+            .collect::<HashMap<String, ServerState>>(),
+    ))
 }
 
 pub fn build_config_db(servers: Vec<Server>) -> Arc<Mutex<HashMap<String, Server>>> {
-    Arc::new(Mutex::new(servers
-        .into_iter()
-        .filter(|s| s.enabled)
-        .map(|s| (s.endpoint.clone(), s.clone()))
-        .collect::<HashMap<String, Server>>()
+    Arc::new(Mutex::new(
+        servers
+            .into_iter()
+            .filter(|s| s.enabled)
+            .map(|s| (s.endpoint.clone(), s.clone()))
+            .collect::<HashMap<String, Server>>(),
     ))
 }

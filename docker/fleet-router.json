@@ -1,0 +1,19 @@
+{
+    "listen_address": "0.0.0.0",
+    "listen_port": 9000,
+    "upstream_reconnect_ms": 3000,
+    "upstream_monitoring_ms": 5000,
+    "upstream_status_ms": 5000,
+    "servers": [
+        {
+            "name": "SHiP Node 2",
+            "endpoint": "nodeos-2:8080",
+            "enabled": true
+        },
+        {
+            "name": "SHiP Node 3",
+            "endpoint": "nodeos-3:8080",
+            "enabled": true
+        }
+    ]
+}

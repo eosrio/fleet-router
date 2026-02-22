@@ -1,6 +1,7 @@
 # fleet-router
 
-![CI](https://github.com/eosrio/fleet-router/actions/workflows/cargo-build.yml/badge.svg)
+![CI](https://github.com/eosrio/fleet-router/actions/workflows/ci.yml/badge.svg)
+[![Crates.io](https://img.shields.io/crates/v/fleet-router.svg)](https://crates.io/crates/fleet-router)
 
 The `fleet-router` is a reverse proxy and load balancer dedicated to the Antelope SHiP protocol. The Fleet SHiP Router is built with Rust using [rs_abieos](https://github.com/eosrio/rs-abieos) for maximum efficiency.
 

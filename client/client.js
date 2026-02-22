@@ -9,7 +9,9 @@ let ws;
 let shipAbi;
 const abieos = node_abieos_1.Abieos.getInstance();
 function send(ws, message) {
-    ws.send(Buffer.from(abieos.jsonToHex('SHIP_ABI', 'request', message), "hex"));
+    const hexString = abieos.jsonToHex('SHIP_ABI', 'request', message);
+    const buffer = Buffer.from(hexString, "hex");
+    ws.send(buffer);
 }
 let live = false;
 let lastBlockNum = 0;

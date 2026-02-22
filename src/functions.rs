@@ -4,7 +4,9 @@ use crate::errors;
 use crate::models::ServerState;
 
 /// Select a backend server from the list of available servers based on the number of connections
-pub fn select_backend_server(servers: &mut HashMap<String, ServerState>) -> Result<String, &'static str> {
+pub fn select_backend_server(
+    servers: &mut HashMap<String, ServerState>,
+) -> Result<String, &'static str> {
     let mut selected_server = None;
     let mut min_connections = usize::MAX;
     for (server, state) in servers.iter() {

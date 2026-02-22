@@ -74,7 +74,13 @@ pub fn encode_block_position(block_num: u32, block_id: &[u8; 32]) -> Vec<u8> {
 ///
 /// Fields: head, last_irreversible, trace_begin_block, trace_end_block,
 ///         chain_state_begin_block, chain_state_end_block, chain_id
-pub fn encode_status_result_v0(head_block: u32, lib_block: u32, chain_id: &[u8; 32]) -> Vec<u8> {
+pub fn encode_status_result_v0(
+    head_block: u32,
+    lib_block: u32,
+    chain_id: &[u8; 32],
+    trace_begin: u32,
+    trace_end: u32,
+) -> Vec<u8> {
     let head_id = fake_block_id(head_block);
     let lib_id = fake_block_id(lib_block);
 
@@ -86,14 +92,14 @@ pub fn encode_status_result_v0(head_block: u32, lib_block: u32, chain_id: &[u8; 
     // last_irreversible block_position
     buf.extend_from_slice(&encode_block_position(lib_block, &lib_id));
     // trace_begin_block
-    buf.extend_from_slice(&1u32.to_le_bytes());
+    buf.extend_from_slice(&trace_begin.to_le_bytes());
     // trace_end_block
-    buf.extend_from_slice(&(head_block + 1).to_le_bytes());
+    buf.extend_from_slice(&trace_end.to_le_bytes());
     // chain_state_begin_block
-    buf.extend_from_slice(&1u32.to_le_bytes());
+    buf.extend_from_slice(&trace_begin.to_le_bytes());
     // chain_state_end_block
-    buf.extend_from_slice(&(head_block + 1).to_le_bytes());
-    // chain_id (binary extension — present but optional in v0, always send it)
+    buf.extend_from_slice(&trace_end.to_le_bytes());
+    // chain_id (binary extension)
     buf.extend_from_slice(chain_id);
     buf
 }
@@ -339,7 +345,7 @@ mod tests {
     #[test]
     fn test_status_result_v0_encoding() {
         let chain_id = [0xABu8; 32];
-        let result = encode_status_result_v0(1000, 990, &chain_id);
+        let result = encode_status_result_v0(1000, 990, &chain_id, 1, 1001);
         // Should start with varuint32(0)
         assert_eq!(result[0], 0);
         // head block_num should be 1000 LE at offset 1

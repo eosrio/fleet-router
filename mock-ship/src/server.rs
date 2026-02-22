@@ -33,6 +33,10 @@ pub struct MockShipConfig {
     pub chain_id: [u8; 32],
     /// Size of fake data payloads per block (bytes). 0 = no data even if requested.
     pub block_data_size: usize,
+    /// First block with trace data available. Default: 1.
+    pub trace_begin_block: u32,
+    /// One past last block with trace data. Default: 0 = use head_block + 1.
+    pub trace_end_block: u32,
 }
 
 impl Default for MockShipConfig {
@@ -46,6 +50,8 @@ impl Default for MockShipConfig {
             disconnect_after: None,
             chain_id: [0u8; 32],
             block_data_size: 0,
+            trace_begin_block: 1,
+            trace_end_block: 0, // 0 = use head_block + 1
         }
     }
 }
@@ -246,10 +252,17 @@ impl MockShipServer {
                     let request = decode_request(&data);
                     match request {
                         ShipRequest::GetStatusV0 | ShipRequest::GetStatusV1 => {
+                            let trace_end = if config.trace_end_block > 0 {
+                                config.trace_end_block
+                            } else {
+                                config.head_block + 1
+                            };
                             let result = encode_status_result_v0(
                                 config.head_block,
                                 config.lib_block,
                                 &config.chain_id,
+                                config.trace_begin_block,
+                                trace_end,
                             );
                             if writer.send(Message::Binary(result.into())).await.is_err() {
                                 return;

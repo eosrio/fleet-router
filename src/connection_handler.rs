@@ -47,12 +47,13 @@ async fn get_socket(
     backend_servers: &ServerStateDb,
     server_config_db: &ServerConfigDb,
     max_attempts: u32,
+    requested_block: Option<u32>,
 ) -> Option<(ConnectionGuard, WebSocketStream<MaybeTlsStream<TcpStream>>)> {
     for _ in 0..max_attempts {
         // Select a backend server and optimistically increment counter
         let server = {
             let backend_servers_lock = &mut backend_servers.lock().await;
-            let selected_backend = match select_backend_server(backend_servers_lock) {
+            let selected_backend = match select_backend_server(backend_servers_lock, requested_block) {
                 Ok(endpoint) => endpoint,
                 Err(_) => {
                     continue;
@@ -132,7 +133,7 @@ pub async fn handle_client(
     println!("New incoming WebSocket connection: {}", client_address);
 
     let Some((mut _active_conn, server_socket)) =
-        get_socket(&backend_servers, &server_config_db, 3).await
+        get_socket(&backend_servers, &server_config_db, 3, None).await
     else {
         eprintln!("[client_handler] No upstream server available! Closing connection.");
         // Gracefully close the client connection
@@ -320,7 +321,19 @@ pub async fn handle_client(
         println!("[client_handler] Server stream ended");
 
         // now we must select another server to reconnect
-        let Some((new_conn, new_stream)) = get_socket(&backend_servers, &server_config_db, 3).await
+        // Extract requested start_block from last_request for range-aware routing
+        let failover_block = {
+            let lr = last_request.lock().await;
+            lr.as_ref().and_then(|req| {
+                if req.len() >= 5 {
+                    Some(u32::from_le_bytes(req[1..5].try_into().unwrap()))
+                } else {
+                    None
+                }
+            })
+        };
+
+        let Some((new_conn, new_stream)) = get_socket(&backend_servers, &server_config_db, 3, failover_block).await
         else {
             eprintln!("[client_handler] No upstream server available! Closing connection.");
             break;

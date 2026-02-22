@@ -29,7 +29,7 @@ struct FleetRouterProcess {
 
 impl FleetRouterProcess {
     /// Start fleet-router with a generated config pointing to the given upstream endpoints.
-    async fn start(upstream_endpoints: &[String]) -> Self {
+    async fn start(upstream_endpoints: &[String], status_ms: u64) -> Self {
         // Find a free port for fleet-router to listen on
         let listen_port = {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -54,7 +54,7 @@ impl FleetRouterProcess {
             "listen_port": listen_port,
             "upstream_reconnect_ms": 1000,
             "upstream_monitoring_ms": 2000,
-            "upstream_status_ms": 2000,
+            "upstream_status_ms": status_ms,
             "servers": servers
         });
 
@@ -197,7 +197,7 @@ async fn e2e_proxy_receives_abi() {
     let handle = mock.start();
 
     // Start fleet-router pointing at the mock
-    let router = FleetRouterProcess::start(&[mock_endpoint]).await;
+    let router = FleetRouterProcess::start(&[mock_endpoint], 2000).await;
 
     // Give fleet-router time to connect to upstream and receive ABI
     sleep(Duration::from_secs(2)).await;
@@ -240,7 +240,7 @@ async fn e2e_proxy_status_request() {
     let mock_endpoint = mock.endpoint();
     let handle = mock.start();
 
-    let router = FleetRouterProcess::start(&[mock_endpoint]).await;
+    let router = FleetRouterProcess::start(&[mock_endpoint], 2000).await;
     sleep(Duration::from_secs(2)).await;
 
     let (mut writer, mut reader) = ws_connect(&router.ws_url()).await;
@@ -288,7 +288,7 @@ async fn e2e_proxy_block_streaming() {
     let mock_endpoint = mock.endpoint();
     let handle = mock.start();
 
-    let router = FleetRouterProcess::start(&[mock_endpoint]).await;
+    let router = FleetRouterProcess::start(&[mock_endpoint], 2000).await;
     sleep(Duration::from_secs(2)).await;
 
     let (mut writer, mut reader) = ws_connect(&router.ws_url()).await;
@@ -337,7 +337,7 @@ async fn e2e_proxy_multiple_clients() {
     let mock_endpoint = mock.endpoint();
     let handle = mock.start();
 
-    let router = FleetRouterProcess::start(&[mock_endpoint]).await;
+    let router = FleetRouterProcess::start(&[mock_endpoint], 2000).await;
     sleep(Duration::from_secs(2)).await;
 
     // Connect 3 clients simultaneously
@@ -395,7 +395,7 @@ async fn e2e_proxy_multiple_upstreams() {
     let h1 = mock1.start();
     let h2 = mock2.start();
 
-    let router = FleetRouterProcess::start(&[ep1, ep2]).await;
+    let router = FleetRouterProcess::start(&[ep1, ep2], 2000).await;
     sleep(Duration::from_secs(2)).await;
 
     // Connect multiple clients — they should be distributed across upstreams
@@ -457,7 +457,7 @@ async fn e2e_proxy_flow_control() {
     let mock_endpoint = mock.endpoint();
     let handle = mock.start();
 
-    let router = FleetRouterProcess::start(&[mock_endpoint]).await;
+    let router = FleetRouterProcess::start(&[mock_endpoint], 2000).await;
     sleep(Duration::from_secs(2)).await;
 
     let (mut writer, mut reader) = ws_connect(&router.ws_url()).await;
@@ -529,7 +529,7 @@ async fn e2e_proxy_load_balancing_distribution() {
     let h1 = mock1.start();
     let h2 = mock2.start();
 
-    let router = FleetRouterProcess::start(&[ep1, ep2]).await;
+    let router = FleetRouterProcess::start(&[ep1, ep2], 2000).await;
     sleep(Duration::from_secs(2)).await;
 
     // Hold all connections open so the load balancer sees actual connection counts.
@@ -613,7 +613,7 @@ async fn e2e_proxy_failover() {
     let h1 = mock1.start();
     let h2 = mock2.start();
 
-    let router = FleetRouterProcess::start(&[ep1, ep2]).await;
+    let router = FleetRouterProcess::start(&[ep1, ep2], 2000).await;
     sleep(Duration::from_secs(2)).await;
 
     // Verify both upstreams are initially reachable
@@ -691,7 +691,7 @@ async fn e2e_proxy_sustained_streaming() {
     let mock_endpoint = mock.endpoint();
     let handle = mock.start();
 
-    let router = FleetRouterProcess::start(&[mock_endpoint]).await;
+    let router = FleetRouterProcess::start(&[mock_endpoint], 2000).await;
     sleep(Duration::from_secs(2)).await;
 
     // Spawn concurrent clients that each stream a range of blocks
@@ -796,7 +796,7 @@ async fn e2e_proxy_concurrent_scaling() {
     let h1 = mock1.start();
     let h2 = mock2.start();
 
-    let router = FleetRouterProcess::start(&[ep1, ep2]).await;
+    let router = FleetRouterProcess::start(&[ep1, ep2], 2000).await;
     sleep(Duration::from_secs(2)).await;
 
     let total_bytes = Arc::new(AtomicU64::new(0));
@@ -858,4 +858,253 @@ async fn e2e_proxy_concurrent_scaling() {
     drop(router);
     h1.shutdown().await;
     h2.shutdown().await;
+}
+
+// ===========================================================================
+// E2E TEST 11: Range-aware failover routing
+// ===========================================================================
+
+/// Two upstreams with non-overlapping trace ranges:
+/// - Upstream A: blocks 1..5001 (head=5000)  — disconnects after 3 blocks
+/// - Upstream B: blocks 5001..10001 (head=10000)
+///
+/// Client requests block 500 (in A's range). After A disconnects,
+/// failover should see that block ~503 is still in A's range and route
+/// to another upstream covering that range. Since only A covers it and A
+/// will accept new connections, the client should reconnect to A.
+/// Crucially, it should NOT failover to B (which doesn't cover block 503).
+///
+/// We verify this by checking that the head_block in responses is always 5000.
+#[tokio::test]
+async fn e2e_proxy_range_aware_routing() {
+    // Upstream A: covers blocks 1..5001, disconnects after 3 blocks
+    let config_a = MockShipConfig {
+        head_block: 5000,
+        lib_block: 4990,
+        blocks_to_stream: 0,
+        disconnect_after: Some(3),
+        trace_begin_block: 1,
+        trace_end_block: 5001,
+        ..Default::default()
+    };
+
+    // Upstream B: covers blocks 5001..10001 (does NOT cover block 500)
+    let config_b = MockShipConfig {
+        head_block: 10000,
+        lib_block: 9990,
+        blocks_to_stream: 0,
+        trace_begin_block: 5001,
+        trace_end_block: 10001,
+        ..Default::default()
+    };
+
+    let mock_a = MockShipServer::new(config_a).await;
+    let mock_b = MockShipServer::new(config_b).await;
+    let ep_a = mock_a.endpoint();
+    let ep_b = mock_b.endpoint();
+    let ha = mock_a.start();
+    let hb = mock_b.start();
+
+    // Start router with fast status polling (500ms)
+    let router = FleetRouterProcess::start(&[ep_a, ep_b], 500).await;
+
+    // Wait for monitoring loop to populate trace ranges
+    sleep(Duration::from_secs(3)).await;
+
+    let (mut writer, mut reader) = ws_connect(&router.ws_url()).await;
+    let _abi = read_one(&mut reader).await;
+
+    // Request blocks starting at 500 (in A's range only)
+    writer
+        .send(Message::Binary(build_blocks_request(500, 600, 10).into()))
+        .await
+        .unwrap();
+
+    // Read blocks — A will disconnect after 3, then failover should reconnect to A (not B)
+    let mut heads_seen = std::collections::HashSet::new();
+    let mut blocks_received = 0u32;
+    let timeout = Duration::from_secs(10);
+    let start = std::time::Instant::now();
+
+    loop {
+        if start.elapsed() > timeout || blocks_received >= 10 {
+            break;
+        }
+        let msg = tokio::select! {
+            msg = reader.next() => {
+                match msg {
+                    Some(Ok(m)) => m,
+                    _ => break,
+                }
+            }
+            _ = sleep(Duration::from_secs(5)) => break,
+        };
+
+        match msg {
+            Message::Binary(data) => {
+                if data.len() >= 5 {
+                    let head = u32::from_le_bytes(data[1..5].try_into().unwrap());
+                    heads_seen.insert(head);
+                    blocks_received += 1;
+                }
+            }
+            Message::Text(_) => continue, // ABI from reconnection
+            _ => break,
+        }
+    }
+
+    println!("  Range routing: heads seen = {:?}, blocks = {}", heads_seen, blocks_received);
+
+    // All blocks should come from upstream A (head=5000), never from B (head=10000)
+    assert!(
+        !heads_seen.contains(&10000),
+        "Should NOT route to upstream B (head=10000) — it doesn't cover block 500"
+    );
+    assert!(
+        blocks_received >= 3,
+        "Should receive at least 3 blocks from upstream A (got {})",
+        blocks_received
+    );
+
+    drop(writer);
+    drop(reader);
+    drop(router);
+    ha.shutdown().await;
+    hb.shutdown().await;
+}
+
+// ===========================================================================
+// E2E TEST 12: Failover routes to range-valid upstream
+// ===========================================================================
+
+/// Three upstreams:
+/// - Upstream A: blocks 1..5001 (head=5000)  — will be shut down
+/// - Upstream B: blocks 8001..12001 (head=12000) — does NOT cover the requested range
+/// - Upstream C: blocks 1..6001 (head=6000) — DOES cover the range, failover target
+///
+/// Client requests blocks in range covered by A and C. When A goes down,
+/// failover should route to C (not B).
+#[tokio::test]
+async fn e2e_proxy_failover_to_range_valid() {
+    let config_a = MockShipConfig {
+        head_block: 5000,
+        lib_block: 4990,
+        blocks_to_stream: 0,
+        disconnect_after: Some(5), // Disconnect after 5 blocks to trigger failover
+        trace_begin_block: 1,
+        trace_end_block: 5001,
+        ..Default::default()
+    };
+
+    // Upstream B does NOT cover low block range
+    let config_b = MockShipConfig {
+        head_block: 12000,
+        lib_block: 11990,
+        blocks_to_stream: 0,
+        trace_begin_block: 8001,
+        trace_end_block: 12001,
+        ..Default::default()
+    };
+
+    // Upstream C covers same range as A
+    let config_c = MockShipConfig {
+        head_block: 6000,
+        lib_block: 5990,
+        blocks_to_stream: 0,
+        trace_begin_block: 1,
+        trace_end_block: 6001,
+        ..Default::default()
+    };
+
+    let mock_a = MockShipServer::new(config_a).await;
+    let mock_b = MockShipServer::new(config_b).await;
+    let mock_c = MockShipServer::new(config_c).await;
+    let ep_a = mock_a.endpoint();
+    let ep_b = mock_b.endpoint();
+    let ep_c = mock_c.endpoint();
+    let ha = mock_a.start();
+    let hb = mock_b.start();
+    let hc = mock_c.start();
+
+    let router = FleetRouterProcess::start(&[ep_a, ep_b, ep_c], 500).await;
+
+    // Wait for monitoring to populate trace ranges
+    sleep(Duration::from_secs(3)).await;
+
+    let (mut writer, mut reader) = ws_connect(&router.ws_url()).await;
+    let _abi = read_one(&mut reader).await;
+
+    // Request blocks starting at 100 — should initially go to A or C (both cover this range)
+    writer
+        .send(Message::Binary(build_blocks_request(100, 1000, 100).into()))
+        .await
+        .unwrap();
+
+    // Read blocks until failover happens (A disconnects after 5)
+    let mut heads_seen = std::collections::HashSet::new();
+    let mut blocks_received = 0u32;
+    let timeout = Duration::from_secs(10);
+    let start = std::time::Instant::now();
+
+    loop {
+        if start.elapsed() > timeout {
+            break;
+        }
+        let msg = tokio::select! {
+            msg = reader.next() => {
+                match msg {
+                    Some(Ok(m)) => m,
+                    _ => break,
+                }
+            }
+            _ = sleep(Duration::from_secs(5)) => break,
+        };
+
+        match msg {
+            Message::Binary(data) => {
+                if data.len() >= 5 {
+                    let head = u32::from_le_bytes(data[1..5].try_into().unwrap());
+                    heads_seen.insert(head);
+                    blocks_received += 1;
+                }
+                // Send acks to keep flow going
+                if blocks_received.is_multiple_of(10) {
+                    let _ = writer.send(Message::Binary(build_ack_request(10).into())).await;
+                }
+                if blocks_received >= 20 {
+                    break;
+                }
+            }
+            Message::Text(_) => {
+                // ABI from new upstream after failover
+                continue;
+            }
+            _ => break,
+        }
+    }
+
+    println!(
+        "  Failover: heads seen = {:?}, blocks = {}",
+        heads_seen, blocks_received
+    );
+
+    // After failover, we should see head from C (6000) or A (5000), NOT from B (12000)
+    assert!(
+        !heads_seen.contains(&12000),
+        "Failover should NOT route to upstream B (head=12000) which doesn't cover block range 100+"
+    );
+
+    // We should have received blocks from at least one valid upstream
+    assert!(
+        blocks_received >= 5,
+        "Should have received at least 5 blocks (got {})",
+        blocks_received
+    );
+
+    drop(writer);
+    drop(reader);
+    drop(router);
+    ha.shutdown().await;
+    hb.shutdown().await;
+    hc.shutdown().await;
 }

@@ -66,20 +66,24 @@ async fn mark_offline(backend_servers: &ServerStateDb, endpoint: &str) {
 /// Leading Ping/Pong control frames are skipped. Returns `None` (so the caller
 /// can try another upstream) on timeout, Close, Binary-first, or error.
 async fn read_first_abi(ws: &mut UpstreamStream, handshake_timeout_ms: u64) -> Option<String> {
-    loop {
-        let next = if handshake_timeout_ms > 0 {
-            match timeout(Duration::from_millis(handshake_timeout_ms), ws.next()).await {
-                Ok(n) => n,
-                Err(_) => return None, // handshake timed out
+    // Single overall deadline for the whole handshake: a peer that drips
+    // Ping/Pong frames cannot keep it alive past the timeout.
+    let read = async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => return Some(text.to_string()),
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+                _ => return None,
             }
-        } else {
-            ws.next().await
-        };
-        match next {
-            Some(Ok(Message::Text(text))) => return Some(text.to_string()),
-            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
-            _ => return None,
         }
+    };
+    if handshake_timeout_ms > 0 {
+        // On timeout (Err), unwrap_or_default yields None — treat as a failed handshake.
+        timeout(Duration::from_millis(handshake_timeout_ms), read)
+            .await
+            .unwrap_or_default()
+    } else {
+        read.await
     }
 }
 
@@ -286,9 +290,11 @@ pub async fn handle_client(
 
                 let mut sw = server_writer.lock().await;
                 if let Err(e) = sw.send(msg.clone()).await {
-                    // Don't silently drop: buffer for replay after failover swaps the socket.
+                    // Don't silently drop: buffer for replay after failover swaps the
+                    // socket. Keep holding `server_writer` while pushing to `pending`
+                    // so the failover loop cannot acquire the writer, swap, and flush
+                    // `pending` before this frame is buffered (which would strand it).
                     tracing::debug!(error = %e, "forward to upstream failed; buffering for failover");
-                    drop(sw);
                     let mut p = pending.lock().await;
                     if p.len() < MAX_PENDING_FRAMES {
                         p.push_back(msg);

@@ -55,21 +55,34 @@ pub async fn run_metrics_server(
 }
 
 async fn handle_request(mut stream: TcpStream, state_db: ServerStateDb) -> std::io::Result<()> {
-    // Read just enough to parse the request line. Bounded in both time and size.
+    // Read just enough to parse the request line, bounded by a single overall
+    // timeout (so a slow client can't hold the connection open by dripping
+    // bytes) and a fixed buffer size.
     let mut buf = [0u8; 1024];
-    let mut len = 0;
-    while len < buf.len() {
-        let n = match timeout(Duration::from_secs(5), stream.read(&mut buf[len..])).await {
-            Ok(Ok(0)) => break, // EOF
-            Ok(Ok(n)) => n,     // read some bytes
-            Ok(Err(e)) => return Err(e),
-            Err(_) => break, // read timeout
-        };
-        len += n;
-        if buf[..len].windows(4).any(|w| w == b"\r\n\r\n") || buf[..len].contains(&b'\n') {
-            break; // we have the request line (and possibly headers)
+    let len = match timeout(Duration::from_secs(5), async {
+        let mut len = 0;
+        while len < buf.len() {
+            match stream.read(&mut buf[len..]).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    len += n;
+                    if buf[..len].windows(4).any(|w| w == b"\r\n\r\n")
+                        || buf[..len].contains(&b'\n')
+                    {
+                        break; // we have the request line (and possibly headers)
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
-    }
+        Ok(len)
+    })
+    .await
+    {
+        Ok(Ok(len)) => len,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Ok(()), // overall read timeout: drop the connection
+    };
 
     let head = String::from_utf8_lossy(&buf[..len]);
     let request_line = head.lines().next().unwrap_or("");

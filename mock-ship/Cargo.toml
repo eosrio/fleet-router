@@ -3,6 +3,8 @@ name = "mock-ship"
 version = "0.1.0"
 edition = "2021"
 description = "Mock SHiP (State History Plugin) server for testing fleet-router"
+license = "MIT"
+publish = false
 
 [dependencies]
 tokio = { version = "1", features = ["net", "sync", "rt", "macros", "time"] }

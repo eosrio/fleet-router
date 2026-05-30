@@ -104,7 +104,6 @@ pub fn encode_status_result_v0(
     buf
 }
 
-
 /// Encode a get_blocks_result_v0 with optional data payloads.
 ///
 /// When `block_data`, `traces`, or `deltas` are `Some`, the optional is encoded as

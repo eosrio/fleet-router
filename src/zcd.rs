@@ -225,10 +225,14 @@ fn zcd_builder<'a>(buffer: &'a [u8], fields: &'a [(&ZCDType, &str, usize)]) -> Z
         match f_type {
             Array => {
                 // unbounded fields in the middle of the array
-                if offset >= buffer.len() { break; }
+                if offset >= buffer.len() {
+                    break;
+                }
                 let elements = buffer[offset];
                 let full_size = 1 + size * elements as usize;
-                if offset + full_size > buffer.len() { break; }
+                if offset + full_size > buffer.len() {
+                    break;
+                }
                 let field_buffer = &buffer[offset..offset + full_size];
                 hash_map.insert(
                     field.to_string(),
@@ -259,7 +263,9 @@ fn zcd_builder<'a>(buffer: &'a [u8], fields: &'a [(&ZCDType, &str, usize)]) -> Z
                     }
                 } else {
                     // bounded fields
-                    if offset + size > buffer.len() { break; }
+                    if offset + size > buffer.len() {
+                        break;
+                    }
                     let field_buffer = &buffer[offset..offset + size];
                     hash_map.insert(
                         field.to_string(),

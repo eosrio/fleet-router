@@ -211,12 +211,18 @@ impl MockShipServer {
                             None
                         };
                         let traces_data = if fetch_traces && config.block_data_size > 0 {
-                            Some(generate_fake_data(block_num.wrapping_add(1000), config.block_data_size))
+                            Some(generate_fake_data(
+                                block_num.wrapping_add(1000),
+                                config.block_data_size,
+                            ))
                         } else {
                             None
                         };
                         let deltas_data = if fetch_deltas && config.block_data_size > 0 {
-                            Some(generate_fake_data(block_num.wrapping_add(2000), config.block_data_size))
+                            Some(generate_fake_data(
+                                block_num.wrapping_add(2000),
+                                config.block_data_size,
+                            ))
                         } else {
                             None
                         };
@@ -284,6 +290,16 @@ impl MockShipServer {
                             fetch_traces: ft,
                             fetch_deltas: fd,
                         } => {
+                            // When an explicit trace range is configured, model a
+                            // real node that cannot serve blocks outside it: close
+                            // the connection so the proxy fails over to a covering
+                            // upstream. (No effect when trace_end_block is unset.)
+                            if config.trace_end_block > 0
+                                && (start_block_num < config.trace_begin_block
+                                    || start_block_num >= config.trace_end_block)
+                            {
+                                return;
+                            }
                             current_block = Some(start_block_num);
                             end_block = end_block_num;
                             send_credits = max_messages_in_flight;

@@ -1,25 +1,38 @@
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 use crate::errors;
 use crate::models::ServerState;
 
-/// Select a backend server from the list of available servers.
+/// Select a backend server from the list of available (enabled + online) servers.
 ///
-/// When `requested_block` is `Some`, prefer servers whose trace range covers that block
-/// (least connections among those). Falls back to any online server if none covers the range.
+/// Candidates are ranked, best first:
+///
+/// 1. covers the requested block AND is fresh (advancing)
+/// 2. covers the requested block but is stale
+/// 3. does not cover the block but is fresh
+/// 4. does not cover the block and is stale
+///
+/// Within the same rank, the server with the fewest active connections wins
+/// (least-connections load balancing). Stale servers are deprioritized but never
+/// excluded, so selection never starves when every upstream is stale.
+///
+/// The range check uses an exclusive upper bound (`block < trace_end_block`) because SHiP's
+/// `get_status_result` reports `trace_end_block` as one-past-the-last available block.
 pub fn select_backend_server(
-    servers: &mut HashMap<String, ServerState>,
+    servers: &HashMap<String, ServerState>,
     requested_block: Option<u32>,
 ) -> Result<String, &'static str> {
-    let mut best_in_range: Option<(String, usize)> = None;
-    let mut best_fallback: Option<(String, usize)> = None;
+    // Lower (rank, connections) is better.
+    let mut best: Option<(u8, usize, String)> = None;
 
     for (server, state) in servers.iter() {
         if !state.enabled || !state.online {
             continue;
         }
 
-        // Check if this server's trace range covers the requested block
+        let conns = state.connections.load(Ordering::Relaxed);
+
         let covers_range = match requested_block {
             Some(block) => {
                 state.trace_end_block > 0
@@ -29,37 +42,40 @@ pub fn select_backend_server(
             None => false,
         };
 
-        if covers_range
-            && (best_in_range.is_none()
-                || state.connections < best_in_range.as_ref().unwrap().1)
-        {
-            best_in_range = Some((server.clone(), state.connections));
-        }
+        let rank = match (covers_range, state.stale) {
+            (true, false) => 0u8,
+            (true, true) => 1,
+            (false, false) => 2,
+            (false, true) => 3,
+        };
 
-        // Always track the overall least-connections fallback
-        if best_fallback.is_none() || state.connections < best_fallback.as_ref().unwrap().1 {
-            best_fallback = Some((server.clone(), state.connections));
+        let better = match &best {
+            None => true,
+            Some((best_rank, best_conns, _)) => (rank, conns) < (*best_rank, *best_conns),
+        };
+        if better {
+            best = Some((rank, conns, server.clone()));
         }
     }
 
-    // Prefer in-range, fall back to any online server
-    if let Some((server, _)) = best_in_range {
-        Ok(server)
-    } else if let Some((server, _)) = best_fallback {
-        if let Some(block) = requested_block {
-            eprintln!(
-                "[select_backend] Warning: no upstream covers block {}, falling back to least connections",
-                block
-            );
+    match best {
+        Some((rank, _, server)) => {
+            if let Some(block) = requested_block {
+                if rank >= 2 {
+                    tracing::warn!(
+                        block,
+                        "no upstream covers the requested block; falling back to least-connections"
+                    );
+                }
+            }
+            Ok(server)
         }
-        Ok(server)
-    } else {
-        Err(errors::NO_SERVERS_AVAILABLE)
+        None => Err(errors::NO_SERVERS_AVAILABLE),
     }
 }
 
 pub fn buffer_to_hex(buffer: Vec<u8>) -> String {
-    let mut hex = String::new();
+    let mut hex = String::with_capacity(buffer.len() * 2);
     for byte in buffer {
         hex.push_str(&format!("{:02x}", byte));
     }

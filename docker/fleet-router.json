@@ -1,6 +1,6 @@
 {
     "listen_address": "0.0.0.0",
-    "listen_port": 9000,
+    "listen_port": 17000,
     "upstream_reconnect_ms": 3000,
     "upstream_monitoring_ms": 5000,
     "upstream_status_ms": 5000,

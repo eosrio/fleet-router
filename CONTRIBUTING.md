@@ -13,27 +13,14 @@ project spaces and interactions.
 
 ## Prerequisites
 
-fleet-router builds on **Linux x86_64 only**. The `rs_abieos` build script
-panics with "Unsupported OS" on macOS and Windows. On those platforms, use the
-published Docker image (`ghcr.io/eosrio/fleet-router`) instead of a native
-build.
+fleet-router is pure Rust and builds on **Linux, macOS, and Windows** (x86_64
+and arm64) — no C/C++ toolchain, `clang`, or `libclang` required. See the
+[Requirements section in the README](README.md#requirements-and-supported-platforms).
 
-You need the following to build from source. See the
-[Requirements section in the README](README.md#requirements-and-supported-platforms) for the full
-rationale.
+You need:
 
-- Linux x86_64
+- Rust **1.95+** (the Minimum Supported Rust Version, required by `rs_abieos`)
 - `git`
-- A C/C++ toolchain plus `clang` and `libclang-dev` (the `rs_abieos` build
-  script compiles vendored C++ and uses `bindgen`, which needs `libclang`)
-- Rust **1.85+** (the Minimum Supported Rust Version — a transitive dependency
-  uses the 2024 edition)
-
-On Debian/Ubuntu, install the system packages with:
-
-```bash
-sudo apt-get install -y git clang libclang-dev build-essential
-```
 
 Install Rust via [rustup](https://rustup.rs/) if you do not already have a
 toolchain:
@@ -52,10 +39,8 @@ cd fleet-router
 cargo build
 ```
 
-The first build compiles the vendored C++ in `rs_abieos`, so expect it to take
-longer than a typical Rust build. `Cargo.lock` is committed; CI and releases
-build with `--locked`, so do not delete or regenerate it unless your change
-intentionally updates dependencies.
+`Cargo.lock` is committed; CI and releases build with `--locked`, so do not
+delete or regenerate it unless your change intentionally updates dependencies.
 
 ## Testing
 
@@ -99,8 +84,9 @@ Notes:
 - `cargo fmt --all` reformats your changes. CI runs `cargo fmt --all -- --check`
   and fails if anything is unformatted.
 - Clippy must be clean: `-D warnings` turns every warning into an error.
-- CI runs these commands with `--locked` and also runs an MSRV check against
-  Rust 1.85, a `cargo-deny` supply-chain scan (advisories, bans, licenses,
+- CI runs these commands with `--locked` across Linux, macOS, and Windows, and
+  also runs an MSRV check against Rust 1.95, a `cargo-deny` supply-chain scan
+  (advisories, bans, licenses,
   sources), and a Docker image build. Keeping the three commands above green
   locally covers the parts you are most likely to break.
 

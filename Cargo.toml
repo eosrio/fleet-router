@@ -5,7 +5,7 @@ members = [".", "mock-ship"]
 name = "fleet-router"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.95"
 description = "Reverse proxy and load balancer for the Antelope SHiP (State History Plugin) WebSocket protocol."
 authors = ["Igor Lins e Silva", "EOS Rio"]
 repository = "https://github.com/eosrio/fleet-router"
@@ -33,7 +33,7 @@ chrono = "0.4.37"
 clap = { version = "4.5.4", features = ["derive", "string", "wrap_help", "unicode"] }
 color-print = "0.3.5"
 futures = { version = "0.3.30", features = ["compat"] }
-rs_abieos = "0.3.0"
+rs_abieos = { version = "0.5.0", default-features = false, features = ["rust-backend"] }
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.115"
 tokio = { version = "1.37.0", features = ["full"] }

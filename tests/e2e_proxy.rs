@@ -89,19 +89,10 @@ impl FleetRouterProcess {
     }
 
     fn find_binary() -> String {
-        // Try debug build first, then release
-        let debug_path = "target/debug/fleet-router";
-        let release_path = "target/release/fleet-router";
-        if std::path::Path::new(debug_path).exists() {
-            debug_path.to_string()
-        } else if std::path::Path::new(release_path).exists() {
-            release_path.to_string()
-        } else {
-            panic!(
-                "fleet-router binary not found. Run `cargo build` first.\n  Checked: {} and {}",
-                debug_path, release_path
-            );
-        }
+        // Cargo builds the binary before running this integration test and sets
+        // CARGO_BIN_EXE_<name> to its absolute path, with the platform's
+        // executable extension (e.g. `.exe` on Windows).
+        env!("CARGO_BIN_EXE_fleet-router").to_string()
     }
 
     fn ws_url(&self) -> String {

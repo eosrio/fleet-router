@@ -12,7 +12,7 @@ body:
         - For security vulnerabilities, do **not** open a public issue. Use private reporting per [SECURITY.md](../../SECURITY.md).
         - For questions or usage help, please use Discussions instead.
 
-        fleet-router currently supports **Linux x86_64 only**. macOS/Windows are not supported for native builds; use the Docker image (`ghcr.io/eosrio/fleet-router`) there.
+        fleet-router is pure Rust and runs on Linux, macOS, and Windows (x86_64 and arm64). A prebuilt Docker image is also available (`ghcr.io/eosrio/fleet-router`).
 
   - type: input
     id: version
@@ -39,7 +39,7 @@ body:
     id: os-arch
     attributes:
       label: OS and architecture
-      description: "Distribution/version and CPU architecture. Remember: only Linux x86_64 is supported."
+      description: "Operating system, distribution/version, and CPU architecture."
       placeholder: "Ubuntu 24.04, x86_64"
     validations:
       required: true
@@ -47,11 +47,10 @@ body:
   - type: input
     id: build-env
     attributes:
-      label: Rust version and build toolchain (for build issues)
+      label: Rust version (for build issues)
       description: >-
-        Output of `rustc --version` (MSRV is 1.85), and whether clang + libclang-dev were installed
-        (required by bindgen). Leave blank if this is not a build issue.
-      placeholder: "rustc 1.85.0; clang/libclang-dev installed: yes"
+        Output of `rustc --version` (MSRV is 1.95). Leave blank if this is not a build issue.
+      placeholder: "rustc 1.95.0"
     validations:
       required: false
 

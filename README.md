@@ -10,7 +10,7 @@ A reverse proxy and load balancer for the Antelope **SHiP** (State History Plugi
 
 Use it when you run more than one SHiP node and want clients (Hyperion, dfuse-style indexers, custom consumers) to see a single, resilient endpoint with load balancing and automatic failover, instead of pinning each consumer to one node.
 
-It is written in Rust on [tokio](https://tokio.rs/) and [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite), and uses [rs_abieos](https://github.com/eosrio/rs-abieos) (C++ FFI) for ABI handling.
+It is written in Rust on [tokio](https://tokio.rs/) and [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite), and uses [rs_abieos](https://github.com/eosrio/rs-abieos) (pure-Rust backend) for ABI handling.
 
 ## Features
 
@@ -42,33 +42,19 @@ A client connects over WebSocket. The router selects an upstream (range-aware, t
 
 ## Requirements and supported platforms
 
-**Linux x86_64 only.** The `rs_abieos` build script panics with *"Unsupported OS"* on macOS and Windows. On those platforms, use the [Docker image](#docker) instead of a native build.
-
-A native build compiles vendored C++ via a build script and uses `bindgen`, so you need a C/C++ toolchain plus `clang`/`libclang`:
+fleet-router is **pure Rust** and builds on **Linux, macOS, and Windows** (x86_64 and arm64) — no C/C++ toolchain, `clang`, or `libclang` required. The only prerequisite is a Rust toolchain.
 
 | Requirement | Notes |
 |---|---|
-| Linux x86_64 | Only supported native target |
-| Rust ≥ 1.85 (MSRV) | A transitive dependency uses the Rust 2024 edition |
-| `git` | To clone and build from source |
-| C/C++ toolchain | Debian/Ubuntu: `build-essential` |
-| `clang` + `libclang-dev` | Required by `bindgen` |
+| Rust ≥ 1.95 (MSRV) | Required by `rs_abieos` (uses `if let` guards, stabilized in Rust 1.95) |
 
-On Debian/Ubuntu, install the prerequisites with:
-
-```bash
-sudo apt-get install -y git clang libclang-dev build-essential
-```
-
-If you do not already have Rust:
+If you do not already have Rust, install it via [rustup](https://rustup.rs/):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
 ## Installation
-
-> Native builds (crates.io or from source) require the [prerequisites above](#requirements-and-supported-platforms) to be installed first. macOS/Windows users should use the Docker image.
 
 ### From crates.io
 
@@ -268,7 +254,7 @@ The image runs as a non-root user and defines a `HEALTHCHECK` against port `1700
 
 - Transport is **plaintext `ws://`** on both the client listener and the upstream connections. No TLS / `wss://` is compiled in.
 - The client listener is **unauthenticated** — anyone who can reach the port can stream data.
-- `rs_abieos` parses untrusted upstream bytes through C++ FFI. Treat your upstreams as part of the trust boundary.
+- `rs_abieos` (pure Rust) parses untrusted upstream data; treat your upstreams as part of the trust boundary.
 
 Because of the above:
 

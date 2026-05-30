@@ -33,7 +33,7 @@ First public release on crates.io and GitHub.
 - Capped exponential backoff for upstream monitoring reconnects.
 - `cargo-deny` supply-chain configuration and CI (advisories, bans, licenses,
   sources), an MSRV check, dependency caching, and a tag-triggered release
-  workflow (crates.io publish, Linux binary, GHCR image).
+  workflow (crates.io publish, cross-platform binaries, GHCR image).
 - Community health files: `CONTRIBUTING.md`, `SECURITY.md`,
   `CODE_OF_CONDUCT.md`, issue templates, and a pull-request template.
 

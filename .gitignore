@@ -15,4 +15,10 @@ target/
 
 .idea
 
+# Editor / AI-assistant local directories
+.agents/
+.claude/
+.cursor/
+.windsurf/
+
 config.json

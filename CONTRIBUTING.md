@@ -84,11 +84,11 @@ Notes:
 - `cargo fmt --all` reformats your changes. CI runs `cargo fmt --all -- --check`
   and fails if anything is unformatted.
 - Clippy must be clean: `-D warnings` turns every warning into an error.
-- CI runs these commands with `--locked` across Linux, macOS, and Windows, and
-  also runs an MSRV check against Rust 1.95, a `cargo-deny` supply-chain scan
-  (advisories, bans, licenses,
-  sources), and a Docker image build. Keeping the three commands above green
-  locally covers the parts you are most likely to break.
+- CI runs build + test with `--locked` across Linux, macOS, and Windows, runs
+  fmt + clippy on Linux, and also runs an MSRV check against Rust 1.95, a
+  `cargo-deny` supply-chain scan (advisories, bans, licenses, sources), and a
+  Docker image build. Keeping the three commands above green locally covers the
+  parts you are most likely to break.
 
 ## Updating the CHANGELOG
 

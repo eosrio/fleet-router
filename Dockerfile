@@ -1,10 +1,5 @@
-# Fleet Router — multi-stage build.
-# Note: builds on Linux only (rs_abieos compiles vendored C++ via bindgen and
-# requires clang/libclang).
-FROM rust:1.85-bookworm AS builder
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends clang libclang-dev && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+# Fleet Router — multi-stage build. Pure-Rust: no C/C++ toolchain required.
+FROM rust:1.95-bookworm AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release --locked

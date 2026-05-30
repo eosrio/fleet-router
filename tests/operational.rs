@@ -10,12 +10,10 @@ use mock_ship::{MockShipConfig, MockShipServer};
 use tokio::time::sleep;
 
 fn find_binary() -> String {
-    for path in ["target/debug/fleet-router", "target/release/fleet-router"] {
-        if std::path::Path::new(path).exists() {
-            return path.to_string();
-        }
-    }
-    panic!("fleet-router binary not found. Run `cargo build` first.");
+    // Cargo builds the binary before running this integration test and sets
+    // CARGO_BIN_EXE_<name> to its absolute path, with the platform's executable
+    // extension (e.g. `.exe` on Windows).
+    env!("CARGO_BIN_EXE_fleet-router").to_string()
 }
 
 fn free_port() -> u16 {

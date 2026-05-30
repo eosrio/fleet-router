@@ -39,6 +39,9 @@ First public release on crates.io and GitHub.
 
 ### Changed
 
+- Build on the pure-Rust `rs_abieos` backend (`rust-backend`): fleet-router now
+  compiles on **Linux, macOS, and Windows** (x86_64 and arm64) with no C/C++
+  toolchain, `clang`, or `libclang`.
 - The CLI `--version` now derives from `Cargo.toml` (`CARGO_PKG_VERSION`).
 - The connection counter is now an atomic, decremented synchronously and
   underflow-safely when a connection ends.

@@ -72,8 +72,8 @@ encryption and access control.
 ### Trust boundary
 
 Upstream SHiP nodes are part of the trust boundary. fleet-router parses bytes
-received from upstreams through `rs_abieos`, a C++ library reached via FFI.
-Only point fleet-router at upstream nodes you operate or otherwise trust.
+received from upstreams via `rs_abieos` (pure-Rust backend). Only point
+fleet-router at upstream nodes you operate or otherwise trust.
 
 ### In scope
 

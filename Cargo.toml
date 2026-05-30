@@ -5,14 +5,27 @@ members = [".", "mock-ship"]
 name = "fleet-router"
 version = "0.2.0"
 edition = "2021"
-description = """
-Fleet Router - Antelope SHiP Reverse Proxy & Load Balancer
-"""
+rust-version = "1.85"
+description = "Reverse proxy and load balancer for the Antelope SHiP (State History Plugin) WebSocket protocol."
 authors = ["Igor Lins e Silva", "EOS Rio"]
 repository = "https://github.com/eosrio/fleet-router"
+homepage = "https://github.com/eosrio/fleet-router"
+documentation = "https://github.com/eosrio/fleet-router#readme"
+readme = "README.md"
 license = "MIT"
 categories = ["network-programming"]
 keywords = ["antelope", "ship", "state-history", "load-balancer", "websockets"]
+# Keep the published crate lean: ship only what's needed to build and run the
+# binary. Tests, Docker assets, the TypeScript client, and CI config stay in git.
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "example.config.json",
+]
 
 [dependencies]
 anyhow = "1.0.82"
@@ -25,6 +38,8 @@ serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.115"
 tokio = { version = "1.37.0", features = ["full"] }
 tokio-tungstenite = "0.28.0"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
 [dev-dependencies]
 mock-ship = { path = "mock-ship" }

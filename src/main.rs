@@ -1,7 +1,19 @@
+//! # fleet-router
+//!
+//! A reverse proxy and load balancer for the Antelope **SHiP** (State History
+//! Plugin) WebSocket protocol. Clients connect to the router; it selects an
+//! upstream SHiP node (range-aware, least-connections) and proxies the
+//! WebSocket bidirectionally, transparently failing over to another upstream
+//! and de-duplicating replayed blocks on reconnect.
+//!
+//! Run with `fleet-router run --config config.json`. See the project README for
+//! the full configuration reference and operational guidance.
+
 use std::any::Any;
 use std::fs::{read_to_string, write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use clap::{arg, value_parser, Command};
@@ -11,9 +23,11 @@ use rs_abieos::Abieos;
 use serde_json::from_str;
 use tokio::net::TcpListener;
 use tokio::spawn;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex, Semaphore};
+use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use tracing::Instrument;
 
 use crate::config_sample::CONFIG_SAMPLE;
 use crate::connection_handler::handle_client;
@@ -27,6 +41,7 @@ mod config_sample;
 mod connection_handler;
 mod errors;
 mod functions;
+mod health;
 mod models;
 mod tasks;
 mod zcd;
@@ -41,13 +56,14 @@ async fn main() -> Result<()> {
             }
             conf
         }
-        Ok(None) => {
-            return Ok(());
-        }
-        Err(e) => {
-            bail!(e)
-        }
+        Ok(None) => return Ok(()),
+        Err(e) => bail!(e),
     };
+
+    init_tracing();
+
+    // Validate the configuration up front with clear, actionable errors.
+    config.validate()?;
 
     let main_abieos = Abieos::new();
     let ctx = main_abieos.as_ptr();
@@ -56,114 +72,160 @@ async fn main() -> Result<()> {
     }
     let shared_abieos = Arc::new(Mutex::new(Abieos::from_context(ctx)));
 
-    if config.servers.iter().filter(|s| s.enabled).count() == 0 {
-        bail!("No enabled servers found in config.json. Aborting.");
-    }
-
-    // global settings
     let static_config = StaticConfig {
-        listen_port: config.listen_port,
         upstream_status_ms: config.upstream_status_ms,
         upstream_monitoring_ms: config.upstream_monitoring_ms,
-        listen_address: config.listen_address,
         upstream_reconnect_ms: config.upstream_reconnect_ms,
     };
+    let limits = config.proxy_limits();
 
-    if static_config.listen_address.is_empty() {
-        bail!("Invalid address");
-    }
-
-    // Create a shared state for the server configuration HashMap
     let server_config_db: ServerConfigDb = build_config_db(config.servers.clone());
-
-    // Create a shared state for the server state HashMap
     let server_state_db: ServerStateDb = build_state_db(config.servers.clone());
 
-    // Backend Monitoring Loop
+    // Graceful-shutdown broadcast: every long-lived task subscribes.
+    let (shutdown_tx, _) = broadcast::channel::<()>(16);
+
+    // Per-upstream monitoring loops.
     for server in config.servers.iter().filter(|s| s.enabled).cloned() {
-        println!("{}", server.name);
-        // Get references
-        let server_state_db_clone = server_state_db.clone();
-        let abieos_arc_clone = shared_abieos.clone();
-        println!("Monitoring started for server: {}", server.endpoint);
+        tracing::info!(name = %server.name, upstream = %server.endpoint, "starting upstream monitor");
         spawn(monitoring_connection(
             server,
             static_config.clone(),
-            server_state_db_clone,
-            abieos_arc_clone,
+            server_state_db.clone(),
+            shared_abieos.clone(),
+            shutdown_tx.subscribe(),
         ));
     }
 
-    // spawn a new async task to print the server state every 5 seconds
-    let server_state_db_clone = server_state_db.clone();
+    // Periodic block-progress / staleness monitor.
     spawn(state_monitoring_loop(
-        server_state_db_clone,
+        server_state_db.clone(),
         static_config.upstream_monitoring_ms,
+        shutdown_tx.subscribe(),
     ));
 
-    let listener = match TcpListener::bind(format!(
-        "{}:{}",
-        static_config.listen_address, static_config.listen_port
-    ))
-    .await
-    {
-        Ok(listener) => listener,
-        Err(e) => {
-            bail!("Error binding to address: {}", e);
-        }
-    };
+    // Optional health/metrics HTTP endpoint.
+    if let Some(port) = config.metrics_port {
+        let addr = format!(
+            "{}:{}",
+            config
+                .metrics_address
+                .clone()
+                .unwrap_or_else(|| config.listen_address.clone()),
+            port
+        );
+        spawn(health::run_metrics_server(
+            addr,
+            server_state_db.clone(),
+            shutdown_tx.subscribe(),
+        ));
+    }
 
-    println!(
-        "Listening on: {}:{}",
-        static_config.listen_address, static_config.listen_port
-    );
+    let bind_addr = format!("{}:{}", config.listen_address, config.listen_port);
+    let listener = TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("error binding to {}: {}", bind_addr, e))?;
+    tracing::info!(address = %config.listen_address, port = config.listen_port, "listening for clients");
 
-    // Graceful shutdown channel
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    // Connection backpressure: at most `max_connections` concurrent clients.
+    let conn_limit = Arc::new(Semaphore::new(config.max_connections));
+    let max_connections = config.max_connections;
 
     loop {
         tokio::select! {
-            // Accept new TCP connections on the main thread
             result = listener.accept() => {
                 let (client_stream, client_addr) = match result {
-                    Ok((stream, address)) => (stream, address),
+                    Ok(pair) => pair,
                     Err(e) => {
-                        eprintln!("Error accepting incoming connection: {}", e);
-                        // continue to the next iteration of the loop
+                        tracing::warn!(error = %e, "error accepting incoming connection");
                         continue;
                     }
                 };
 
-                println!(
-                    "New incoming TCP connection: {}:{}",
-                    client_addr.ip(),
-                    client_addr.port()
-                );
+                // Reject immediately when at capacity (backpressure, not queueing).
+                let permit = match conn_limit.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::warn!(%client_addr, max = max_connections, "connection limit reached; rejecting");
+                        drop(client_stream);
+                        continue;
+                    }
+                };
+
+                tracing::debug!(%client_addr, "accepted tcp connection");
 
                 let s_state_db = server_state_db.clone();
                 let s_config_db = server_config_db.clone();
                 let abieos = shared_abieos.clone();
-                let mut shutdown_rx = shutdown_tx.subscribe();
+                let shutdown_rx = shutdown_tx.subscribe();
 
-                // Spawn a new task to handle the new TCP connection
-                spawn(async move {
-                    tokio::select! {
-                        _ = handle_client(client_stream, client_addr, s_state_db, s_config_db, abieos) => {}
-                        _ = shutdown_rx.recv() => {
-                            println!("[{}] Connection closed due to server shutdown", client_addr);
-                        }
+                spawn(
+                    async move {
+                        let _permit = permit; // released when this task ends
+                        handle_client(
+                            client_stream,
+                            client_addr,
+                            s_state_db,
+                            s_config_db,
+                            abieos,
+                            limits,
+                            shutdown_rx,
+                        )
+                        .await;
                     }
-                });
+                    .instrument(tracing::info_span!("client", addr = %client_addr)),
+                );
             }
-            _ = tokio::signal::ctrl_c() => {
-                println!("\n[main] Received Ctrl+C / SIGINT. Shutting down gracefully...");
+            _ = shutdown_signal() => {
+                tracing::info!("shutdown signal received; draining connections");
                 let _ = shutdown_tx.send(());
-
-                // Allow a brief moment for inflight connections to drop naturally
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                drain_connections(&conn_limit, max_connections, config.shutdown_grace_ms).await;
+                tracing::info!("shutdown complete");
                 break Ok(());
             }
         }
+    }
+}
+
+/// Initialize `tracing` with a `RUST_LOG`-driven filter (default `info`).
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt().with_env_filter(filter).with_target(false).init();
+}
+
+/// Resolve when a shutdown signal (SIGINT/Ctrl+C, or SIGTERM on Unix) arrives.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Wait (up to `grace_ms`) for active client connections to drain.
+async fn drain_connections(conn_limit: &Arc<Semaphore>, max: usize, grace_ms: u64) {
+    let start = Instant::now();
+    while conn_limit.available_permits() < max {
+        if start.elapsed() >= Duration::from_millis(grace_ms) {
+            let remaining = max - conn_limit.available_permits();
+            tracing::warn!(remaining, "shutdown grace period elapsed; forcing exit");
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -221,7 +283,7 @@ async fn run_tests(servers: Vec<Server>) {
 fn process_args() -> Result<Option<(bool, ServerConfig)>> {
     let cmd = Command::new("fleet-router")
         .about("Protocol-aware reverse proxy for Antelope SHiP")
-        .version("0.2.0")
+        .version(env!("CARGO_PKG_VERSION"))
         .arg(
             arg!(--"config" <PATH>)
                 .global(true)
@@ -258,14 +320,13 @@ fn process_args() -> Result<Option<(bool, ServerConfig)>> {
     if let Some(("config", config)) = matches.subcommand() {
         match config.subcommand() {
             Some(("init", init)) => {
-                let path = {
-                    if let Some(config_out_path) = init.get_one::<PathBuf>("CONFIG_OUT") {
-                        config_out_path.to_owned()
-                    } else {
-                        PathBuf::from("./config.json")
-                    }
-                };
-                write(&path, CONFIG_SAMPLE).unwrap();
+                let path = init
+                    .get_one::<PathBuf>("CONFIG_OUT")
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from("./config.json"));
+                if let Err(e) = write(&path, CONFIG_SAMPLE) {
+                    bail!("failed to write config file {}: {}", path.display(), e);
+                }
                 let display_path = path.canonicalize().unwrap_or(path);
                 cprintln!(
                     "Creating new config file: <bright-cyan>{:?}</>",
@@ -275,40 +336,27 @@ fn process_args() -> Result<Option<(bool, ServerConfig)>> {
                 return Ok(None);
             }
             Some(("test", test)) => match test.get_one::<PathBuf>("CONFIG") {
-                None => {
-                    bail!("missing config file");
-                }
-                Some(test_path) => {
-                    return Ok(test_config(test_path));
-                }
+                None => bail!("missing config file"),
+                Some(test_path) => return Ok(test_config(test_path)),
             },
             _ => {}
         };
-    } else if let Some(("run", _run_matches)) = matches.subcommand() {
-        // Explicit run subcommand, which is exactly the same as no subcommand (default)
-        // No-op here since the config arg is registered globally
     }
 
     let config_path = match matches.get_one::<PathBuf>("config") {
         Some(path) => path,
-        None => {
-            bail!("missing config path");
-        }
+        None => bail!("missing config path"),
     };
-    println!("Using config file at: {:?}", config_path);
+    tracing::debug!(?config_path, "loading configuration");
 
     let config_contents = match read_to_string(config_path) {
         Ok(data) => data,
-        Err(e) => {
-            bail!("failed to read configuration file: {}", e);
-        }
+        Err(e) => bail!("failed to read configuration file: {}", e),
     };
 
     let config: ServerConfig = match from_str(&config_contents) {
         Ok(config) => config,
-        Err(e) => {
-            bail!("failed to parse configuration file: {}", e);
-        }
+        Err(e) => bail!("failed to parse configuration file: {}", e),
     };
 
     Ok(Some((false, config)))
@@ -316,18 +364,20 @@ fn process_args() -> Result<Option<(bool, ServerConfig)>> {
 
 fn test_config(path: &PathBuf) -> Option<(bool, ServerConfig)> {
     match read_to_string(path) {
-        Ok(data) => {
-            match from_str::<ServerConfig>(&data) {
-                Ok(config) => {
-                    // println!("{:#?}", config);
-                    Some((true, config))
+        Ok(data) => match from_str::<ServerConfig>(&data) {
+            Ok(config) => {
+                if let Err(e) = config.validate() {
+                    cprintln!("<red>configuration is invalid: {}</>", e);
+                    return None;
                 }
-                Err(e) => {
-                    cprintln!("<red>failed to parse configuration file: {}</>", e);
-                    None
-                }
+                cprintln!("<green>configuration is valid.</>");
+                Some((true, config))
             }
-        }
+            Err(e) => {
+                cprintln!("<red>failed to parse configuration file: {}</>", e);
+                None
+            }
+        },
         Err(e) => {
             cprintln!("<red>failed to read configuration file: {}</>", e);
             None

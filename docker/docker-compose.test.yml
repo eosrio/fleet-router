@@ -117,7 +117,7 @@ services:
     volumes:
       - ./fleet-router.json:/etc/fleet-router.json:ro
     ports:
-      - "9100:9000"
+      - "9100:17000"
     depends_on:
       nodeos-2:
         condition: service_started

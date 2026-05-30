@@ -1,0 +1,112 @@
+name: Bug report
+description: Report a problem with fleet-router (proxying, failover, build, config, or metrics).
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        Before opening an issue:
+        - Search existing issues to avoid duplicates.
+        - For security vulnerabilities, do **not** open a public issue. Use private reporting per [SECURITY.md](../../SECURITY.md).
+        - For questions or usage help, please use Discussions instead.
+
+        fleet-router currently supports **Linux x86_64 only**. macOS/Windows are not supported for native builds; use the Docker image (`ghcr.io/eosrio/fleet-router`) there.
+
+  - type: input
+    id: version
+    attributes:
+      label: fleet-router version
+      description: "Output of `fleet-router --version`, or the Docker image tag / git commit you built from."
+      placeholder: "0.2.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: How was it installed?
+      options:
+        - crates.io (cargo install fleet-router)
+        - From source (cargo install --path .)
+        - Docker image (ghcr.io/eosrio/fleet-router)
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: input
+    id: os-arch
+    attributes:
+      label: OS and architecture
+      description: "Distribution/version and CPU architecture. Remember: only Linux x86_64 is supported."
+      placeholder: "Ubuntu 24.04, x86_64"
+    validations:
+      required: true
+
+  - type: input
+    id: build-env
+    attributes:
+      label: Rust version and build toolchain (for build issues)
+      description: >-
+        Output of `rustc --version` (MSRV is 1.85), and whether clang + libclang-dev were installed
+        (required by bindgen). Leave blank if this is not a build issue.
+      placeholder: "rustc 1.85.0; clang/libclang-dev installed: yes"
+    validations:
+      required: false
+
+  - type: textarea
+    id: config
+    attributes:
+      label: config.json (redact secrets)
+      description: "Your config.json or the relevant portion. Redact endpoints/hosts you don't want public."
+      render: json
+      placeholder: |
+        {
+          "listen_address": "0.0.0.0",
+          "listen_port": 17000,
+          "upstream_reconnect_ms": 3000,
+          "upstream_monitoring_ms": 5000,
+          "upstream_status_ms": 5000,
+          "servers": [
+            { "name": "node-1", "endpoint": "10.0.0.1:8080", "enabled": true }
+          ]
+        }
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: "Exact commands and actions that trigger the problem."
+      placeholder: |
+        1. fleet-router config test ./config.json
+        2. fleet-router run --config ./config.json
+        3. Connect a SHiP client to ws://host:17000 and send a get_blocks request
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-actual
+    attributes:
+      label: Expected vs. actual behavior
+      description: "What you expected to happen, and what actually happened."
+      placeholder: |
+        Expected: client connection persists across upstream failover with no gap in blocks.
+        Actual: client received duplicate blocks / connection dropped / ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs (RUST_LOG=debug)
+      description: "Run with `RUST_LOG=debug` and paste the relevant output. Redact sensitive values."
+      render: shell
+      placeholder: |
+        RUST_LOG=debug fleet-router run --config ./config.json
+        2026-05-30T12:00:00Z  INFO fleet_router: ...
+    validations:
+      required: false

@@ -652,7 +652,10 @@ async fn e2e_proxy_failover() {
                 .unwrap();
             if let Message::Binary(data) = read_one(&mut reader).await {
                 let head = u32::from_le_bytes(data[1..5].try_into().unwrap());
-                assert_eq!(head, 6000, "After failover, should route to surviving upstream");
+                assert_eq!(
+                    head, 6000,
+                    "After failover, should route to surviving upstream"
+                );
                 successes += 1;
             }
             drop(writer);
@@ -661,7 +664,10 @@ async fn e2e_proxy_failover() {
         sleep(Duration::from_millis(100)).await;
     }
 
-    println!("  After failover: {} successful connections to upstream 6000", successes);
+    println!(
+        "  After failover: {} successful connections to upstream 6000",
+        successes
+    );
     assert!(
         successes >= 3,
         "Expected at least 3 successful connections after failover, got {}",
@@ -751,7 +757,9 @@ async fn e2e_proxy_sustained_streaming() {
 
     println!(
         "  Sustained: {} total blocks across {} clients in {:.2}s",
-        total_received, num_clients, elapsed.as_secs_f64()
+        total_received,
+        num_clients,
+        elapsed.as_secs_f64()
     );
 
     assert_eq!(
@@ -953,7 +961,10 @@ async fn e2e_proxy_range_aware_routing() {
         }
     }
 
-    println!("  Range routing: heads seen = {:?}, blocks = {}", heads_seen, blocks_received);
+    println!(
+        "  Range routing: heads seen = {:?}, blocks = {}",
+        heads_seen, blocks_received
+    );
 
     // All blocks should come from upstream A (head=5000), never from B (head=10000)
     assert!(
@@ -1069,7 +1080,9 @@ async fn e2e_proxy_failover_to_range_valid() {
                 }
                 // Send acks to keep flow going
                 if blocks_received.is_multiple_of(10) {
-                    let _ = writer.send(Message::Binary(build_ack_request(10).into())).await;
+                    let _ = writer
+                        .send(Message::Binary(build_ack_request(10).into()))
+                        .await;
                 }
                 if blocks_received >= 20 {
                     break;

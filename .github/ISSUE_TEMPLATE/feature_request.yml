@@ -1,0 +1,43 @@
+name: Feature request
+description: Suggest a new feature or enhancement for fleet-router.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement.
+
+        Please search existing issues and Discussions first to avoid duplicates.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: "What problem are you trying to solve? What is the use case or pain point?"
+      placeholder: "When an upstream goes stale, I'd like ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: "Describe the behavior or capability you'd like. Be as concrete as you can (config fields, CLI flags, metrics, etc.)."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: "Other approaches or workarounds you've considered, and why they fall short."
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: "Any other context, references, links, or examples that would help."
+    validations:
+      required: false

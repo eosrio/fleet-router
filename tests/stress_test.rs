@@ -289,15 +289,8 @@ async fn stress_concurrent_heavy_clients_mock() {
 
             writer
                 .send(Message::Binary(
-                    build_blocks_request_with_data(
-                        start,
-                        end,
-                        max_in_flight,
-                        true,
-                        true,
-                        true,
-                    )
-                    .into(),
+                    build_blocks_request_with_data(start, end, max_in_flight, true, true, true)
+                        .into(),
                 ))
                 .await
                 .unwrap();
@@ -380,10 +373,7 @@ where
     test_fn().await;
 
     // Stop load
-    let _ = client
-        .post(format!("{}/stop", base))
-        .send()
-        .await;
+    let _ = client.post(format!("{}/stop", base)).send().await;
 
     // Print final status
     if let Ok(res) = client.get(format!("{}/status", base)).send().await {
@@ -428,8 +418,15 @@ async fn stress_block_data_via_router_docker() {
         let start = if head > count { head - count } else { 1 };
         writer
             .send(Message::Binary(
-                build_blocks_request_with_data(start, start + count, max_in_flight, true, true, true)
-                    .into(),
+                build_blocks_request_with_data(
+                    start,
+                    start + count,
+                    max_in_flight,
+                    true,
+                    true,
+                    true,
+                )
+                .into(),
             ))
             .await
             .unwrap();
@@ -536,4 +533,3 @@ async fn stress_concurrent_clients_via_router_docker() {
     })
     .await;
 }
-

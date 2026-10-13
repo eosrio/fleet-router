@@ -192,8 +192,15 @@ async fn handle_monitoring_msg(
         Message::Text(msg) => {
             if ship_abi.is_none() {
                 *ship_abi = Some(msg.to_string());
+                let Some(abi) = ship_abi.as_deref() else {
+                    tracing::warn!(
+                        upstream = %server.endpoint,
+                        "upstream ABI missing after handshake"
+                    );
+                    return;
+                };
                 let abieos = abieos.lock().await;
-                match abieos.set_abi_json_native(0u64, ship_abi.as_deref().unwrap()) {
+                match abieos.set_abi_json_native(0u64, abi) {
                     Ok(true) => {
                         let mut s = sender.lock().await;
                         if let Err(e) = s.send(Message::Binary(vec![0u8].into())).await {
@@ -212,37 +219,12 @@ async fn handle_monitoring_msg(
             }
         }
         Message::Binary(bin_msg) => {
-            let result_message = zcd::deserialize_result(&bin_msg);
-
-            let Some(ZCDValues::U8(0)) = result_message.get("variant") else {
-                return;
-            };
-            let Some(ZCDValues::Bytes(bytes)) = result_message.get("data") else {
-                return;
-            };
-            let result = zcd::deserialize_status_result(&bytes);
-
-            let Some(ZCDValues::U32(head_block_num)) = result.get("head_block_num") else {
-                return;
-            };
-            if head_block_num > 0 {
-                let mut db = server_state_db.lock().await;
-                if let Some(state) = db.get_mut(&server.endpoint) {
-                    state.enabled = true;
-                    state.online = true;
-                    if let Some(ZCDValues::U32(tb)) = result.get("trace_begin_block") {
-                        state.trace_begin_block = tb;
-                    }
-                    if let Some(ZCDValues::U32(te)) = result.get("trace_end_block") {
-                        state.trace_end_block = te;
-                    }
-                    if let Some(ZCDValues::U32(cb)) = result.get("chain_state_begin_block") {
-                        state.chain_state_begin_block = cb;
-                    }
-                    if let Some(ZCDValues::U32(ce)) = result.get("chain_state_end_block") {
-                        state.chain_state_end_block = ce;
-                    }
-                }
+            if let Err(e) = apply_status_update(&bin_msg, server_state_db, server).await {
+                tracing::warn!(
+                    upstream = %server.endpoint,
+                    error = %e,
+                    "rejected upstream status frame"
+                );
             }
         }
         Message::Close(_) => {
@@ -250,5 +232,150 @@ async fn handle_monitoring_msg(
             *server_closed = true;
         }
         _ => {}
+    }
+}
+
+/// Apply one upstream binary frame to `server`'s monitored state.
+///
+/// Non-status results are ignored. A status body that is truncated or
+/// malformed leaves the stored state unchanged and returns the decode error.
+async fn apply_status_update(
+    bin_msg: &[u8],
+    server_state_db: &ServerStateDb,
+    server: &Server,
+) -> Result<(), zcd::ZcdError> {
+    let result_message = zcd::deserialize_result(bin_msg);
+    match result_message.get("variant")? {
+        Some(ZCDValues::U8(0)) => {}
+        _ => return Ok(()),
+    }
+    let Some(ZCDValues::Bytes(bytes)) = result_message.get("data")? else {
+        return Err(zcd::ZcdError::MissingField);
+    };
+    let result = zcd::deserialize_status_result(&bytes)?;
+    let head_block_num = require_u32(&result, "head_block_num")?;
+    if head_block_num == 0 {
+        return Ok(());
+    }
+    let trace_begin = require_u32(&result, "trace_begin_block")?;
+    let trace_end = require_u32(&result, "trace_end_block")?;
+    let chain_begin = require_u32(&result, "chain_state_begin_block")?;
+    let chain_end = require_u32(&result, "chain_state_end_block")?;
+
+    let mut db = server_state_db.lock().await;
+    if let Some(state) = db.get_mut(&server.endpoint) {
+        state.enabled = true;
+        state.online = true;
+        state.trace_begin_block = trace_begin;
+        state.trace_end_block = trace_end;
+        state.chain_state_begin_block = chain_begin;
+        state.chain_state_end_block = chain_end;
+    }
+    Ok(())
+}
+
+fn require_u32(result: &zcd::ZCD<'_>, field: &'static str) -> Result<u32, zcd::ZcdError> {
+    match result.get(field)? {
+        Some(ZCDValues::U32(value)) => Ok(value),
+        _ => Err(zcd::ZcdError::Truncated {
+            field,
+            expected: 4,
+            remaining: 0,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_status_update;
+    use crate::models::{build_state_db, Server};
+    use crate::zcd::ZcdError;
+
+    fn fixture() -> (Server, crate::models::ServerStateDb) {
+        let server = Server {
+            name: "alpha".to_string(),
+            endpoint: "127.0.0.1:18080".to_string(),
+            enabled: true,
+        };
+        let db = build_state_db(vec![server.clone()]);
+        (server, db)
+    }
+
+    fn status_body() -> Vec<u8> {
+        let mut buf = Vec::with_capacity(120);
+        buf.extend_from_slice(&1000u32.to_le_bytes());
+        buf.extend_from_slice(&[0x11; 32]);
+        buf.extend_from_slice(&990u32.to_le_bytes());
+        buf.extend_from_slice(&[0x22; 32]);
+        buf.extend_from_slice(&10u32.to_le_bytes());
+        buf.extend_from_slice(&1001u32.to_le_bytes());
+        buf.extend_from_slice(&5u32.to_le_bytes());
+        buf.extend_from_slice(&1000u32.to_le_bytes());
+        buf.extend_from_slice(&[0xAB; 32]);
+        buf
+    }
+
+    /// Result variant 0 followed by a status body.
+    fn status_message(body: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0u8];
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    #[tokio::test]
+    async fn valid_status_frame_updates_upstream_state() {
+        let (server, db) = fixture();
+        apply_status_update(&status_message(&status_body()), &db, &server)
+            .await
+            .expect("valid status");
+        let guard = db.lock().await;
+        let state = guard.get(&server.endpoint).expect("state");
+        assert!(state.online);
+        assert_eq!(state.trace_begin_block, 10);
+        assert_eq!(state.trace_end_block, 1001);
+        assert_eq!(state.chain_state_begin_block, 5);
+        assert_eq!(state.chain_state_end_block, 1000);
+    }
+
+    #[tokio::test]
+    async fn truncated_status_frame_is_rejected_without_panic() {
+        let (server, db) = fixture();
+        // Variant byte only: the status body is missing.
+        let err = apply_status_update(&[0], &db, &server)
+            .await
+            .expect_err("truncated");
+        assert_eq!(
+            err,
+            ZcdError::Truncated {
+                field: "head_block_num",
+                expected: 4,
+                remaining: 0,
+            }
+        );
+        let guard = db.lock().await;
+        let state = guard.get(&server.endpoint).expect("state");
+        assert!(!state.online);
+        assert_eq!(state.trace_end_block, 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_status_frame_is_rejected_without_panic() {
+        let (server, db) = fixture();
+        // Variant plus three bytes of a four-byte head block number.
+        let err = apply_status_update(&[0, 1, 2, 3], &db, &server)
+            .await
+            .expect_err("malformed");
+        assert_eq!(
+            err,
+            ZcdError::Malformed {
+                field: "head_block_num",
+                expected: 4,
+                actual: 3,
+            }
+        );
+        let guard = db.lock().await;
+        let state = guard.get(&server.endpoint).expect("state");
+        assert!(!state.online);
+        assert_eq!(state.chain_state_end_block, 0);
     }
 }

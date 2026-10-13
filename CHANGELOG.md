@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `softprops/action-gh-release` v3 (Node 24). Dependabot tracks Actions, Cargo,
   and Docker updates.
 
+### Fixed
+
+- The hand-rolled SHiP status decoder rejects truncated and malformed upstream
+  frames with an error instead of panicking on a short slice or a missing
+  field. The monitoring loop logs the error and leaves that upstream's state
+  unchanged. The upstream ABI is applied without unwrapping the handshake
+  buffer.
+
 ### Security
 
 - Locked dependency updates clear `RUSTSEC-2026-0258` (`h2` 0.4.20),

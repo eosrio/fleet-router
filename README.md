@@ -125,7 +125,8 @@ Configuration is a single JSON file (`config.json` by default). The three `*_ms`
 | `max_connections` | usize | no | `10000` | Max concurrent client connections; excess are rejected (backpressure). |
 | `handshake_timeout_ms` | u64 | no | `10000` | Client WebSocket handshake timeout; `0` disables it. |
 | `idle_timeout_ms` | u64 | no | `0` (disabled) | Close a connection idle (no data in either direction) for this long. |
-| `max_message_bytes` | usize | no | `268435456` (256 MiB) | Max WebSocket message size on both client and upstream links. |
+| `max_message_bytes` | usize | no | `268435456` (256 MiB) | Max WebSocket message size on upstream links. |
+| `max_client_message_bytes` | usize | no | `65536` (64 KiB) | Max WebSocket message and frame size accepted from a client. Omitting the field keeps existing configs valid and applies this default. |
 | `shutdown_grace_ms` | u64 | no | `5000` | How long to wait for in-flight connections to drain on shutdown. |
 | `metrics_address` | string | no | falls back to `listen_address` | Bind address for the health/metrics HTTP endpoint. |
 | `metrics_port` | u16 | no | unset (endpoint disabled) | Port for the health/metrics HTTP endpoint. Setting it enables the endpoint. |
@@ -137,6 +138,8 @@ Each entry in `servers` is an object:
 | `name` | string | yes | Human-readable name used in logs. |
 | `endpoint` | string | yes | Upstream as `host:port` (no scheme; `ws://` is prepended). Endpoints must be unique. |
 | `enabled` | bool | yes | Whether the router may use this upstream. At least one enabled server is required. |
+
+Client requests are capped by `max_client_message_bytes` (default 64 KiB) on both the WebSocket message size and the frame size. Upstream block payloads still use `max_message_bytes`. While an upstream failover is in progress, client frames that cannot be forwarded are buffered up to **64 KiB** per session. Each buffered frame counts as at least one byte, so empty frames cannot grow the queue without a bound. Exceeding that cap closes the session with WebSocket close code 1008 (policy violation).
 
 ### Sample `config.json`
 
@@ -249,7 +252,7 @@ The image runs as a non-root user. Its `HEALTHCHECK` runs `fleet-router check`, 
 ### Tuning notes
 
 - **Intervals** (`upstream_reconnect_ms`, `upstream_monitoring_ms`, `upstream_status_ms`): lower values detect failures and staleness faster at the cost of more polling traffic to upstreams; raise them to reduce chatter.
-- **Limits** (`max_connections`, `handshake_timeout_ms`, `idle_timeout_ms`, `max_message_bytes`): size `max_connections` for your expected concurrency (excess connections are rejected, not queued); set `idle_timeout_ms` to reap dead clients; lower `max_message_bytes` only if you are sure your blocks fit, since oversized frames are rejected on both links.
+- **Limits** (`max_connections`, `handshake_timeout_ms`, `idle_timeout_ms`, `max_message_bytes`, `max_client_message_bytes`): size `max_connections` for your expected concurrency (excess connections are rejected, not queued); set `idle_timeout_ms` to reap dead clients; lower `max_message_bytes` only if you are sure upstream blocks fit. `max_client_message_bytes` caps client frames (default 64 KiB). The per-session failover buffer is capped at 64 KiB, and the session is closed if a client exceeds it.
 
 ## Security and limitations
 

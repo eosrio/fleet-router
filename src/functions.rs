@@ -23,11 +23,37 @@ pub fn select_backend_server(
     servers: &HashMap<String, ServerState>,
     requested_block: Option<u32>,
 ) -> Result<String, &'static str> {
+    select_ranked(servers, requested_block, true)
+}
+
+/// Select an upstream for a session whose socket just died.
+///
+/// Prefers the same ranking as [`select_backend_server`]. When every candidate
+/// is offline, still returns an enabled server so failover can attempt a
+/// reconnect. The monitor marks an upstream offline as soon as its own read
+/// fails, and that is often the same drop the proxy just saw. Refusing the
+/// only server would close the client before the handshake and the
+/// pending-byte cap can run. New sessions keep the online requirement.
+pub fn select_failover_server(
+    servers: &HashMap<String, ServerState>,
+    requested_block: Option<u32>,
+) -> Result<String, &'static str> {
+    if let Ok(server) = select_backend_server(servers, requested_block) {
+        return Ok(server);
+    }
+    select_ranked(servers, requested_block, false)
+}
+
+fn select_ranked(
+    servers: &HashMap<String, ServerState>,
+    requested_block: Option<u32>,
+    require_online: bool,
+) -> Result<String, &'static str> {
     // Lower (rank, connections) is better.
     let mut best: Option<(u8, usize, String)> = None;
 
     for (server, state) in servers.iter() {
-        if !state.enabled || !state.online {
+        if !state.enabled || (require_online && !state.online) {
             continue;
         }
 
@@ -80,4 +106,46 @@ pub fn buffer_to_hex(buffer: Vec<u8>) -> String {
         hex.push_str(&format!("{:02x}", byte));
     }
     hex
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn state(enabled: bool, online: bool, conns: usize) -> ServerState {
+        let mut server = ServerState::new();
+        server.enabled = enabled;
+        server.online = online;
+        server.connections = Arc::new(AtomicUsize::new(conns));
+        server
+    }
+
+    #[test]
+    fn new_sessions_skip_offline_upstreams() {
+        let mut servers = HashMap::new();
+        servers.insert("dead".into(), state(true, false, 0));
+        assert!(select_backend_server(&servers, None).is_err());
+        assert_eq!(select_failover_server(&servers, None).unwrap(), "dead");
+    }
+
+    #[test]
+    fn failover_prefers_an_online_upstream() {
+        let mut servers = HashMap::new();
+        servers.insert("dead".into(), state(true, false, 0));
+        servers.insert("live".into(), state(true, true, 5));
+        assert_eq!(select_backend_server(&servers, None).unwrap(), "live");
+        assert_eq!(select_failover_server(&servers, None).unwrap(), "live");
+    }
+
+    #[test]
+    fn failover_skips_disabled_upstreams() {
+        let mut servers = HashMap::new();
+        servers.insert("off".into(), state(false, false, 0));
+        servers.insert("also".into(), state(false, true, 0));
+        assert!(select_failover_server(&servers, None).is_err());
+        assert!(select_backend_server(&servers, None).is_err());
+    }
 }

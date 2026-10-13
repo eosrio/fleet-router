@@ -120,12 +120,12 @@ Configuration is a single JSON file (`config.json` by default). The three `*_ms`
 | `listen_port` | u16 | yes (non-zero) | `17000` (sample) | Port for client connections. |
 | `upstream_reconnect_ms` | u64 | yes (> 0) | — | Milliseconds between upstream reconnection attempts. |
 | `upstream_monitoring_ms` | u64 | yes (> 0) | — | Milliseconds between block-progress logging and staleness checks. |
-| `upstream_status_ms` | u64 | yes (> 0) | — | Milliseconds between status requests sent to each upstream. |
+| `upstream_status_ms` | u64 | yes (> 0) | — | Milliseconds between status requests sent to each upstream. Only one request is in flight; a reply that misses this deadline marks the upstream offline. |
 | `servers` | array | yes (≥ 1 enabled) | — | List of upstream SHiP nodes (see below). |
 | `max_connections` | usize | no | `10000` | Max concurrent client connections; excess are rejected (backpressure). |
-| `handshake_timeout_ms` | u64 | no | `10000` | Client WebSocket handshake timeout; `0` disables it. |
+| `handshake_timeout_ms` | u64 | no | `10000` | Client WebSocket handshake timeout; `0` disables it. The upstream monitor and `config test` use this same bound for connect and the first read, falling back to 10s when it is `0`. |
 | `idle_timeout_ms` | u64 | no | `0` (disabled) | Close a connection idle (no data in either direction) for this long. |
-| `max_message_bytes` | usize | no | `268435456` (256 MiB) | Max WebSocket message size on upstream links. |
+| `max_message_bytes` | usize | no | `268435456` (256 MiB) | Max WebSocket message size on proxied upstreams and monitor connections. |
 | `max_client_message_bytes` | usize | no | `65536` (64 KiB) | Max WebSocket message and frame size accepted from a client. Omitting the field keeps existing configs valid and applies this default. |
 | `shutdown_grace_ms` | u64 | no | `5000` | How long to wait for in-flight connections to drain on shutdown. |
 | `metrics_address` | string | no | falls back to `listen_address` | Bind address for the health/metrics HTTP endpoint. |

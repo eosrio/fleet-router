@@ -24,18 +24,17 @@ use serde_json::from_str;
 use tokio::net::TcpListener;
 use tokio::spawn;
 use tokio::sync::{broadcast, Mutex, Semaphore};
-use tokio::time::sleep;
-use tokio_tungstenite::connect_async;
+use tokio::time::{sleep, timeout};
+use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::Instrument;
 
 use crate::config_sample::CONFIG_SAMPLE;
 use crate::connection_handler::handle_client;
 use crate::models::{
-    build_config_db, build_state_db, Server, ServerConfig, ServerConfigDb, ServerStateDb,
-    StaticConfig,
+    build_config_db, build_state_db, ServerConfig, ServerConfigDb, ServerStateDb, StaticConfig,
 };
-use crate::tasks::{monitoring_connection, state_monitoring_loop};
+use crate::tasks::{monitoring_connection, state_monitoring_loop, upstream_ws_config};
 
 mod config_sample;
 mod connection_handler;
@@ -51,7 +50,7 @@ async fn main() -> Result<()> {
     let config: ServerConfig = match process_args() {
         Ok(Some((test, conf))) => {
             if test {
-                run_tests(conf.servers.clone()).await;
+                run_tests(&conf).await;
                 return Ok(());
             }
             conf
@@ -76,6 +75,8 @@ async fn main() -> Result<()> {
         upstream_status_ms: config.upstream_status_ms,
         upstream_monitoring_ms: config.upstream_monitoring_ms,
         upstream_reconnect_ms: config.upstream_reconnect_ms,
+        connect_timeout_ms: config.upstream_connect_timeout_ms(),
+        max_message_bytes: config.max_message_bytes,
     };
     let limits = config.proxy_limits();
 
@@ -229,46 +230,97 @@ async fn drain_connections(conn_limit: &Arc<Semaphore>, max: usize, grace_ms: u6
     }
 }
 
-async fn run_tests(servers: Vec<Server>) {
-    let mut valid_count = 0;
-    for server in servers {
-        let endpoint = format!("ws://{}", server.endpoint);
-        cprintln!("\n 🧪 Testing <bright-cyan>{}</>", endpoint);
-        match connect_async(endpoint.clone()).await {
-            Ok((ws, _)) => {
-                cprintln!(" ✅  <green>Websocket connected!</>");
-                let (_, mut reader) = ws.split();
-                let message = reader.next().await;
-                match message {
-                    None => {
-                        cprintln!(" ❌  <red>{}:</> No Message Received!", endpoint);
-                    }
-                    Some(Ok(Message::Text(txt))) => {
-                        if txt.contains("eosio::abi") {
-                            cprintln!(" ✅  <green>ABI Received!</>");
-                            valid_count += 1;
-                        } else {
-                            cprintln!(" ❌  <red>{}:</> Invalid ABI!", endpoint);
-                        }
-                    }
-                    Some(Err(e)) => {
-                        cprintln!(
-                            " ❌  <red>{}:</> Failed to read message! Error: {}",
-                            endpoint,
-                            e
-                        );
-                    }
-                    Some(Ok(m)) => {
-                        cprintln!(
-                            " ❌  <red>{}:</> Unexpected Message type: {:?}",
-                            endpoint,
-                            m.type_id()
-                        );
-                    }
-                }
+enum Probe {
+    Abi,
+    ConnectTimeout,
+    ConnectFailed(String),
+    ReadTimeout,
+    NoMessage,
+    ReadFailed(String),
+    InvalidAbi,
+    Unexpected(String),
+}
+
+/// `config test`: connect, read the ABI frame, and report. Both steps are
+/// bounded, and the socket uses the configured message size.
+async fn probe_upstream(endpoint: &str, max_message_bytes: usize, bound: Duration) -> Probe {
+    let connect =
+        connect_async_with_config(endpoint, Some(upstream_ws_config(max_message_bytes)), true);
+    let ws = match timeout(bound, connect).await {
+        Err(_) => return Probe::ConnectTimeout,
+        Ok(Err(e)) => return Probe::ConnectFailed(e.to_string()),
+        Ok(Ok((ws, _))) => ws,
+    };
+
+    let (_, mut reader) = ws.split();
+    match timeout(bound, reader.next()).await {
+        Err(_) => Probe::ReadTimeout,
+        Ok(None) => Probe::NoMessage,
+        Ok(Some(Err(e))) => Probe::ReadFailed(e.to_string()),
+        Ok(Some(Ok(Message::Text(txt)))) => {
+            if txt.contains("eosio::abi") {
+                Probe::Abi
+            } else {
+                Probe::InvalidAbi
             }
-            Err(e) => {
+        }
+        Ok(Some(Ok(other))) => Probe::Unexpected(format!("{:?}", other.type_id())),
+    }
+}
+
+async fn run_tests(config: &ServerConfig) {
+    let mut valid_count = 0;
+    let bound = Duration::from_millis(config.upstream_connect_timeout_ms());
+    for server in &config.servers {
+        let endpoint = server.ws_url();
+        cprintln!("\n 🧪 Testing <bright-cyan>{}</>", endpoint);
+        match probe_upstream(&endpoint, config.max_message_bytes, bound).await {
+            Probe::Abi => {
+                cprintln!(" ✅  <green>Websocket connected!</>");
+                cprintln!(" ✅  <green>ABI Received!</>");
+                valid_count += 1;
+            }
+            Probe::ConnectTimeout => {
+                cprintln!(
+                    " ❌  <red>{}:</> Websocket connect timed out after {} ms",
+                    endpoint,
+                    bound.as_millis()
+                );
+            }
+            Probe::ConnectFailed(e) => {
                 cprintln!(" ❌  <red>Connection failed! Error: {}</>", e);
+            }
+            Probe::ReadTimeout => {
+                cprintln!(" ✅  <green>Websocket connected!</>");
+                cprintln!(
+                    " ❌  <red>{}:</> Timed out waiting for the ABI after {} ms",
+                    endpoint,
+                    bound.as_millis()
+                );
+            }
+            Probe::NoMessage => {
+                cprintln!(" ✅  <green>Websocket connected!</>");
+                cprintln!(" ❌  <red>{}:</> No Message Received!", endpoint);
+            }
+            Probe::ReadFailed(e) => {
+                cprintln!(" ✅  <green>Websocket connected!</>");
+                cprintln!(
+                    " ❌  <red>{}:</> Failed to read message! Error: {}",
+                    endpoint,
+                    e
+                );
+            }
+            Probe::InvalidAbi => {
+                cprintln!(" ✅  <green>Websocket connected!</>");
+                cprintln!(" ❌  <red>{}:</> Invalid ABI!", endpoint);
+            }
+            Probe::Unexpected(kind) => {
+                cprintln!(" ✅  <green>Websocket connected!</>");
+                cprintln!(
+                    " ❌  <red>{}:</> Unexpected Message type: {}",
+                    endpoint,
+                    kind
+                );
             }
         }
     }

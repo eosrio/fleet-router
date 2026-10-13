@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +38,26 @@ pub struct MockShipConfig {
     pub trace_begin_block: u32,
     /// One past last block with trace data. Default: 0 = use head_block + 1.
     pub trace_end_block: u32,
+    /// Optional fault injected into `get_status` handling. Default: none.
+    pub status_fault: Option<StatusFault>,
+    /// Total `get_status` requests observed across all sessions.
+    pub status_requests: Option<Arc<AtomicUsize>>,
+    /// Highest number of `get_status` requests observed on any single session.
+    pub max_status_per_session: Option<Arc<AtomicUsize>>,
+}
+
+/// How the mock treats `get_status` requests. Used to exercise monitor limits.
+#[derive(Debug, Clone, Copy)]
+pub enum StatusFault {
+    /// Accept the request and never answer it.
+    Ignore,
+    /// Answer `after_replies` status requests, wait `delay`, send one binary
+    /// frame of `frame_bytes`, then end the session.
+    Oversized {
+        after_replies: u32,
+        frame_bytes: usize,
+        delay: Duration,
+    },
 }
 
 impl Default for MockShipConfig {
@@ -53,7 +73,19 @@ impl Default for MockShipConfig {
             block_data_size: 0,
             trace_begin_block: 1,
             trace_end_block: 0, // 0 = use head_block + 1
+            status_fault: None,
+            status_requests: None,
+            max_status_per_session: None,
         }
+    }
+}
+
+fn observe_status(config: &MockShipConfig, session_status: usize) {
+    if let Some(counter) = &config.status_requests {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(max) = &config.max_status_per_session {
+        max.fetch_max(session_status, Ordering::Relaxed);
     }
 }
 
@@ -205,6 +237,8 @@ impl MockShipServer {
         let mut fetch_block = false;
         let mut fetch_traces = false;
         let mut fetch_deltas = false;
+        let mut session_status: usize = 0;
+        let mut status_replies: u32 = 0;
 
         loop {
             // If we have credits and an active block request, send blocks
@@ -278,6 +312,12 @@ impl MockShipServer {
                     let request = decode_request(&data);
                     match request {
                         ShipRequest::GetStatusV0 | ShipRequest::GetStatusV1 => {
+                            session_status += 1;
+                            observe_status(&config, session_status);
+                            if matches!(config.status_fault, Some(StatusFault::Ignore)) {
+                                continue;
+                            }
+
                             let trace_end = if config.trace_end_block > 0 {
                                 config.trace_end_block
                             } else {
@@ -292,6 +332,22 @@ impl MockShipServer {
                             );
                             if writer.send(Message::Binary(result.into())).await.is_err() {
                                 return;
+                            }
+                            status_replies += 1;
+                            if let Some(StatusFault::Oversized {
+                                after_replies,
+                                frame_bytes,
+                                delay,
+                            }) = config.status_fault
+                            {
+                                if status_replies >= after_replies {
+                                    if !delay.is_zero() {
+                                        sleep(delay).await;
+                                    }
+                                    let frame = vec![0xFFu8; frame_bytes];
+                                    let _ = writer.send(Message::Binary(frame.into())).await;
+                                    return;
+                                }
                             }
                         }
                         ShipRequest::GetBlocksV0 {

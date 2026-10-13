@@ -41,8 +41,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The hand-rolled SHiP status decoder rejects truncated and malformed upstream
   frames with an error instead of panicking on a short slice or a missing
   field. The monitoring loop logs the error and leaves that upstream's state
-  unchanged. The upstream ABI is applied without unwrapping the handshake
-  buffer.
+  unchanged. A rejected status frame does not count as the in-flight reply.
+  The upstream ABI is applied without unwrapping the handshake buffer.
+- Upstream monitors and `config test` bound WebSocket connect and the first read
+  with a timeout (`handshake_timeout_ms`, or 10s when that is 0) and apply
+  `max_message_bytes`. A read error, a connect failure, or a missing status
+  reply marks that upstream offline. An existing session still retries that
+  upstream when no other node is online, so a single-node drop can reconnect
+  (or hit the pending-byte cap) instead of closing immediately.
+- Status polling keeps a single `get_status_request` in flight and drops the
+  session if the reply does not arrive within `upstream_status_ms`. A stalled
+  nodeos no longer accumulates queued status requests (Spring 1.2.3 ends a
+  session once more than 100 are outstanding).
 
 ## [0.2.0] - 2026-05-30
 

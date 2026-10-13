@@ -1,5 +1,5 @@
 # Multi-stage build: compile reference-contracts, then run bootstrap
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:26.04 AS builder
 
 ARG CDT_VERSION=4.1.1
 ARG CDT_DEB=https://github.com/AntelopeIO/cdt/releases/download/v${CDT_VERSION}/cdt_${CDT_VERSION}-1_amd64.deb
@@ -18,7 +18,7 @@ WORKDIR /contracts/build
 RUN cmake .. && make -j$(nproc)
 
 # --- Runtime stage ---
-FROM ubuntu:22.04
+FROM ubuntu:26.04
 
 ARG SPRING_VERSION=1.2.2
 ARG DEB_URL=https://github.com/AntelopeIO/spring/releases/download/v${SPRING_VERSION}/antelope-spring_${SPRING_VERSION}_amd64.deb

@@ -192,6 +192,12 @@ pub struct ServerState {
     pub trace_end_block: u32,
     pub chain_state_begin_block: u32,
     pub chain_state_end_block: u32,
+    /// First block for which this upstream has finality data (`get_status_result_v1`).
+    /// Zero until a v1 status result is observed.
+    pub finality_data_begin_block: u32,
+    /// One past the last block with finality data. Zero means the range is unknown
+    /// (the upstream has only reported `get_status_result_v0`, or reported an empty range).
+    pub finality_data_end_block: u32,
 }
 
 impl ServerState {
@@ -205,6 +211,8 @@ impl ServerState {
             trace_end_block: 0,
             chain_state_begin_block: 0,
             chain_state_end_block: 0,
+            finality_data_begin_block: 0,
+            finality_data_end_block: 0,
         }
     }
 }

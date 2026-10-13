@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Optional configuration field `max_client_message_bytes`. Configs that omit it
   remain valid and use the default.
+- Parse `get_status_result_v1` and track each upstream's finality-data block
+  range. The single in-flight status probe asks for v1 and falls back to
+  `get_status_request_v0` when an upstream does not answer it.
+- Route `get_blocks_request_v1` with `fetch_finality_data` to an upstream whose
+  finality range covers the requested block. Other requests, and fleets that
+  never report a covering range, keep trace-range selection.
 
 ### Changed
 

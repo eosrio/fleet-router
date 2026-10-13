@@ -23,6 +23,14 @@ use crate::zcd::ZCDValues;
 /// before an upstream is flagged stale (and deprioritized for routing).
 const STALE_THRESHOLD: u32 = 12;
 
+/// `get_status_request_v0` — empty body, variant index 0.
+const STATUS_REQUEST_V0: u8 = 0;
+/// `get_status_request_v1` — empty body, variant index 4.
+/// Spring answers with `get_status_result_v1`, which carries the finality-data range.
+const STATUS_REQUEST_V1: u8 = 4;
+/// Unanswered v1 probes before the monitor sticks to v0 for this upstream.
+const STATUS_V1_MISS_LIMIT: u32 = 2;
+
 /// Periodically log per-upstream block progress and flag stale upstreams.
 pub async fn state_monitoring_loop(
     server_state_db: ServerStateDb,
@@ -80,11 +88,32 @@ enum Inbound {
     AbiAccepted,
     /// ABI text arrived but could not be loaded. Reconnect.
     AbiRejected,
-    /// A `get_status_result_v0` was decoded (the in-flight request is done).
-    Status,
-    /// Upstream sent a close frame. Stop monitoring this server.
+    /// A status result was decoded (the in-flight request is done).
+    /// The payload is the result variant: 0 = v0, 3 = v1.
+    Status(u8),
+    /// Upstream sent a close frame. Stop monitoring this server, unless this
+    /// session's unanswered v1 probe should reconnect and fall back.
     Close,
     Ignore,
+}
+
+/// How [`run_monitor_session`] ended.
+enum SessionEnd {
+    /// Shutdown, or the upstream closed after this was not an unanswered v1 probe.
+    Stop,
+    /// Reconnect. `unanswered_v1` means a v1 request was sent and no status
+    /// result arrived. `saw_status` resets the miss counter.
+    Reconnect {
+        unanswered_v1: bool,
+        saw_status: bool,
+    },
+}
+
+fn session_reconnect(sent_v1: bool, saw_status: bool) -> SessionEnd {
+    SessionEnd::Reconnect {
+        unanswered_v1: sent_v1 && !saw_status,
+        saw_status,
+    }
 }
 
 /// WebSocket limits for an upstream monitor (and `config test`) connection.
@@ -111,8 +140,8 @@ fn backoff_delay(reconnect_ms: u64, attempts: &mut u32) -> u64 {
     backoff
 }
 
-async fn send_status(sender: &mut WsSink, endpoint: &str) -> bool {
-    if let Err(e) = sender.send(Message::Binary(vec![0u8].into())).await {
+async fn send_status(sender: &mut WsSink, endpoint: &str, variant: u8) -> bool {
+    if let Err(e) = sender.send(Message::Binary(vec![variant].into())).await {
         tracing::warn!(upstream = %endpoint, error = %e, "failed to send status request");
         return false;
     }
@@ -135,6 +164,10 @@ pub async fn monitoring_connection(
     mut shutdown: broadcast::Receiver<()>,
 ) {
     let mut backoff_attempts: u32 = 0;
+    let mut unanswered_v1_sessions: u32 = 0;
+    // Prefer v1 so Savanna nodes report a finality-data range. Fall back to v0
+    // when the upstream answers with v0, or never answers a v1 probe.
+    let mut status_request = STATUS_REQUEST_V1;
     let connect_timeout = Duration::from_millis(static_config.connect_timeout_ms);
 
     loop {
@@ -176,17 +209,39 @@ pub async fn monitoring_connection(
         backoff_attempts = 0;
         tracing::info!(upstream = %server.endpoint, "monitoring connected to upstream");
 
-        let stop = run_monitor_session(
+        let end = run_monitor_session(
             websocket,
             &server,
             &static_config,
             &server_state_db,
             &abieos,
             &mut shutdown,
+            &mut status_request,
         )
         .await;
-        if stop {
-            break;
+        match end {
+            SessionEnd::Stop => break,
+            SessionEnd::Reconnect {
+                unanswered_v1,
+                saw_status,
+            } => {
+                // A v1 probe that produced no status result usually means the node
+                // does not implement `get_status_request_v1` (it closes or ignores
+                // the socket). After a couple of misses, stick to v0 so the upstream
+                // can still come online. Routing then uses trace ranges.
+                if unanswered_v1 && status_request == STATUS_REQUEST_V1 {
+                    unanswered_v1_sessions = unanswered_v1_sessions.saturating_add(1);
+                    if unanswered_v1_sessions >= STATUS_V1_MISS_LIMIT {
+                        status_request = STATUS_REQUEST_V0;
+                        tracing::info!(
+                            upstream = %server.endpoint,
+                            "no reply to get_status_request_v1; falling back to get_status_request_v0"
+                        );
+                    }
+                } else if saw_status {
+                    unanswered_v1_sessions = 0;
+                }
+            }
         }
 
         tracing::info!(
@@ -204,8 +259,10 @@ pub async fn monitoring_connection(
 
 /// Drive one connected monitor session.
 ///
-/// Returns `true` when the outer loop should stop (shutdown, or the upstream
-/// closed the session). Returns `false` to reconnect.
+/// [`SessionEnd::Stop`] means shutdown, or the upstream closed after this was
+/// not an unanswered v1 probe. [`SessionEnd::Reconnect`] asks the outer loop
+/// to connect again. `status_request` is the variant byte to send; a v0 result
+/// switches it to [`STATUS_REQUEST_V0`] for the rest of this upstream.
 async fn run_monitor_session(
     websocket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     server: &Server,
@@ -213,11 +270,14 @@ async fn run_monitor_session(
     server_state_db: &ServerStateDb,
     abieos: &Arc<Mutex<Abieos>>,
     shutdown: &mut broadcast::Receiver<()>,
-) -> bool {
+    status_request: &mut u8,
+) -> SessionEnd {
     let (mut sender, mut receiver) = websocket.split();
     let mut ship_abi: Option<String> = None;
     let mut abi_ready = false;
     let mut status_in_flight = false;
+    let mut sent_v1 = false;
+    let mut saw_status = false;
     let reply_timeout = Duration::from_millis(static_config.upstream_status_ms);
     let abi_deadline = Instant::now() + Duration::from_millis(static_config.connect_timeout_ms);
     // Placeholders until the first status request is sent.
@@ -237,31 +297,47 @@ async fn run_monitor_session(
 
         tokio::select! {
             biased;
-            _ = shutdown.recv() => return true,
+            _ = shutdown.recv() => return SessionEnd::Stop,
             next = receiver.next() => match next {
                 Some(Ok(msg)) => {
                     match handle_monitoring_msg(msg, &mut ship_abi, abieos, server_state_db, server).await {
                         Inbound::AbiAccepted => {
                             abi_ready = true;
-                            if !send_status(&mut sender, &server.endpoint).await {
+                            let variant = *status_request;
+                            if !send_status(&mut sender, &server.endpoint, variant).await {
                                 mark_offline(server_state_db, &server.endpoint).await;
-                                return false;
+                                return session_reconnect(sent_v1, saw_status);
+                            }
+                            if variant == STATUS_REQUEST_V1 {
+                                sent_v1 = true;
                             }
                             status_in_flight = true;
                             let sent = Instant::now();
                             status_deadline = sent + reply_timeout;
                             next_status_at = sent + reply_timeout;
                         }
-                        Inbound::Status => {
+                        Inbound::Status(variant) => {
                             status_in_flight = false;
+                            saw_status = true;
+                            *status_request = if variant == 0 {
+                                STATUS_REQUEST_V0
+                            } else {
+                                STATUS_REQUEST_V1
+                            };
                         }
                         Inbound::AbiRejected => {
                             mark_offline(server_state_db, &server.endpoint).await;
-                            return false;
+                            return session_reconnect(sent_v1, saw_status);
                         }
                         Inbound::Close => {
                             mark_offline(server_state_db, &server.endpoint).await;
-                            return true;
+                            // A node that does not understand v1 often closes the
+                            // socket. Reconnect so the miss counter can fall back
+                            // to v0. A close after a real status result still stops.
+                            if sent_v1 && !saw_status {
+                                return session_reconnect(true, false);
+                            }
+                            return SessionEnd::Stop;
                         }
                         Inbound::Ignore => {}
                     }
@@ -269,12 +345,12 @@ async fn run_monitor_session(
                 None => {
                     tracing::info!(upstream = %server.endpoint, "upstream disconnected");
                     mark_offline(server_state_db, &server.endpoint).await;
-                    return false;
+                    return session_reconnect(sent_v1, saw_status);
                 }
                 Some(Err(e)) => {
                     tracing::warn!(upstream = %server.endpoint, error = %e, "error reading from upstream");
                     mark_offline(server_state_db, &server.endpoint).await;
-                    return false;
+                    return session_reconnect(sent_v1, saw_status);
                 }
             },
             _ = sleep_until(wake_at) => {
@@ -285,7 +361,7 @@ async fn run_monitor_session(
                         "timed out waiting for upstream ABI; marking upstream offline"
                     );
                     mark_offline(server_state_db, &server.endpoint).await;
-                    return false;
+                    return session_reconnect(sent_v1, saw_status);
                 }
                 if status_in_flight {
                     tracing::warn!(
@@ -294,11 +370,15 @@ async fn run_monitor_session(
                         "status reply timed out; marking upstream offline"
                     );
                     mark_offline(server_state_db, &server.endpoint).await;
-                    return false;
+                    return session_reconnect(sent_v1, saw_status);
                 }
-                if !send_status(&mut sender, &server.endpoint).await {
+                let variant = *status_request;
+                if !send_status(&mut sender, &server.endpoint, variant).await {
                     mark_offline(server_state_db, &server.endpoint).await;
-                    return false;
+                    return session_reconnect(sent_v1, saw_status);
+                }
+                if variant == STATUS_REQUEST_V1 {
+                    sent_v1 = true;
                 }
                 status_in_flight = true;
                 let sent = Instant::now();
@@ -342,10 +422,10 @@ async fn handle_monitoring_msg(
         }
         Message::Binary(bin_msg) => {
             match apply_status_update(&bin_msg, server_state_db, server).await {
-                // `Ok(true)` is a decoded status result, including head 0.
+                // `Ok(Some(variant))` is a decoded status result, including head 0.
                 // Anything else is not the in-flight reply.
-                Ok(true) => Inbound::Status,
-                Ok(false) => Inbound::Ignore,
+                Ok(Some(variant)) => Inbound::Status(variant),
+                Ok(None) => Inbound::Ignore,
                 Err(e) => {
                     tracing::warn!(
                         upstream = %server.endpoint,
@@ -366,33 +446,46 @@ async fn handle_monitoring_msg(
 
 /// Apply one upstream binary frame to `server`'s monitored state.
 ///
-/// `Ok(true)` means the frame was a `get_status_result_v0` and counts as the
-/// in-flight status reply (state is updated only when `head_block_num > 0`).
-/// `Ok(false)` means the frame was some other result and was ignored.
+/// `Ok(Some(variant))` means the frame was `get_status_result_v0` (0) or
+/// `get_status_result_v1` (3) and counts as the in-flight status reply. State
+/// is updated only when `head_block_num > 0`. A v0 result clears any previously
+/// learned finality range. `Ok(None)` means some other result and was ignored.
 /// A truncated or malformed status body leaves the stored state unchanged and
 /// returns the decode error; that error is not a valid reply.
 async fn apply_status_update(
     bin_msg: &[u8],
     server_state_db: &ServerStateDb,
     server: &Server,
-) -> Result<bool, zcd::ZcdError> {
+) -> Result<Option<u8>, zcd::ZcdError> {
     let result_message = zcd::deserialize_result(bin_msg);
-    match result_message.get("variant")? {
-        Some(ZCDValues::U8(0)) => {}
-        _ => return Ok(false),
-    }
+    let variant = match result_message.get("variant")? {
+        Some(ZCDValues::U8(variant)) => variant,
+        _ => return Ok(None),
+    };
     let Some(ZCDValues::Bytes(bytes)) = result_message.get("data")? else {
         return Err(zcd::ZcdError::MissingField);
     };
-    let result = zcd::deserialize_status_result(&bytes)?;
+    let result = match variant {
+        0 => zcd::deserialize_status_result(&bytes)?,
+        3 => zcd::deserialize_status_result_v1(&bytes)?,
+        _ => return Ok(None),
+    };
     let head_block_num = require_u32(&result, "head_block_num")?;
     if head_block_num == 0 {
-        return Ok(true);
+        return Ok(Some(variant));
     }
     let trace_begin = require_u32(&result, "trace_begin_block")?;
     let trace_end = require_u32(&result, "trace_end_block")?;
     let chain_begin = require_u32(&result, "chain_state_begin_block")?;
     let chain_end = require_u32(&result, "chain_state_end_block")?;
+    let finality = if variant == 3 {
+        Some((
+            require_u32(&result, "finality_data_begin_block")?,
+            require_u32(&result, "finality_data_end_block")?,
+        ))
+    } else {
+        None
+    };
 
     let mut db = server_state_db.lock().await;
     if let Some(state) = db.get_mut(&server.endpoint) {
@@ -402,8 +495,15 @@ async fn apply_status_update(
         state.trace_end_block = trace_end;
         state.chain_state_begin_block = chain_begin;
         state.chain_state_end_block = chain_end;
+        if let Some((begin, end)) = finality {
+            state.finality_data_begin_block = begin;
+            state.finality_data_end_block = end;
+        } else {
+            state.finality_data_begin_block = 0;
+            state.finality_data_end_block = 0;
+        }
     }
-    Ok(true)
+    Ok(Some(variant))
 }
 
 fn require_u32(result: &zcd::ZCD<'_>, field: &'static str) -> Result<u32, zcd::ZcdError> {
@@ -460,13 +560,27 @@ mod tests {
         frame
     }
 
+    fn status_body_v1(begin: u32, end: u32) -> Vec<u8> {
+        let mut buf = status_body();
+        buf.extend_from_slice(&begin.to_le_bytes());
+        buf.extend_from_slice(&end.to_le_bytes());
+        buf
+    }
+
+    fn status_message_v1(body: &[u8]) -> Vec<u8> {
+        let mut frame = vec![3u8];
+        frame.extend_from_slice(body);
+        frame
+    }
+
     #[tokio::test]
     async fn valid_status_frame_updates_upstream_state() {
         let (server, db) = fixture();
-        assert!(
+        assert_eq!(
             apply_status_update(&status_message(&status_body()), &db, &server)
                 .await
                 .expect("valid status"),
+            Some(0),
             "a decoded status result counts as the in-flight reply"
         );
         let guard = db.lock().await;
@@ -476,6 +590,8 @@ mod tests {
         assert_eq!(state.trace_end_block, 1001);
         assert_eq!(state.chain_state_begin_block, 5);
         assert_eq!(state.chain_state_end_block, 1000);
+        assert_eq!(state.finality_data_begin_block, 0);
+        assert_eq!(state.finality_data_end_block, 0);
     }
 
     #[tokio::test]
@@ -548,7 +664,7 @@ mod tests {
         let reply = apply_status_update(&[1], &db, &server)
             .await
             .expect("non-status");
-        assert!(!reply);
+        assert_eq!(reply, None);
         let abieos = Arc::new(Mutex::new(Abieos::new()));
         let mut ship_abi = None;
         let inbound = handle_monitoring_msg(
@@ -560,5 +676,76 @@ mod tests {
         )
         .await;
         assert!(matches!(inbound, Inbound::Ignore));
+    }
+
+    #[tokio::test]
+    async fn v1_status_records_finality_range_and_v0_clears_it() {
+        let (server, db) = fixture();
+        assert_eq!(
+            apply_status_update(&status_message_v1(&status_body_v1(10, 800)), &db, &server,)
+                .await
+                .expect("v1 status"),
+            Some(3)
+        );
+        {
+            let guard = db.lock().await;
+            let state = guard.get(&server.endpoint).expect("state");
+            assert!(state.online);
+            assert_eq!(state.trace_begin_block, 10);
+            assert_eq!(state.trace_end_block, 1001);
+            assert_eq!(state.finality_data_begin_block, 10);
+            assert_eq!(state.finality_data_end_block, 800);
+        }
+
+        let mut v0 = status_body();
+        // trace_end_block sits at bytes 76..80 of the v0 body (4+32+4+32+4).
+        v0[76..80].copy_from_slice(&1100u32.to_le_bytes());
+        assert_eq!(
+            apply_status_update(&status_message(&v0), &db, &server)
+                .await
+                .expect("v0 status"),
+            Some(0)
+        );
+        let guard = db.lock().await;
+        let state = guard.get(&server.endpoint).expect("state");
+        assert_eq!(state.trace_end_block, 1100);
+        assert_eq!(state.finality_data_begin_block, 0);
+        assert_eq!(state.finality_data_end_block, 0);
+    }
+
+    #[tokio::test]
+    async fn truncated_v1_does_not_clobber_a_known_finality_range() {
+        let (server, db) = fixture();
+        apply_status_update(&status_message_v1(&status_body_v1(10, 800)), &db, &server)
+            .await
+            .expect("v1 status");
+        let err = apply_status_update(&status_message_v1(&status_body()), &db, &server)
+            .await
+            .expect_err("truncated v1");
+        assert_eq!(
+            err,
+            ZcdError::Truncated {
+                field: "finality_data_begin_block",
+                expected: 4,
+                remaining: 0,
+            }
+        );
+        let inbound = handle_monitoring_msg(
+            Message::Binary(status_message_v1(&status_body()).into()),
+            &mut None,
+            &Arc::new(Mutex::new(Abieos::new())),
+            &db,
+            &server,
+        )
+        .await;
+        assert!(
+            matches!(inbound, Inbound::Ignore),
+            "a truncated v1 frame must not clear the in-flight request"
+        );
+        let guard = db.lock().await;
+        let state = guard.get(&server.endpoint).expect("state");
+        assert_eq!(state.trace_end_block, 1001);
+        assert_eq!(state.finality_data_begin_block, 10);
+        assert_eq!(state.finality_data_end_block, 800);
     }
 }

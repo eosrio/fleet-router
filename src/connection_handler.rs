@@ -18,7 +18,10 @@ use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tungstenite::Message;
 
-use crate::functions::{select_backend_server, select_failover_server};
+use crate::functions::{
+    parse_blocks_route, select_backend_server, select_failover_server, should_reroute_for_finality,
+    RouteRequest,
+};
 use crate::models::{ProxyLimits, ServerConfigDb, ServerStateDb};
 
 type UpstreamStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -71,7 +74,7 @@ enum FailoverAttempt {
     Shutdown,
     ClientEnded,
     Unavailable,
-    Ready(Box<(ConnectionGuard, UpstreamStream, String)>),
+    Ready(Box<(ConnectionGuard, UpstreamStream, String, String)>),
 }
 
 /// Holds one unit of an upstream's active-connection counter. Decrements
@@ -141,10 +144,10 @@ async fn establish_upstream(
     backend_servers: &ServerStateDb,
     server_config_db: &ServerConfigDb,
     max_attempts: u32,
-    requested_block: Option<u32>,
+    route: RouteRequest,
     limits: ProxyLimits,
     failover: bool,
-) -> Option<(ConnectionGuard, UpstreamStream, String)> {
+) -> Option<(ConnectionGuard, UpstreamStream, String, String)> {
     for _ in 0..max_attempts {
         // Select a backend and optimistically increment its counter under the lock.
         // The guard decrements on drop, including when this attempt is cancelled
@@ -152,9 +155,9 @@ async fn establish_upstream(
         let (cfg, guard) = {
             let state = backend_servers.lock().await;
             let selected = match if failover {
-                select_failover_server(&state, requested_block)
+                select_failover_server(&state, route)
             } else {
-                select_backend_server(&state, requested_block)
+                select_backend_server(&state, route)
             } {
                 Ok(ep) => ep,
                 Err(_) => continue,
@@ -187,7 +190,7 @@ async fn establish_upstream(
         match read_first_abi(&mut ws, limits.handshake_timeout_ms).await {
             Some(abi) => {
                 tracing::debug!(upstream = %cfg.name, "connected to upstream");
-                return Some((guard, ws, abi));
+                return Some((guard, ws, abi, cfg.endpoint));
             }
             None => {
                 tracing::warn!(upstream = %cfg.endpoint, "invalid or absent ABI handshake; trying another upstream");
@@ -265,8 +268,17 @@ pub async fn handle_client(
     tracing::info!("client connected");
 
     // 2. Establish the first upstream and read its ABI.
-    let Some((mut active_conn, server_socket, server_abi)) =
-        establish_upstream(&backend_servers, &server_config_db, 3, None, limits, false).await
+    // The client has not sent a blocks request yet, so this pick is least-connections.
+    // A later `get_blocks_request_v1` with `fetch_finality_data` may reroute.
+    let Some((mut active_conn, server_socket, server_abi, endpoint)) = establish_upstream(
+        &backend_servers,
+        &server_config_db,
+        3,
+        RouteRequest::default(),
+        limits,
+        false,
+    )
+    .await
     else {
         tracing::error!("no upstream available; closing client");
         let _ = client_websocket
@@ -289,6 +301,8 @@ pub async fn handle_client(
 
     let (client_writer, mut client_reader) = client_websocket.split();
     let client_writer = Arc::new(Mutex::new(client_writer));
+    let current_endpoint = Arc::new(Mutex::new(endpoint));
+    let reroute_notify = Arc::new(Notify::new());
 
     let (server_writer, server_reader_stream) = server_socket.split();
     let server_reader = Arc::new(Mutex::new(server_reader_stream));
@@ -323,6 +337,9 @@ pub async fn handle_client(
         let disconnected = client_disconnected.clone();
         let notify = client_disconnect_notify.clone();
         let idle_ms = limits.idle_timeout_ms;
+        let backend_servers = backend_servers.clone();
+        let current_endpoint = current_endpoint.clone();
+        let reroute_notify = reroute_notify.clone();
         AbortOnDrop(spawn(async move {
             loop {
                 let next = if idle_ms > 0 {
@@ -339,9 +356,25 @@ pub async fn handle_client(
                 let Some(Ok(msg)) = next else { break };
 
                 // Record the latest blocks-request (v0=1, v1=3) for failover replay.
+                // A v1 request that asks for finality data is not forwarded when
+                // this upstream's range misses and another upstream covers it.
                 if let Message::Binary(ref bin) = msg {
-                    if bin.len() >= 5 && (bin[0] == 1 || bin[0] == 3) {
+                    if let Some(parsed) = parse_blocks_route(bin) {
                         *last_request.lock().await = Some(bin.to_vec());
+                        let endpoint = current_endpoint.lock().await.clone();
+                        let reroute = parsed.fetch_finality_data && {
+                            let db = backend_servers.lock().await;
+                            should_reroute_for_finality(&db, &endpoint, parsed.start_block_num)
+                        };
+                        if reroute {
+                            tracing::info!(
+                                upstream = %endpoint,
+                                block = parsed.start_block_num,
+                                "upstream finality range does not cover request; rerouting"
+                            );
+                            reroute_notify.notify_one();
+                            continue;
+                        }
                     }
                 }
 
@@ -393,6 +426,10 @@ pub async fn handle_client(
 
     'session: loop {
         let mut client_down = false;
+        let mut rerouted = false;
+        // Kept across iterations so a permit is not lost when another branch wins.
+        let reroute_fut = reroute_notify.notified();
+        tokio::pin!(reroute_fut);
         loop {
             if client_disconnected.load(Ordering::Acquire) {
                 client_down = true;
@@ -409,6 +446,7 @@ pub async fn handle_client(
                         return;
                     }
                     _ = client_disconnect_notify.notified() => { client_down = true; break; }
+                    _ = &mut reroute_fut => { rerouted = true; break; }
                     r = timeout(Duration::from_millis(idle_ms), sr_guard.next()) => match r {
                         Ok(Some(Ok(m))) => Some(m),
                         Ok(_) => None,
@@ -425,6 +463,7 @@ pub async fn handle_client(
                         return;
                     }
                     _ = client_disconnect_notify.notified() => { client_down = true; break; }
+                    _ = &mut reroute_fut => { rerouted = true; break; }
                     r = sr_guard.next() => match r {
                         Some(Ok(m)) => Some(m),
                         _ => None,
@@ -478,17 +517,21 @@ pub async fn handle_client(
                 }
             }
         }
-        tracing::warn!("upstream stream ended; attempting failover");
+        if rerouted {
+            tracing::info!("selecting an upstream whose finality range covers the request");
+        } else {
+            tracing::warn!("upstream stream ended; attempting failover");
+        }
 
-        let failover_block = {
+        let route = {
             let lr = last_request.lock().await;
-            lr.as_ref().and_then(|req| {
-                if req.len() >= 5 {
-                    req[1..5].try_into().ok().map(u32::from_le_bytes)
-                } else {
-                    None
-                }
-            })
+            lr.as_deref()
+                .and_then(parse_blocks_route)
+                .map(|parsed| RouteRequest {
+                    block: Some(parsed.start_block_num),
+                    fetch_finality_data: parsed.fetch_finality_data,
+                })
+                .unwrap_or_default()
         };
 
         if client_disconnected.load(Ordering::Acquire) {
@@ -507,7 +550,7 @@ pub async fn handle_client(
                 &backend_servers,
                 &server_config_db,
                 3,
-                failover_block,
+                route,
                 limits,
                 true,
             ) => match result {
@@ -515,7 +558,7 @@ pub async fn handle_client(
                 None => FailoverAttempt::Unavailable,
             },
         };
-        let (new_conn, new_stream, new_abi) = match attempt {
+        let (new_conn, new_stream, new_abi, endpoint) = match attempt {
             FailoverAttempt::Shutdown => {
                 let _ = cw_guard
                     .send(Message::Close(Some(CloseFrame {
@@ -542,6 +585,7 @@ pub async fn handle_client(
             FailoverAttempt::Ready(established) => *established,
         };
         active_conn = new_conn; // drops the old guard (synchronous decrement)
+        *current_endpoint.lock().await = endpoint;
 
         {
             let abieos = shared_abieos.lock().await;

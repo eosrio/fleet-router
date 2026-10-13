@@ -189,6 +189,26 @@ async fn render_metrics(state_db: &ServerStateDb) -> String {
         ));
     }
 
+    out.push_str("# HELP fleet_router_upstream_finality_data_begin_block First block with finality data reported by an upstream (0 if unknown).\n");
+    out.push_str("# TYPE fleet_router_upstream_finality_data_begin_block gauge\n");
+    for (endpoint, state) in db.iter() {
+        out.push_str(&format!(
+            "fleet_router_upstream_finality_data_begin_block{{endpoint=\"{}\"}} {}\n",
+            escape(endpoint),
+            state.finality_data_begin_block
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_finality_data_end_block One past the last block with finality data (0 if unknown).\n");
+    out.push_str("# TYPE fleet_router_upstream_finality_data_end_block gauge\n");
+    for (endpoint, state) in db.iter() {
+        out.push_str(&format!(
+            "fleet_router_upstream_finality_data_end_block{{endpoint=\"{}\"}} {}\n",
+            escape(endpoint),
+            state.finality_data_end_block
+        ));
+    }
+
     out
 }
 

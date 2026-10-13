@@ -49,8 +49,8 @@ body:
     attributes:
       label: Rust version (for build issues)
       description: >-
-        Output of `rustc --version` (MSRV is 1.95). Leave blank if this is not a build issue.
-      placeholder: "rustc 1.95.0"
+        Output of `rustc --version` (MSRV is 1.99). Leave blank if this is not a build issue.
+      placeholder: "rustc 1.99.0"
     validations:
       required: false
 

@@ -1,10 +1,12 @@
 # Fleet Router — multi-stage build. Pure-Rust: no C/C++ toolchain required.
-FROM rust:1.95-bookworm AS builder
+# rust:1.99-trixie
+FROM rust:1.99-trixie@sha256:81015672d6939b0265f09adf96d5de125482bb1330106076956b0518e74edc90 AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim
+# debian:trixie-slim
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
@@ -13,6 +15,7 @@ COPY --from=builder /build/target/release/fleet-router /usr/local/bin/fleet-rout
 USER fleet
 EXPOSE 17000
 # Liveness probe: confirm the proxy port is accepting TCP connections.
+# `fleet-router check` dials 127.0.0.1:17000, so the image does not need a shell.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/17000' || exit 1
+    CMD ["fleet-router", "check"]
 ENTRYPOINT ["fleet-router"]

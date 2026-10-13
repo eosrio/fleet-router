@@ -32,6 +32,11 @@ fn default_shutdown_grace_ms() -> u64 {
     5_000
 }
 
+/// Connect / first-read bound used by the upstream monitor and `config test`
+/// when `handshake_timeout_ms` is 0. A zero handshake timeout only disables the
+/// *client* handshake limit; a silent upstream must not stall monitoring.
+const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS: u64 = 10_000;
+
 /// A single upstream SHiP node, as declared in `config.json`.
 #[derive(Debug, Deserialize, Serialize, Hash, Eq, PartialEq, Clone)]
 pub struct Server {
@@ -61,6 +66,9 @@ pub struct ServerConfig {
     /// Interval (ms) at which upstream status is logged.
     pub upstream_monitoring_ms: u64,
     /// Interval (ms) at which status requests are sent to upstreams.
+    ///
+    /// The monitor keeps a single `get_status_request` in flight and treats this
+    /// same interval as the reply deadline. A miss marks the upstream offline.
     pub upstream_status_ms: u64,
     /// The upstream SHiP nodes to load-balance across.
     pub servers: Vec<Server>,
@@ -148,6 +156,15 @@ impl ServerConfig {
         Ok(())
     }
 
+    /// Bound for monitor connects, the wait for an upstream ABI, and `config test`.
+    pub fn upstream_connect_timeout_ms(&self) -> u64 {
+        if self.handshake_timeout_ms == 0 {
+            DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS
+        } else {
+            self.handshake_timeout_ms
+        }
+    }
+
     /// The per-connection proxy limits derived from this config.
     pub fn proxy_limits(&self) -> ProxyLimits {
         ProxyLimits {
@@ -204,6 +221,11 @@ pub struct StaticConfig {
     pub upstream_reconnect_ms: u64,
     pub upstream_monitoring_ms: u64,
     pub upstream_status_ms: u64,
+    /// Always non-zero. Bounds the monitor's TCP+WebSocket connect and the
+    /// wait for the upstream ABI frame.
+    pub connect_timeout_ms: u64,
+    /// `max_message_size` / `max_frame_size` for the monitor WebSocket.
+    pub max_message_bytes: usize,
 }
 
 /// Per-connection limits applied by the proxy data path.

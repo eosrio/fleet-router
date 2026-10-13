@@ -18,7 +18,7 @@ use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tungstenite::Message;
 
-use crate::functions::select_backend_server;
+use crate::functions::{select_backend_server, select_failover_server};
 use crate::models::{ProxyLimits, ServerConfigDb, ServerStateDb};
 
 type UpstreamStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -133,12 +133,17 @@ async fn read_first_abi(ws: &mut UpstreamStream, handshake_timeout_ms: u64) -> O
 /// Select, connect to, and complete the ABI handshake with an upstream, retrying
 /// against other upstreams (up to `max_attempts`) on failure. Returns the
 /// connection guard, the live socket, and the upstream's ABI JSON.
+///
+/// `failover` lets an existing session retry an enabled upstream the monitor
+/// has already marked offline. New client sessions pass `false` and still
+/// require `online`.
 async fn establish_upstream(
     backend_servers: &ServerStateDb,
     server_config_db: &ServerConfigDb,
     max_attempts: u32,
     requested_block: Option<u32>,
     limits: ProxyLimits,
+    failover: bool,
 ) -> Option<(ConnectionGuard, UpstreamStream, String)> {
     for _ in 0..max_attempts {
         // Select a backend and optimistically increment its counter under the lock.
@@ -146,7 +151,11 @@ async fn establish_upstream(
         // (for example because the client session is closing).
         let (cfg, guard) = {
             let state = backend_servers.lock().await;
-            let selected = match select_backend_server(&state, requested_block) {
+            let selected = match if failover {
+                select_failover_server(&state, requested_block)
+            } else {
+                select_backend_server(&state, requested_block)
+            } {
                 Ok(ep) => ep,
                 Err(_) => continue,
             };
@@ -257,7 +266,7 @@ pub async fn handle_client(
 
     // 2. Establish the first upstream and read its ABI.
     let Some((mut active_conn, server_socket, server_abi)) =
-        establish_upstream(&backend_servers, &server_config_db, 3, None, limits).await
+        establish_upstream(&backend_servers, &server_config_db, 3, None, limits, false).await
     else {
         tracing::error!("no upstream available; closing client");
         let _ = client_websocket
@@ -500,6 +509,7 @@ pub async fn handle_client(
                 3,
                 failover_block,
                 limits,
+                true,
             ) => match result {
                 Some(established) => FailoverAttempt::Ready(Box::new(established)),
                 None => FailoverAttempt::Unavailable,

@@ -19,7 +19,7 @@ and arm64) — no C/C++ toolchain, `clang`, or `libclang` required. See the
 
 You need:
 
-- Rust **1.95+** (the Minimum Supported Rust Version, required by `rs_abieos`)
+- Rust **1.99+** (the Minimum Supported Rust Version)
 - `git`
 
 Install Rust via [rustup](https://rustup.rs/) if you do not already have a
@@ -85,7 +85,7 @@ Notes:
   and fails if anything is unformatted.
 - Clippy must be clean: `-D warnings` turns every warning into an error.
 - CI runs build + test with `--locked` across Linux, macOS, and Windows, runs
-  fmt + clippy on Linux, and also runs an MSRV check against Rust 1.95, a
+  fmt + clippy on Linux, and also runs an MSRV check against Rust 1.99, a
   `cargo-deny` supply-chain scan (advisories, bans, licenses, sources), and a
   Docker image build. Keeping the three commands above green locally covers the
   parts you are most likely to break.

@@ -39,7 +39,7 @@ impl Drop for ConnectionGuard {
         // Saturating decrement: never underflows below zero.
         let _ = self
             .counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| c.checked_sub(1));
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| c.checked_sub(1));
     }
 }
 
@@ -53,7 +53,7 @@ impl Drop for AbortOnDrop {
 }
 
 fn dec(counter: &AtomicUsize) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| c.checked_sub(1));
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| c.checked_sub(1));
 }
 
 async fn mark_offline(backend_servers: &ServerStateDb, endpoint: &str) {

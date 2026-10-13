@@ -313,9 +313,24 @@ fn process_args() -> Result<Option<(bool, ServerConfig)>> {
                         ),
                 ),
         )
-        .subcommand(Command::new("run").about("Start the proxy server (default)"));
+        .subcommand(Command::new("run").about("Start the proxy server (default)"))
+        .subcommand(
+            Command::new("check")
+                .about("Exit 0 if the proxy port accepts a TCP connection (container healthcheck)")
+                .arg(
+                    arg!(--port <PORT> "Port to probe on 127.0.0.1")
+                        .value_parser(value_parser!(u16))
+                        .default_value("17000"),
+                ),
+        );
 
     let matches = cmd.get_matches();
+
+    if let Some(("check", check)) = matches.subcommand() {
+        let port = check.get_one::<u16>("port").copied().unwrap_or(17000);
+        probe_listen_port(port)?;
+        return Ok(None);
+    }
 
     if let Some(("config", config)) = matches.subcommand() {
         match config.subcommand() {
@@ -362,6 +377,18 @@ fn process_args() -> Result<Option<(bool, ServerConfig)>> {
     Ok(Some((false, config)))
 }
 
+/// TCP liveness probe used by the container `HEALTHCHECK`.
+///
+/// Connects to `127.0.0.1:port` with a bounded timeout so the image does not
+/// need a shell or `/dev/tcp`. The default port matches the image's published
+/// proxy port.
+fn probe_listen_port(port: u16) -> Result<()> {
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(4))
+        .map_err(|e| anyhow::anyhow!("listen port {port} is not accepting connections: {e}"))?;
+    Ok(())
+}
+
 fn test_config(path: &PathBuf) -> Option<(bool, ServerConfig)> {
     match read_to_string(path) {
         Ok(data) => match from_str::<ServerConfig>(&data) {
@@ -382,5 +409,26 @@ fn test_config(path: &PathBuf) -> Option<(bool, ServerConfig)> {
             cprintln!("<red>failed to read configuration file: {}</>", e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_listen_port;
+    use std::net::TcpListener;
+
+    #[test]
+    fn probe_accepts_an_open_local_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        probe_listen_port(port).unwrap();
+    }
+
+    #[test]
+    fn probe_rejects_a_closed_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(probe_listen_port(port).is_err());
     }
 }

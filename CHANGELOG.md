@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Minimum supported Rust version is now 1.99.
+- The container image is built from digest-pinned `rust:1.99-trixie` and
+  `debian:trixie-slim`. Its `HEALTHCHECK` runs `fleet-router check`, which
+  probes `127.0.0.1:17000` without a shell.
+- GitHub Actions are pinned by commit SHA. The release workflow uses
+  `softprops/action-gh-release` v3 (Node 24). Dependabot tracks Actions, Cargo,
+  and Docker updates.
+
+### Security
+
+- Locked dependency updates clear `RUSTSEC-2026-0258` (`h2` 0.4.20),
+  `RUSTSEC-2026-0285` (`rustls` 0.23.45), and `RUSTSEC-2026-0190`
+  (`anyhow` 1.0.104). Compatible updates also pick up tokio 1.53.2, serde
+  1.0.229, serde_json 1.0.154, clap 4.6.7, chrono 0.4.45, and futures 0.3.34.
+
 ## [0.2.0] - 2026-05-30
 
 First public release on crates.io and GitHub.

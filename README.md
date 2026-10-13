@@ -46,7 +46,7 @@ fleet-router is **pure Rust** and builds on **Linux, macOS, and Windows** (x86_6
 
 | Requirement | Notes |
 |---|---|
-| Rust ≥ 1.95 (MSRV) | Required by `rs_abieos` (uses `if let` guards, stabilized in Rust 1.95) |
+| Rust ≥ 1.99 (MSRV) | Toolchain used to build, test, and publish fleet-router |
 
 If you do not already have Rust, install it via [rustup](https://rustup.rs/):
 
@@ -78,7 +78,7 @@ A prebuilt image is published to the GitHub Container Registry on tagged release
 docker pull ghcr.io/eosrio/fleet-router
 ```
 
-The image runs as a non-root user and defines a `HEALTHCHECK` on the proxy port (`17000`). See [Running in production](#running-in-production) for a full `docker run` example.
+The image runs as a non-root user and defines a `HEALTHCHECK` that runs `fleet-router check` against the proxy port (`17000`). See [Running in production](#running-in-production) for a full `docker run` example.
 
 ## Quick start
 
@@ -168,6 +168,7 @@ Each entry in `servers` is an object:
 fleet-router config init <path>     Write a sample config file to <path>.
 fleet-router config test <path>     Parse and validate a config, then test upstream connectivity.
 fleet-router run [--config <path>]  Run the proxy.
+fleet-router check [--port <port>]  Exit 0 if 127.0.0.1:<port> accepts TCP (default 17000).
 fleet-router --version              Print the version.
 fleet-router --help                 Print help.
 ```
@@ -243,7 +244,7 @@ docker run -p 17000:17000 \
   ghcr.io/eosrio/fleet-router run --config /etc/fleet-router.json
 ```
 
-The image runs as a non-root user and defines a `HEALTHCHECK` against port `17000`.
+The image runs as a non-root user. Its `HEALTHCHECK` runs `fleet-router check`, which dials `127.0.0.1:17000`.
 
 ### Tuning notes
 

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Cap client WebSocket messages separately from upstream messages with
+  `max_client_message_bytes` (default 64 KiB). The client limit applies to both
+  the message size and the frame size, so an unauthenticated client can no
+  longer force the router to accept upstream-sized frames.
+- Replace the per-session 1024-frame failover buffer with a 64 KiB byte cap.
+  Each buffered frame counts as at least one byte. A session that exceeds the
+  cap is closed with WebSocket close code 1008 (policy violation).
+- Locked dependency updates clear `RUSTSEC-2026-0258` (`h2` 0.4.20),
+  `RUSTSEC-2026-0285` (`rustls` 0.23.45), and `RUSTSEC-2026-0190`
+  (`anyhow` 1.0.104). Compatible updates also pick up tokio 1.53.2, serde
+  1.0.229, serde_json 1.0.154, clap 4.6.7, chrono 0.4.45, and futures 0.3.34.
+
+### Added
+
+- Optional configuration field `max_client_message_bytes`. Configs that omit it
+  remain valid and use the default.
+
 ### Changed
 
 - Minimum supported Rust version is now 1.99.
@@ -24,13 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field. The monitoring loop logs the error and leaves that upstream's state
   unchanged. The upstream ABI is applied without unwrapping the handshake
   buffer.
-
-### Security
-
-- Locked dependency updates clear `RUSTSEC-2026-0258` (`h2` 0.4.20),
-  `RUSTSEC-2026-0285` (`rustls` 0.23.45), and `RUSTSEC-2026-0190`
-  (`anyhow` 1.0.104). Compatible updates also pick up tokio 1.53.2, serde
-  1.0.229, serde_json 1.0.154, clap 4.6.7, chrono 0.4.45, and futures 0.3.34.
 
 ## [0.2.0] - 2026-05-30
 

@@ -84,7 +84,8 @@ scope, including (non-exhaustively):
   input that is within the documented protocol.
 - Resource-exhaustion vectors that bypass the configured safeguards
   (`max_connections`, `handshake_timeout_ms`, `idle_timeout_ms`,
-  `max_message_bytes`).
+  `max_message_bytes`, `max_client_message_bytes`, and the 64 KiB per-session
+  failover buffer).
 - Logic flaws in failover, de-duplication, or shutdown that lead to data
   corruption or unexpected disclosure between client connections.
 

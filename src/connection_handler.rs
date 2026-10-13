@@ -23,9 +23,56 @@ use crate::models::{ProxyLimits, ServerConfigDb, ServerStateDb};
 
 type UpstreamStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// Maximum client frames buffered while an upstream is mid-failover, after which
-/// further frames during the (typically sub-second) swap window are dropped.
-const MAX_PENDING_FRAMES: usize = 1024;
+/// Maximum payload bytes of client frames buffered per session while an upstream
+/// is mid-failover. A frame counts as at least one byte, so an empty-frame flood
+/// cannot grow the queue without bound. Exceeding the cap closes the session
+/// (close code 1008) instead of dropping frames or pinning unbounded memory.
+const MAX_PENDING_CLIENT_BYTES: usize = 64 * 1024;
+
+/// Client frames held during a failover window, accounted in bytes.
+struct PendingClientFrames {
+    frames: VecDeque<Message>,
+    bytes: usize,
+}
+
+impl PendingClientFrames {
+    fn new() -> Self {
+        Self {
+            frames: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    /// Bytes this frame contributes toward [`MAX_PENDING_CLIENT_BYTES`].
+    fn accounted(msg: &Message) -> usize {
+        msg.len().max(1)
+    }
+
+    /// Queue `msg` when it fits. Returns `false` without modifying the queue
+    /// when the byte cap would be exceeded (the message is dropped).
+    fn try_push(&mut self, msg: Message) -> bool {
+        let n = Self::accounted(&msg);
+        if self.bytes.saturating_add(n) > MAX_PENDING_CLIENT_BYTES {
+            return false;
+        }
+        self.bytes += n;
+        self.frames.push_back(msg);
+        true
+    }
+
+    fn pop_front(&mut self) -> Option<Message> {
+        let msg = self.frames.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(Self::accounted(&msg));
+        Some(msg)
+    }
+}
+
+enum FailoverAttempt {
+    Shutdown,
+    ClientEnded,
+    Unavailable,
+    Ready(Box<(ConnectionGuard, UpstreamStream, String)>),
+}
 
 /// Holds one unit of an upstream's active-connection counter. Decrements
 /// synchronously (and underflow-safely) when dropped — no spawn, no lock, no
@@ -50,10 +97,6 @@ impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
-}
-
-fn dec(counter: &AtomicUsize) {
-    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| c.checked_sub(1));
 }
 
 async fn mark_offline(backend_servers: &ServerStateDb, endpoint: &str) {
@@ -99,7 +142,9 @@ async fn establish_upstream(
 ) -> Option<(ConnectionGuard, UpstreamStream, String)> {
     for _ in 0..max_attempts {
         // Select a backend and optimistically increment its counter under the lock.
-        let (cfg, counter) = {
+        // The guard decrements on drop, including when this attempt is cancelled
+        // (for example because the client session is closing).
+        let (cfg, guard) = {
             let state = backend_servers.lock().await;
             let selected = match select_backend_server(&state, requested_block) {
                 Ok(ep) => ep,
@@ -113,7 +158,7 @@ async fn establish_upstream(
                 continue;
             };
             counter.fetch_add(1, Ordering::Relaxed);
-            (cfg, counter)
+            (cfg, ConnectionGuard { counter })
         };
 
         let mut config = WebSocketConfig::default();
@@ -124,7 +169,7 @@ async fn establish_upstream(
             Ok((ws, _)) => ws,
             Err(e) => {
                 tracing::warn!(upstream = %cfg.endpoint, error = %e, "error connecting to upstream");
-                dec(&counter);
+                drop(guard);
                 mark_offline(backend_servers, &cfg.endpoint).await;
                 continue;
             }
@@ -133,11 +178,11 @@ async fn establish_upstream(
         match read_first_abi(&mut ws, limits.handshake_timeout_ms).await {
             Some(abi) => {
                 tracing::debug!(upstream = %cfg.name, "connected to upstream");
-                return Some((ConnectionGuard { counter }, ws, abi));
+                return Some((guard, ws, abi));
             }
             None => {
                 tracing::warn!(upstream = %cfg.endpoint, "invalid or absent ABI handshake; trying another upstream");
-                dec(&counter);
+                drop(guard);
                 mark_offline(backend_servers, &cfg.endpoint).await;
                 let _ = ws.close(None).await;
                 continue;
@@ -175,9 +220,10 @@ pub async fn handle_client(
     mut shutdown: broadcast::Receiver<()>,
 ) {
     // 1. Complete the client WebSocket handshake (bounded in time and message size).
+    //    Client frames use the smaller client cap; upstream links keep max_message_bytes.
     let mut client_config = WebSocketConfig::default();
-    client_config.max_message_size = Some(limits.max_message_bytes);
-    client_config.max_frame_size = Some(limits.max_message_bytes);
+    client_config.max_message_size = Some(limits.max_client_message_bytes);
+    client_config.max_frame_size = Some(limits.max_client_message_bytes);
 
     let accept_fut = accept_async_with_config(client_stream, Some(client_config));
     let mut client_websocket = if limits.handshake_timeout_ms > 0 {
@@ -242,8 +288,9 @@ pub async fn handle_client(
     // Raw bytes of the latest get_blocks_request (v0/v1) for failover replay, and
     // client frames that failed to forward during a failover window.
     let last_request: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-    let pending_client_frames: Arc<Mutex<VecDeque<Message>>> =
-        Arc::new(Mutex::new(VecDeque::new()));
+    let pending_client_frames: Arc<Mutex<PendingClientFrames>> =
+        Arc::new(Mutex::new(PendingClientFrames::new()));
+    let pending_limit_hit = Arc::new(AtomicBool::new(false));
 
     // Forward the ABI to the client.
     {
@@ -263,6 +310,7 @@ pub async fn handle_client(
         let last_request = last_request.clone();
         let server_writer = server_writer.clone();
         let pending = pending_client_frames.clone();
+        let pending_limit_hit = pending_limit_hit.clone();
         let disconnected = client_disconnected.clone();
         let notify = client_disconnect_notify.clone();
         let idle_ms = limits.idle_timeout_ms;
@@ -288,19 +336,35 @@ pub async fn handle_client(
                     }
                 }
 
-                let mut sw = server_writer.lock().await;
-                if let Err(e) = sw.send(msg.clone()).await {
-                    // Don't silently drop: buffer for replay after failover swaps the
-                    // socket. Keep holding `server_writer` while pushing to `pending`
-                    // so the failover loop cannot acquire the writer, swap, and flush
-                    // `pending` before this frame is buffered (which would strand it).
-                    tracing::debug!(error = %e, "forward to upstream failed; buffering for failover");
-                    let mut p = pending.lock().await;
-                    if p.len() < MAX_PENDING_FRAMES {
-                        p.push_back(msg);
+                let exceeded = {
+                    let mut sw = server_writer.lock().await;
+                    if let Err(e) = sw.send(msg.clone()).await {
+                        // Don't silently drop: buffer for replay after failover swaps the
+                        // socket. Keep holding `server_writer` while pushing to `pending`
+                        // so the failover loop cannot acquire the writer, swap, and flush
+                        // `pending` before this frame is buffered (which would strand it).
+                        tracing::debug!(error = %e, "forward to upstream failed; buffering for failover");
+                        let frame_bytes = PendingClientFrames::accounted(&msg);
+                        let mut p = pending.lock().await;
+                        let buffered = p.bytes;
+                        if p.try_push(msg) {
+                            false
+                        } else {
+                            tracing::warn!(
+                                buffered,
+                                frame_bytes,
+                                cap = MAX_PENDING_CLIENT_BYTES,
+                                "pending client buffer exceeded; closing session"
+                            );
+                            true
+                        }
                     } else {
-                        tracing::warn!("pending client-frame buffer full; dropping frame");
+                        false
                     }
+                };
+                if exceeded {
+                    pending_limit_hit.store(true, Ordering::Release);
+                    break;
                 }
             }
             disconnected.store(true, Ordering::Release);
@@ -316,6 +380,7 @@ pub async fn handle_client(
 
     let mut restarting = false;
     let mut last_seen_block: Option<u32> = None;
+    let mut close_for_pending_limit = false;
 
     'session: loop {
         let mut client_down = false;
@@ -385,7 +450,10 @@ pub async fn handle_client(
             }
         }
 
-        if client_down {
+        if client_down || client_disconnected.load(Ordering::Acquire) {
+            // `notified()` can lose its permit if another select branch wins, so
+            // re-read the flag the client task sets before it notifies.
+            close_for_pending_limit = pending_limit_hit.load(Ordering::Acquire);
             break 'session;
         }
 
@@ -414,23 +482,54 @@ pub async fn handle_client(
             })
         };
 
-        let Some((new_conn, new_stream, new_abi)) = establish_upstream(
-            &backend_servers,
-            &server_config_db,
-            3,
-            failover_block,
-            limits,
-        )
-        .await
-        else {
-            tracing::error!("no upstream available after failover; closing client");
-            let _ = cw_guard
-                .send(Message::Close(Some(CloseFrame {
-                    code: CloseCode::Error,
-                    reason: "no upstream available".into(),
-                })))
-                .await;
+        if client_disconnected.load(Ordering::Acquire) {
+            close_for_pending_limit = pending_limit_hit.load(Ordering::Acquire);
             break 'session;
+        }
+
+        // Failover can block in the upstream handshake. Race it against client
+        // disconnect and shutdown so a pending-buffer close is not stuck behind
+        // a hung connect. `establish_upstream` drops its connection guard if
+        // cancelled.
+        let attempt = tokio::select! {
+            _ = shutdown.recv() => FailoverAttempt::Shutdown,
+            _ = client_disconnect_notify.notified() => FailoverAttempt::ClientEnded,
+            result = establish_upstream(
+                &backend_servers,
+                &server_config_db,
+                3,
+                failover_block,
+                limits,
+            ) => match result {
+                Some(established) => FailoverAttempt::Ready(Box::new(established)),
+                None => FailoverAttempt::Unavailable,
+            },
+        };
+        let (new_conn, new_stream, new_abi) = match attempt {
+            FailoverAttempt::Shutdown => {
+                let _ = cw_guard
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Away,
+                        reason: "server shutting down".into(),
+                    })))
+                    .await;
+                return;
+            }
+            FailoverAttempt::ClientEnded => {
+                close_for_pending_limit = pending_limit_hit.load(Ordering::Acquire);
+                break 'session;
+            }
+            FailoverAttempt::Unavailable => {
+                tracing::error!("no upstream available after failover; closing client");
+                let _ = cw_guard
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Error,
+                        reason: "no upstream available".into(),
+                    })))
+                    .await;
+                break 'session;
+            }
+            FailoverAttempt::Ready(established) => *established,
         };
         active_conn = new_conn; // drops the old guard (synchronous decrement)
 
@@ -474,5 +573,77 @@ pub async fn handle_client(
         restarting = true;
     }
 
+    if close_for_pending_limit {
+        let _ = cw_guard
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "pending client buffer exceeded".into(),
+            })))
+            .await;
+    }
+
     let _ = active_conn; // keep the guard alive for the whole session
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binary(n: usize) -> Message {
+        Message::binary(vec![0u8; n])
+    }
+
+    #[test]
+    fn pending_buffer_accepts_frames_until_the_byte_cap() {
+        let mut pending = PendingClientFrames::new();
+        assert!(pending.try_push(binary(1024)));
+        assert!(pending.try_push(binary(MAX_PENDING_CLIENT_BYTES - 1024)));
+        assert_eq!(pending.bytes, MAX_PENDING_CLIENT_BYTES);
+        assert_eq!(pending.frames.len(), 2);
+        assert!(!pending.try_push(binary(1)));
+        assert_eq!(pending.frames.len(), 2);
+        assert_eq!(pending.bytes, MAX_PENDING_CLIENT_BYTES);
+    }
+
+    #[test]
+    fn pending_buffer_rejects_a_single_oversized_frame() {
+        let mut pending = PendingClientFrames::new();
+        assert!(!pending.try_push(binary(MAX_PENDING_CLIENT_BYTES + 1)));
+        assert!(pending.frames.is_empty());
+        assert_eq!(pending.bytes, 0);
+        assert!(pending.try_push(binary(1)));
+    }
+
+    #[test]
+    fn pending_buffer_exact_cap_fits_and_pop_frees_budget() {
+        let mut pending = PendingClientFrames::new();
+        assert!(pending.try_push(binary(MAX_PENDING_CLIENT_BYTES)));
+        assert!(!pending.try_push(binary(1)));
+        let got = pending.pop_front().unwrap();
+        assert_eq!(got.len(), MAX_PENDING_CLIENT_BYTES);
+        assert_eq!(pending.bytes, 0);
+        assert!(pending.pop_front().is_none());
+        assert!(pending.try_push(binary(MAX_PENDING_CLIENT_BYTES)));
+    }
+
+    #[test]
+    fn pending_buffer_counts_empty_frames_as_one_byte() {
+        let mut pending = PendingClientFrames::new();
+        assert!(pending.try_push(binary(MAX_PENDING_CLIENT_BYTES - 1)));
+        assert!(pending.try_push(Message::binary(Vec::<u8>::new())));
+        assert_eq!(pending.bytes, MAX_PENDING_CLIENT_BYTES);
+        assert!(!pending.try_push(Message::text("")));
+        assert_eq!(pending.frames.len(), 2);
+    }
+
+    #[test]
+    fn pending_buffer_counts_text_and_binary_payloads() {
+        let mut pending = PendingClientFrames::new();
+        assert!(pending.try_push(Message::text("abcd")));
+        assert!(pending.try_push(Message::binary(vec![1, 2, 3])));
+        assert_eq!(pending.bytes, 7);
+        let first = pending.pop_front().unwrap();
+        assert_eq!(first.len(), 4);
+        assert_eq!(pending.bytes, 3);
+    }
 }

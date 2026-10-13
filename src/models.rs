@@ -25,6 +25,9 @@ fn default_idle_timeout_ms() -> u64 {
 fn default_max_message_bytes() -> usize {
     256 * 1024 * 1024 // 256 MiB
 }
+fn default_max_client_message_bytes() -> usize {
+    64 * 1024 // 64 KiB; client SHiP requests are tiny
+}
 fn default_shutdown_grace_ms() -> u64 {
     5_000
 }
@@ -71,9 +74,17 @@ pub struct ServerConfig {
     /// Idle timeout (ms): close a connection that exchanges no data for this long. 0 = disabled.
     #[serde(default = "default_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
-    /// Maximum WebSocket message size (bytes) accepted on both client and upstream links.
+    /// Maximum WebSocket message size (bytes) accepted on upstream links.
     #[serde(default = "default_max_message_bytes")]
     pub max_message_bytes: usize,
+    /// Maximum WebSocket message and frame size (bytes) accepted from a client.
+    ///
+    /// Independent of [`Self::max_message_bytes`]. Clients only send small SHiP
+    /// requests, so this defaults much lower than the upstream cap and stops an
+    /// unauthenticated peer from forcing multi-megabyte allocations. Configs
+    /// that omit the field stay valid and use the default.
+    #[serde(default = "default_max_client_message_bytes")]
+    pub max_client_message_bytes: usize,
     /// How long (ms) to wait for in-flight connections to drain on shutdown.
     #[serde(default = "default_shutdown_grace_ms")]
     pub shutdown_grace_ms: u64,
@@ -109,6 +120,9 @@ impl ServerConfig {
         if self.max_message_bytes == 0 {
             bail!("max_message_bytes must be greater than 0");
         }
+        if self.max_client_message_bytes == 0 {
+            bail!("max_client_message_bytes must be greater than 0");
+        }
         if self.servers.is_empty() {
             bail!("config must define at least one server");
         }
@@ -140,6 +154,7 @@ impl ServerConfig {
             handshake_timeout_ms: self.handshake_timeout_ms,
             idle_timeout_ms: self.idle_timeout_ms,
             max_message_bytes: self.max_message_bytes,
+            max_client_message_bytes: self.max_client_message_bytes,
         }
     }
 }
@@ -196,7 +211,10 @@ pub struct StaticConfig {
 pub struct ProxyLimits {
     pub handshake_timeout_ms: u64,
     pub idle_timeout_ms: u64,
+    /// Upstream WebSocket message/frame cap.
     pub max_message_bytes: usize,
+    /// Client WebSocket message/frame cap.
+    pub max_client_message_bytes: usize,
 }
 
 pub fn build_state_db(servers: Vec<Server>) -> ServerStateDb {
@@ -217,4 +235,63 @@ pub fn build_config_db(servers: Vec<Server>) -> ServerConfigDb {
             .map(|s| (s.endpoint.clone(), s))
             .collect::<HashMap<String, Server>>(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_config() -> serde_json::Value {
+        serde_json::json!({
+            "listen_address": "127.0.0.1",
+            "listen_port": 17000,
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "servers": [
+                { "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }
+            ]
+        })
+    }
+
+    #[test]
+    fn legacy_config_defaults_the_client_message_cap() {
+        let cfg: ServerConfig = serde_json::from_value(minimal_config()).unwrap();
+        assert_eq!(cfg.max_message_bytes, 256 * 1024 * 1024);
+        assert_eq!(cfg.max_client_message_bytes, 64 * 1024);
+        cfg.validate().unwrap();
+        let limits = cfg.proxy_limits();
+        assert_eq!(limits.max_message_bytes, cfg.max_message_bytes);
+        assert_eq!(limits.max_client_message_bytes, 64 * 1024);
+    }
+
+    #[test]
+    fn example_config_without_client_cap_stays_valid() {
+        let cfg: ServerConfig =
+            serde_json::from_str(include_str!("../example.config.json")).unwrap();
+        assert_eq!(cfg.max_client_message_bytes, 64 * 1024);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn custom_client_message_cap_is_honored() {
+        let mut value = minimal_config();
+        value["max_client_message_bytes"] = serde_json::json!(4096);
+        let cfg: ServerConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(cfg.max_client_message_bytes, 4096);
+        cfg.validate().unwrap();
+        assert_eq!(cfg.proxy_limits().max_client_message_bytes, 4096);
+    }
+
+    #[test]
+    fn zero_client_message_cap_is_rejected() {
+        let mut value = minimal_config();
+        value["max_client_message_bytes"] = serde_json::json!(0);
+        let cfg: ServerConfig = serde_json::from_value(value).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("max_client_message_bytes"),
+            "unexpected error: {err}"
+        );
+    }
 }

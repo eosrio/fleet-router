@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -118,6 +119,8 @@ impl MockShipServer {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let connection_count = Arc::new(Mutex::new(0u32));
         let count_clone = connection_count.clone();
+        let control = Arc::new(SessionControl::new());
+        let control_for_loop = control.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -125,15 +128,31 @@ impl MockShipServer {
                     result = self.listener.accept() => {
                         match result {
                             Ok((stream, _peer)) => {
+                                if control_for_loop.stall.load(Ordering::Acquire) {
+                                    // Hold the TCP socket open and never complete the
+                                    // WebSocket handshake, so a peer blocks in connect
+                                    // instead of seeing connection refused.
+                                    tokio::spawn(async move {
+                                        let _held = stream;
+                                        std::future::pending::<()>().await;
+                                    });
+                                    continue;
+                                }
                                 let cfg = config.clone();
                                 let count = count_clone.clone();
+                                let control = control_for_loop.clone();
                                 tokio::spawn(async move {
                                     {
                                         let mut c = count.lock().await;
                                         *c += 1;
                                     }
-                                    if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
-                                        Self::handle_session(ws, cfg).await;
+                                    tokio::select! {
+                                        _ = wait_until_killed(&control) => {}
+                                        _ = async {
+                                            if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
+                                                Self::handle_session(ws, cfg).await;
+                                            }
+                                        } => {}
                                     }
                                     {
                                         let mut c = count.lock().await;
@@ -158,6 +177,7 @@ impl MockShipServer {
             shutdown_tx: Some(shutdown_tx),
             join_handle: Some(handle),
             connection_count,
+            control,
         }
     }
 
@@ -323,17 +343,60 @@ impl MockShipServer {
     }
 }
 
+struct SessionControl {
+    stall: AtomicBool,
+    killed: AtomicBool,
+    kill: Notify,
+}
+
+impl SessionControl {
+    fn new() -> Self {
+        Self {
+            stall: AtomicBool::new(false),
+            killed: AtomicBool::new(false),
+            kill: Notify::new(),
+        }
+    }
+}
+
+/// Completes when [`MockShipHandle::stall_and_drop_sessions`] has been called.
+///
+/// `notify_waiters` is observed by a `Notified` future as soon as that future
+/// is created, so registering interest before the flag check does not miss a
+/// kill that lands in between.
+async fn wait_until_killed(control: &SessionControl) {
+    loop {
+        let notified = control.kill.notified();
+        if control.killed.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
 /// Handle for a running mock server. Drop to stop.
 pub struct MockShipHandle {
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     join_handle: Option<tokio::task::JoinHandle<()>>,
     connection_count: Arc<Mutex<u32>>,
+    control: Arc<SessionControl>,
 }
 
 impl MockShipHandle {
     /// Get the current number of active connections.
     pub async fn connection_count(&self) -> u32 {
         *self.connection_count.lock().await
+    }
+
+    /// Drop sessions that are already running, and accept further TCP
+    /// connections without completing a WebSocket handshake.
+    ///
+    /// Used to force an upstream write failure while keeping the listen port
+    /// open so a reconnect blocks instead of failing immediately.
+    pub fn stall_and_drop_sessions(&self) {
+        self.control.stall.store(true, Ordering::Release);
+        self.control.killed.store(true, Ordering::Release);
+        self.control.kill.notify_waiters();
     }
 
     /// Gracefully shut down the server.

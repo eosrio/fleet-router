@@ -32,6 +32,8 @@ pub enum ZcdError {
     },
     /// Lookup of a field the frame did not contain.
     MissingField,
+    /// Decoded value was a different type than the conversion requested.
+    TypeMismatch,
 }
 
 impl Display for ZcdError {
@@ -54,6 +56,9 @@ impl Display for ZcdError {
                 "malformed SHiP field '{field}': expected {expected} bytes, got {actual}"
             ),
             ZcdError::MissingField => write!(f, "SHiP field is not present in the frame"),
+            ZcdError::TypeMismatch => {
+                write!(f, "SHiP value has a different type than requested")
+            }
         }
     }
 }
@@ -123,56 +128,68 @@ impl Display for ZCDValues {
     }
 }
 
-impl From<ZCDValues> for u8 {
-    fn from(value: ZCDValues) -> u8 {
+impl TryFrom<ZCDValues> for u8 {
+    type Error = ZcdError;
+
+    fn try_from(value: ZCDValues) -> Result<Self, Self::Error> {
         match value {
-            ZCDValues::U8(v) => v,
-            _ => panic!("Invalid conversion"),
+            ZCDValues::U8(v) => Ok(v),
+            _ => Err(ZcdError::TypeMismatch),
         }
     }
 }
 
-impl From<ZCDValues> for u32 {
-    fn from(value: ZCDValues) -> u32 {
+impl TryFrom<ZCDValues> for u32 {
+    type Error = ZcdError;
+
+    fn try_from(value: ZCDValues) -> Result<Self, Self::Error> {
         match value {
-            ZCDValues::U32(v) => v,
-            _ => panic!("Invalid conversion"),
+            ZCDValues::U32(v) => Ok(v),
+            _ => Err(ZcdError::TypeMismatch),
         }
     }
 }
 
-impl From<ZCDValues> for u64 {
-    fn from(value: ZCDValues) -> u64 {
+impl TryFrom<ZCDValues> for u64 {
+    type Error = ZcdError;
+
+    fn try_from(value: ZCDValues) -> Result<Self, Self::Error> {
         match value {
-            ZCDValues::U64(v) => v,
-            _ => panic!("Invalid conversion"),
+            ZCDValues::U64(v) => Ok(v),
+            _ => Err(ZcdError::TypeMismatch),
         }
     }
 }
 
-impl From<ZCDValues> for u128 {
-    fn from(value: ZCDValues) -> u128 {
+impl TryFrom<ZCDValues> for u128 {
+    type Error = ZcdError;
+
+    fn try_from(value: ZCDValues) -> Result<Self, Self::Error> {
         match value {
-            ZCDValues::U128(v) => v,
-            _ => panic!("Invalid conversion"),
+            ZCDValues::U128(v) => Ok(v),
+            _ => Err(ZcdError::TypeMismatch),
         }
     }
 }
 
-impl From<ZCDValues> for [u8; 32] {
-    fn from(value: ZCDValues) -> [u8; 32] {
+impl TryFrom<ZCDValues> for [u8; 32] {
+    type Error = ZcdError;
+
+    fn try_from(value: ZCDValues) -> Result<Self, Self::Error> {
         match value {
-            ZCDValues::Checksum256(v) => v,
-            _ => panic!("Invalid conversion"),
+            ZCDValues::Checksum256(v) => Ok(v),
+            _ => Err(ZcdError::TypeMismatch),
         }
     }
 }
 
-impl From<ZCDValues> for String {
-    fn from(value: ZCDValues) -> String {
+impl TryFrom<ZCDValues> for String {
+    type Error = ZcdError;
+
+    fn try_from(value: ZCDValues) -> Result<Self, Self::Error> {
         match value {
-            ZCDValues::String(v) => v,
-            _ => panic!("Invalid conversion"),
+            ZCDValues::String(v) => Ok(v),
+            _ => Err(ZcdError::TypeMismatch),
         }
     }
 }
@@ -238,11 +255,8 @@ impl ZCD<'_> {
         ZCD { buffer, hash_map }
     }
 
-    pub fn get_type(&self, field: &str) -> Result<&ZCDType, ZcdError> {
-        self.hash_map
-            .get(field)
-            .map(|entry| entry.f_type)
-            .ok_or(ZcdError::MissingField)
+    pub fn get_type(&self, field: &str) -> Option<&ZCDType> {
+        self.hash_map.get(field).map(|entry| entry.f_type)
     }
 
     pub fn get(&self, field: &str) -> Result<Option<ZCDValues>, ZcdError> {
@@ -319,16 +333,24 @@ fn zcd_builder<'a>(buffer: &'a [u8], fields: &'a [(&ZCDType, &str, usize)]) -> Z
     for (index, (f_type, field, size)) in fields.iter().enumerate() {
         match f_type {
             Array => {
-                // unbounded fields in the middle of the array
-                if offset >= buffer.len() {
+                // Count byte plus `size` bytes per element. A truncated frame,
+                // or a count whose span does not fit in `usize`, leaves the
+                // field absent instead of panicking.
+                let Some(&elements) = buffer.get(offset) else {
                     break;
-                }
-                let elements = buffer[offset];
-                let full_size = 1 + size * elements as usize;
-                if offset + full_size > buffer.len() {
+                };
+                let Some(payload) = size.checked_mul(usize::from(elements)) else {
                     break;
-                }
-                let field_buffer = &buffer[offset..offset + full_size];
+                };
+                let Some(full_size) = payload.checked_add(1) else {
+                    break;
+                };
+                let Some(end) = offset.checked_add(full_size) else {
+                    break;
+                };
+                let Some(field_buffer) = buffer.get(offset..end) else {
+                    break;
+                };
                 hash_map.insert(
                     field.to_string(),
                     ZCDField {
@@ -337,7 +359,7 @@ fn zcd_builder<'a>(buffer: &'a [u8], fields: &'a [(&ZCDType, &str, usize)]) -> Z
                         f_type,
                     },
                 );
-                offset += full_size;
+                offset = end;
             }
             _ => {
                 // unbounded fields are the last fields in the array
@@ -345,12 +367,14 @@ fn zcd_builder<'a>(buffer: &'a [u8], fields: &'a [(&ZCDType, &str, usize)]) -> Z
                     // unbounded fields at last index
                     if index == fields.len() - 1 {
                         // get data until the end of the buffer
-                        let field_buffer = &buffer[offset..];
+                        let Some(field_buffer) = buffer.get(offset..) else {
+                            break;
+                        };
                         hash_map.insert(
                             field.to_string(),
                             ZCDField {
                                 slice: field_buffer,
-                                size: buffer.len() - offset,
+                                size: field_buffer.len(),
                                 f_type,
                             },
                         );
@@ -358,10 +382,15 @@ fn zcd_builder<'a>(buffer: &'a [u8], fields: &'a [(&ZCDType, &str, usize)]) -> Z
                     }
                 } else {
                     // bounded fields
-                    if offset + size > buffer.len() {
+                    let Some(end) = offset.checked_add(*size) else {
+                        break;
+                    };
+                    if end > buffer.len() {
                         break;
                     }
-                    let field_buffer = &buffer[offset..offset + size];
+                    let Some(field_buffer) = buffer.get(offset..end) else {
+                        break;
+                    };
                     hash_map.insert(
                         field.to_string(),
                         ZCDField {
@@ -370,7 +399,7 @@ fn zcd_builder<'a>(buffer: &'a [u8], fields: &'a [(&ZCDType, &str, usize)]) -> Z
                             f_type,
                         },
                     );
-                    offset += size;
+                    offset = end;
                 }
             }
         }
@@ -693,10 +722,7 @@ mod tests {
                 actual: 3,
             }
         );
-        assert_eq!(
-            parsed.get_type("missing").expect_err("type"),
-            ZcdError::MissingField
-        );
+        assert!(parsed.get_type("missing").is_none());
     }
 
     #[test]
@@ -742,5 +768,284 @@ mod tests {
                 actual: 2,
             }
         );
+    }
+
+    #[test]
+    fn value_conversions_reject_mismatched_types() {
+        assert_eq!(u8::try_from(ZCDValues::U8(3)).expect("u8"), 3);
+        assert_eq!(
+            u8::try_from(ZCDValues::U32(3)).expect_err("mismatch"),
+            ZcdError::TypeMismatch
+        );
+        assert_eq!(u32::try_from(ZCDValues::U32(7)).expect("u32"), 7);
+        assert_eq!(
+            u32::try_from(ZCDValues::U8(7)).expect_err("mismatch"),
+            ZcdError::TypeMismatch
+        );
+        assert_eq!(u64::try_from(ZCDValues::U64(9)).expect("u64"), 9);
+        assert!(u64::try_from(ZCDValues::U32(9)).is_err());
+        assert_eq!(u128::try_from(ZCDValues::U128(11)).expect("u128"), 11);
+        assert!(u128::try_from(ZCDValues::U64(11)).is_err());
+        assert_eq!(
+            <[u8; 32]>::try_from(ZCDValues::Checksum256([4; 32])).expect("id"),
+            [4; 32]
+        );
+        assert!(<[u8; 32]>::try_from(ZCDValues::Bytes(vec![4; 32])).is_err());
+        assert_eq!(
+            String::try_from(ZCDValues::String("ok".to_string())).expect("string"),
+            "ok"
+        );
+        assert!(String::try_from(ZCDValues::Bytes(b"ok".to_vec())).is_err());
+    }
+
+    #[test]
+    fn numeric_accessors_reject_wrong_widths() {
+        assert_eq!(
+            ZCDField {
+                slice: &[0; 5],
+                f_type: &U32,
+                size: 5,
+            }
+            .as_u32()
+            .expect_err("long u32"),
+            ZcdError::Malformed {
+                field: "u32",
+                expected: 4,
+                actual: 5,
+            }
+        );
+        assert_eq!(
+            ZCDField {
+                slice: &[0; 7],
+                f_type: &ZCDType::U64,
+                size: 7,
+            }
+            .as_u64()
+            .expect_err("short u64"),
+            ZcdError::Malformed {
+                field: "u64",
+                expected: 8,
+                actual: 7,
+            }
+        );
+        assert_eq!(
+            ZCDField {
+                slice: &[9; 8],
+                f_type: &ZCDType::U64,
+                size: 8,
+            }
+            .as_u64()
+            .expect("u64"),
+            u64::from_le_bytes([9; 8])
+        );
+        assert_eq!(
+            ZCDField {
+                slice: &[0; 15],
+                f_type: &ZCDType::U128,
+                size: 15,
+            }
+            .as_u128()
+            .expect_err("short u128"),
+            ZcdError::Malformed {
+                field: "u128",
+                expected: 16,
+                actual: 15,
+            }
+        );
+        assert_eq!(
+            ZCDField {
+                slice: &[3; 16],
+                f_type: &ZCDType::U128,
+                size: 16,
+            }
+            .as_u128()
+            .expect("u128"),
+            u128::from_le_bytes([3; 16])
+        );
+        assert_eq!(
+            ZCDField {
+                slice: &[0; 33],
+                f_type: &Checksum256,
+                size: 33,
+            }
+            .as_checksum256()
+            .expect_err("long checksum"),
+            ZcdError::Malformed {
+                field: "checksum256",
+                expected: 32,
+                actual: 33,
+            }
+        );
+    }
+
+    /// `get_blocks_request_v0` body. `positions` is the `have_positions` count.
+    fn blocks_request(positions: u8, payload_bytes: usize, trailing: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        push_u32(&mut buf, 10);
+        push_u32(&mut buf, 20);
+        push_u32(&mut buf, 3);
+        buf.push(positions);
+        buf.resize(buf.len() + payload_bytes, 0x44);
+        buf.resize(buf.len() + trailing, 0x01);
+        buf
+    }
+
+    fn expect_bool(parsed: &ZCD<'_>, field: &str) -> bool {
+        match parsed.get(field).expect("field width") {
+            Some(ZCDValues::Bool(value)) => value,
+            other => panic!("expected bool {field}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_have_positions_array_parses() {
+        // Two positions, 36 bytes each, then the four request flags.
+        let buf = blocks_request(2, 36 * 2, 4);
+        let parsed = deserialize_with(&GET_BLOCKS_REQUEST_V0_FIELDS, &buf);
+        assert_eq!(expect_u32(&parsed, "start_block_num"), 10);
+        assert_eq!(expect_u32(&parsed, "end_block_num"), 20);
+        assert_eq!(expect_u32(&parsed, "max_messages_in_flight"), 3);
+        let positions = parsed
+            .hash_map
+            .get("have_positions")
+            .expect("positions present");
+        assert_eq!(positions.slice.len(), 1 + 36 * 2);
+        assert_eq!(positions.slice[0], 2);
+        assert!(expect_bool(&parsed, "irreversible_only"));
+        assert!(expect_bool(&parsed, "fetch_block"));
+        assert!(expect_bool(&parsed, "fetch_traces"));
+        assert!(expect_bool(&parsed, "fetch_deltas"));
+        assert!(matches!(
+            parsed.get_type("have_positions"),
+            Some(ZCDType::Array)
+        ));
+
+        // An empty position list is one count byte, and the flags still follow it.
+        let empty = blocks_request(0, 0, 4);
+        let parsed = deserialize_with(&GET_BLOCKS_REQUEST_V0_FIELDS, &empty);
+        let positions = parsed
+            .hash_map
+            .get("have_positions")
+            .expect("empty positions present");
+        assert_eq!(positions.slice, &[0]);
+        assert!(expect_bool(&parsed, "irreversible_only"));
+    }
+
+    #[test]
+    fn truncated_array_frame_omits_the_field() {
+        // Count says two positions, but only ten payload bytes follow.
+        let buf = blocks_request(2, 10, 0);
+        let parsed = deserialize_with(&GET_BLOCKS_REQUEST_V0_FIELDS, &buf);
+        assert_eq!(expect_u32(&parsed, "start_block_num"), 10);
+        assert!(parsed.get("have_positions").expect("lookup").is_none());
+        assert!(parsed.get_type("have_positions").is_none());
+        assert!(parsed.get("fetch_deltas").expect("lookup").is_none());
+    }
+
+    #[test]
+    fn oversized_array_frame_keeps_the_declared_span() {
+        let mut buf = blocks_request(1, 36, 4);
+        let declared = buf.len();
+        buf.extend_from_slice(&[0xFF; 64]);
+        let parsed = deserialize_with(&GET_BLOCKS_REQUEST_V0_FIELDS, &buf);
+        let positions = parsed
+            .hash_map
+            .get("have_positions")
+            .expect("positions present");
+        assert_eq!(positions.slice.len(), 1 + 36);
+        assert_eq!(expect_u32(&parsed, "start_block_num"), 10);
+        assert!(expect_bool(&parsed, "fetch_deltas"));
+        // Trailing bytes past the last field stay outside every slice.
+        let consumed: usize = parsed.hash_map.values().map(|field| field.size).sum();
+        assert_eq!(consumed, declared);
+    }
+
+    #[test]
+    fn huge_element_counts_do_not_panic() {
+        // 255 elements of the real 36-byte position, with almost no payload.
+        let short = blocks_request(255, 4, 0);
+        let parsed = deserialize_with(&GET_BLOCKS_REQUEST_V0_FIELDS, &short);
+        assert!(parsed.get("have_positions").expect("lookup").is_none());
+        assert_eq!(expect_u32(&parsed, "max_messages_in_flight"), 3);
+
+        // Per-element size that overflows `size * elements` and `1 + payload`.
+        let overflowing: [(&ZCDType, &str, usize); 1] =
+            [(&ZCDType::Array, "items", usize::MAX / 2)];
+        let parsed = deserialize_with(&overflowing, &[2, 1, 2, 3]);
+        assert!(parsed.get("items").expect("lookup").is_none());
+
+        let max_width: [(&ZCDType, &str, usize); 1] = [(&ZCDType::Array, "items", usize::MAX)];
+        let parsed = deserialize_with(&max_width, &[1]);
+        assert!(parsed.get("items").expect("lookup").is_none());
+
+        // A consumed prefix plus a span of `usize::MAX` must not wrap the end.
+        let shifted: [(&ZCDType, &str, usize); 2] = [
+            (&ZCDType::U8, "prefix", 1),
+            (&ZCDType::Array, "items", usize::MAX),
+        ];
+        let parsed = deserialize_with(&shifted, &[7, 1, 2, 3, 4]);
+        match parsed.get("prefix").expect("prefix") {
+            Some(ZCDValues::U8(value)) => assert_eq!(value, 7),
+            other => panic!("expected u8, got {other:?}"),
+        }
+        assert!(parsed.get("items").expect("lookup").is_none());
+    }
+
+    #[test]
+    fn arbitrary_bytes_never_panic() {
+        let samples: &[&[u8]] = &[
+            &[],
+            &[0],
+            &[255],
+            &[255, 255, 255, 255],
+            &[1, 2, 3],
+            &[0; 12],
+            &[255; 8],
+        ];
+        for sample in samples {
+            exercise_decoder(sample);
+        }
+
+        let mut state = 0x1234_5678_9abc_def0u64;
+        for _ in 0..256 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let len = (state % 128) as usize;
+            let mut buf = Vec::with_capacity(len);
+            for _ in 0..len {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                buf.push((state & 0xff) as u8);
+            }
+            exercise_decoder(&buf);
+        }
+    }
+
+    fn exercise_decoder(buf: &[u8]) {
+        let tables: [&[(&ZCDType, &str, usize)]; 4] = [
+            &GET_BLOCKS_REQUEST_V0_FIELDS,
+            &GET_BLOCKS_ACK_REQUEST_V0_FIELDS,
+            &RESULT_V0_FIELDS,
+            &STATUS_RESULT_V0_FIELDS,
+        ];
+        for fields in tables {
+            let parsed = deserialize_with(fields, buf);
+            for (_, name, _) in fields {
+                let _ = parsed.get(name);
+                let _ = parsed.get_type(name);
+            }
+        }
+        let _ = deserialize_result(buf);
+        let _ = deserialize_status_result(buf);
+        let _ = deserialize_status_result_v1(buf);
+
+        let hostile: [(&ZCDType, &str, usize); 3] = [
+            (&U8, "prefix", 1),
+            (&Array, "items", usize::MAX / 2),
+            (&U32, "tail", usize::MAX),
+        ];
+        let parsed = deserialize_with(&hostile, buf);
+        let _ = parsed.get("prefix");
+        let _ = parsed.get("items");
+        let _ = parsed.get("tail");
+        let _ = parsed.get_type("items");
     }
 }

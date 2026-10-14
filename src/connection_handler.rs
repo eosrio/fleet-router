@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use rs_abieos::Abieos;
 use tokio::net::TcpStream;
 use tokio::spawn;
 use tokio::sync::{broadcast, Mutex, Notify};
@@ -18,6 +17,7 @@ use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tungstenite::Message;
 
+use crate::abi::accept_upstream_abi;
 use crate::functions::{
     parse_blocks_route, select_backend_server, select_failover_server, should_reroute_for_finality,
     RouteRequest,
@@ -227,7 +227,6 @@ pub async fn handle_client(
     _client_address: SocketAddr,
     backend_servers: ServerStateDb,
     server_config_db: ServerConfigDb,
-    shared_abieos: Arc<Mutex<Abieos>>,
     limits: ProxyLimits,
     mut shutdown: broadcast::Receiver<()>,
 ) {
@@ -290,13 +289,11 @@ pub async fn handle_client(
         return;
     };
 
-    // Validate the ABI against the shared abieos context.
-    {
-        let abieos = shared_abieos.lock().await;
-        if let Err(e) = abieos.set_abi_json("0", &server_abi) {
-            tracing::error!(error = %e, "error setting ABI from upstream");
-            return;
-        }
+    // Validate on a fresh handle and drop it. The parsed model is not kept
+    // for the session, and it is not registered on a shared context.
+    if let Err(e) = accept_upstream_abi(&server_abi) {
+        tracing::error!(error = %e, "error setting ABI from upstream");
+        return;
     }
 
     let (client_writer, mut client_reader) = client_websocket.split();
@@ -587,12 +584,9 @@ pub async fn handle_client(
         active_conn = new_conn; // drops the old guard (synchronous decrement)
         *current_endpoint.lock().await = endpoint;
 
-        {
-            let abieos = shared_abieos.lock().await;
-            if let Err(e) = abieos.set_abi_json("0", &new_abi) {
-                tracing::error!(error = %e, "error setting ABI after failover");
-                break 'session;
-            }
+        if let Err(e) = accept_upstream_abi(&new_abi) {
+            tracing::error!(error = %e, "error setting ABI after failover");
+            break 'session;
         }
 
         // Swap in the new socket.

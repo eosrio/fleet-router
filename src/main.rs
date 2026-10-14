@@ -19,11 +19,10 @@ use anyhow::{bail, Result};
 use clap::{arg, value_parser, Command};
 use color_print::cprintln;
 use futures::StreamExt;
-use rs_abieos::Abieos;
 use serde_json::from_str;
 use tokio::net::TcpListener;
 use tokio::spawn;
-use tokio::sync::{broadcast, Mutex, Semaphore};
+use tokio::sync::{broadcast, Semaphore};
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
@@ -36,6 +35,7 @@ use crate::models::{
 };
 use crate::tasks::{monitoring_connection, state_monitoring_loop, upstream_ws_config};
 
+mod abi;
 mod config_sample;
 mod connection_handler;
 mod errors;
@@ -64,13 +64,6 @@ async fn main() -> Result<()> {
     // Validate the configuration up front with clear, actionable errors.
     config.validate()?;
 
-    let main_abieos = Abieos::new();
-    let ctx = main_abieos.as_ptr();
-    if ctx.is_null() {
-        bail!("Error instancing Abieos! No context was created!");
-    }
-    let shared_abieos = Arc::new(Mutex::new(Abieos::from_context(ctx)));
-
     let static_config = StaticConfig {
         upstream_status_ms: config.upstream_status_ms,
         upstream_monitoring_ms: config.upstream_monitoring_ms,
@@ -93,7 +86,6 @@ async fn main() -> Result<()> {
             server,
             static_config.clone(),
             server_state_db.clone(),
-            shared_abieos.clone(),
             shutdown_tx.subscribe(),
         ));
     }
@@ -157,7 +149,6 @@ async fn main() -> Result<()> {
 
                 let s_state_db = server_state_db.clone();
                 let s_config_db = server_config_db.clone();
-                let abieos = shared_abieos.clone();
                 let shutdown_rx = shutdown_tx.subscribe();
 
                 spawn(
@@ -168,7 +159,6 @@ async fn main() -> Result<()> {
                             client_addr,
                             s_state_db,
                             s_config_db,
-                            abieos,
                             limits,
                             shutdown_rx,
                         )

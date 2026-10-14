@@ -104,6 +104,37 @@ pub fn encode_status_result_v0(
     buf
 }
 
+/// Encode a get_status_result_v1 as the `result` variant (index 3).
+///
+/// Same fields as v0, with `chain_id` required, followed by
+/// `finality_data_begin_block` and `finality_data_end_block` (exclusive end).
+pub fn encode_status_result_v1(
+    head_block: u32,
+    lib_block: u32,
+    chain_id: &[u8; 32],
+    trace_begin: u32,
+    trace_end: u32,
+    finality_begin: u32,
+    finality_end: u32,
+) -> Vec<u8> {
+    let head_id = fake_block_id(head_block);
+    let lib_id = fake_block_id(lib_block);
+
+    let mut buf = Vec::with_capacity(136);
+    // variant index 3 = get_status_result_v1
+    buf.extend_from_slice(&encode_varuint32(3));
+    buf.extend_from_slice(&encode_block_position(head_block, &head_id));
+    buf.extend_from_slice(&encode_block_position(lib_block, &lib_id));
+    buf.extend_from_slice(&trace_begin.to_le_bytes());
+    buf.extend_from_slice(&trace_end.to_le_bytes());
+    buf.extend_from_slice(&trace_begin.to_le_bytes());
+    buf.extend_from_slice(&trace_end.to_le_bytes());
+    buf.extend_from_slice(chain_id);
+    buf.extend_from_slice(&finality_begin.to_le_bytes());
+    buf.extend_from_slice(&finality_end.to_le_bytes());
+    buf
+}
+
 /// Encode a get_blocks_result_v0 with optional data payloads.
 ///
 /// When `block_data`, `traces`, or `deltas` are `Some`, the optional is encoded as
@@ -197,6 +228,7 @@ pub enum ShipRequest {
         fetch_block: bool,
         fetch_traces: bool,
         fetch_deltas: bool,
+        fetch_finality_data: bool,
     },
     GetBlocksAckV0 {
         num_messages: u32,
@@ -259,6 +291,7 @@ pub fn decode_request(data: &[u8]) -> ShipRequest {
                 let fetch_block = payload.get(bool_offset + 1).copied().unwrap_or(0) != 0;
                 let fetch_traces = payload.get(bool_offset + 2).copied().unwrap_or(0) != 0;
                 let fetch_deltas = payload.get(bool_offset + 3).copied().unwrap_or(0) != 0;
+                let fetch_finality_data = payload.get(bool_offset + 4).copied().unwrap_or(0) != 0;
                 ShipRequest::GetBlocksV1 {
                     start_block_num: start,
                     end_block_num: end,
@@ -266,6 +299,7 @@ pub fn decode_request(data: &[u8]) -> ShipRequest {
                     fetch_block,
                     fetch_traces,
                     fetch_deltas,
+                    fetch_finality_data,
                 }
             } else {
                 ShipRequest::Unknown(3)
@@ -349,6 +383,55 @@ mod tests {
         assert_eq!(result[0], 0);
         // head block_num should be 1000 LE at offset 1
         assert_eq!(u32::from_le_bytes(result[1..5].try_into().unwrap()), 1000);
+    }
+
+    #[test]
+    fn test_status_result_v1_encoding_appends_finality_range() {
+        let chain_id = [0xABu8; 32];
+        let result = encode_status_result_v1(1000, 990, &chain_id, 1, 1001, 10, 500);
+        assert_eq!(result[0], 3);
+        assert_eq!(u32::from_le_bytes(result[1..5].try_into().unwrap()), 1000);
+        let n = result.len();
+        assert!(n >= 8);
+        assert_eq!(
+            u32::from_le_bytes(result[n - 8..n - 4].try_into().unwrap()),
+            10
+        );
+        assert_eq!(
+            u32::from_le_bytes(result[n - 4..n].try_into().unwrap()),
+            500
+        );
+        // v0 frame is the same prefix without the trailing 8 bytes, and variant 0.
+        let v0 = encode_status_result_v0(1000, 990, &chain_id, 1, 1001);
+        assert_eq!(result.len(), v0.len() + 8);
+    }
+
+    #[test]
+    fn test_blocks_request_v1_decode_finality_flag() {
+        let mut data = encode_varuint32(3);
+        data.extend_from_slice(&100u32.to_le_bytes());
+        data.extend_from_slice(&200u32.to_le_bytes());
+        data.extend_from_slice(&10u32.to_le_bytes());
+        data.extend_from_slice(&encode_varuint32(0));
+        data.push(0); // irreversible_only
+        data.push(1); // fetch_block
+        data.push(0); // fetch_traces
+        data.push(0); // fetch_deltas
+        data.push(1); // fetch_finality_data
+
+        match decode_request(&data) {
+            ShipRequest::GetBlocksV1 {
+                start_block_num,
+                fetch_block,
+                fetch_finality_data,
+                ..
+            } => {
+                assert_eq!(start_block_num, 100);
+                assert!(fetch_block);
+                assert!(fetch_finality_data);
+            }
+            other => panic!("Expected GetBlocksV1, got {:?}", other),
+        }
     }
 
     #[test]

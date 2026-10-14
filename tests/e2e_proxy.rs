@@ -30,6 +30,35 @@ struct FleetRouterProcess {
 impl FleetRouterProcess {
     /// Start fleet-router with a generated config pointing to the given upstream endpoints.
     async fn start(upstream_endpoints: &[String], status_ms: u64) -> Self {
+        Self::launch(upstream_endpoints, status_ms, 1000, None).await
+    }
+
+    /// Start fleet-router and also bind the HTTP metrics endpoint.
+    async fn start_with_metrics(
+        upstream_endpoints: &[String],
+        status_ms: u64,
+        reconnect_ms: u64,
+    ) -> (Self, u16) {
+        let metrics_port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let router = Self::launch(
+            upstream_endpoints,
+            status_ms,
+            reconnect_ms,
+            Some(metrics_port),
+        )
+        .await;
+        (router, metrics_port)
+    }
+
+    async fn launch(
+        upstream_endpoints: &[String],
+        status_ms: u64,
+        reconnect_ms: u64,
+        metrics_port: Option<u16>,
+    ) -> Self {
         // Find a free port for fleet-router to listen on
         let listen_port = {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -49,14 +78,18 @@ impl FleetRouterProcess {
             })
             .collect();
 
-        let config = serde_json::json!({
+        let mut config = serde_json::json!({
             "listen_address": "127.0.0.1",
             "listen_port": listen_port,
-            "upstream_reconnect_ms": 1000,
+            "upstream_reconnect_ms": reconnect_ms,
             "upstream_monitoring_ms": 2000,
             "upstream_status_ms": status_ms,
             "servers": servers
         });
+        if let Some(port) = metrics_port {
+            config["metrics_address"] = serde_json::json!("127.0.0.1");
+            config["metrics_port"] = serde_json::json!(port);
+        }
 
         // Write config to a temp file
         let mut config_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
@@ -168,6 +201,45 @@ fn build_blocks_request(start: u32, end: u32, max_in_flight: u32) -> Vec<u8> {
     buf.push(0); // fetch_traces
     buf.push(0); // fetch_deltas
     buf
+}
+
+fn build_blocks_request_v1(
+    start: u32,
+    end: u32,
+    max_in_flight: u32,
+    fetch_finality: bool,
+) -> Vec<u8> {
+    let mut buf = vec![3u8]; // get_blocks_request_v1
+    buf.extend_from_slice(&start.to_le_bytes());
+    buf.extend_from_slice(&end.to_le_bytes());
+    buf.extend_from_slice(&max_in_flight.to_le_bytes());
+    buf.push(0); // have_positions
+    buf.push(0); // irreversible_only
+    buf.push(0); // fetch_block
+    buf.push(0); // fetch_traces
+    buf.push(0); // fetch_deltas
+    buf.push(u8::from(fetch_finality));
+    buf
+}
+
+async fn wait_for_metric(port: u16, needle: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = format!("127.0.0.1:{port}");
+    for _ in 0..150 {
+        if let Ok(mut stream) = tokio::net::TcpStream::connect(&addr).await {
+            let req = b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            if stream.write_all(req).await.is_ok() {
+                let mut buf = Vec::new();
+                if stream.read_to_end(&mut buf).await.is_ok()
+                    && String::from_utf8_lossy(&buf).contains(needle)
+                {
+                    return;
+                }
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out waiting for metric containing {needle}");
 }
 
 fn build_ack_request(num_messages: u32) -> Vec<u8> {
@@ -1111,4 +1183,130 @@ async fn e2e_proxy_failover_to_range_valid() {
     ha.shutdown().await;
     hb.shutdown().await;
     hc.shutdown().await;
+}
+
+fn finality_end_metric(endpoint: &str, end: u32) -> String {
+    format!("fleet_router_upstream_finality_data_end_block{{endpoint=\"{endpoint}\"}} {end}")
+}
+
+/// Read up to `n` block-result heads, skipping ABI text frames.
+async fn read_block_heads(reader: &mut WsReader, n: usize) -> Vec<u32> {
+    let mut heads = Vec::new();
+    let start = std::time::Instant::now();
+    while heads.len() < n && start.elapsed() < Duration::from_secs(10) {
+        let msg = match tokio::time::timeout(Duration::from_secs(5), reader.next()).await {
+            Ok(Some(Ok(msg))) => msg,
+            _ => break,
+        };
+        match msg {
+            Message::Binary(data) if data.len() >= 5 && (data[0] == 1 || data[0] == 2) => {
+                heads.push(u32::from_le_bytes(data[1..5].try_into().unwrap()));
+            }
+            Message::Text(_) => continue,
+            _ => break,
+        }
+    }
+    heads
+}
+
+// ===========================================================================
+// E2E TEST 13: Finality-data requests follow the v1 status range
+// ===========================================================================
+
+/// Two upstreams with the same trace range and disjoint finality ranges:
+/// - B (head 9000) is the only node up when the client connects, so the session
+///   starts there. Its finality range does not cover block 100.
+/// - A (head 5000) comes up afterwards and does cover block 100.
+///
+/// A `get_blocks_request_v1` with `fetch_finality_data` must move to A.
+/// A later client that does not ask for finality data stays on least-connections
+/// (B), which is the v0 behaviour.
+#[tokio::test]
+async fn e2e_proxy_routes_finality_requests_by_v1_range() {
+    let config_a = MockShipConfig {
+        head_block: 5000,
+        lib_block: 4990,
+        blocks_to_stream: 0,
+        trace_begin_block: 1,
+        trace_end_block: 20_001,
+        emit_status_v1: true,
+        finality_data_begin_block: 1,
+        finality_data_end_block: 10_001,
+        ..Default::default()
+    };
+    let config_b = MockShipConfig {
+        head_block: 9000,
+        lib_block: 8990,
+        blocks_to_stream: 0,
+        trace_begin_block: 1,
+        trace_end_block: 20_001,
+        emit_status_v1: true,
+        finality_data_begin_block: 10_001,
+        finality_data_end_block: 20_001,
+        ..Default::default()
+    };
+
+    // Bind A but do not accept yet, so the router can only mark B online.
+    let mock_a = MockShipServer::new(config_a).await;
+    let mock_b = MockShipServer::new(config_b).await;
+    let ep_a = mock_a.endpoint();
+    let ep_b = mock_b.endpoint();
+    let hb = mock_b.start();
+
+    let (router, metrics_port) =
+        FleetRouterProcess::start_with_metrics(&[ep_b.clone(), ep_a.clone()], 100, 200).await;
+
+    wait_for_metric(metrics_port, &finality_end_metric(&ep_b, 20_001)).await;
+
+    let (mut writer, mut reader) = ws_connect(&router.ws_url()).await;
+    let _abi = read_one(&mut reader).await;
+
+    // A accepts the monitor handshake that has been waiting, then reports v1.
+    let ha = mock_a.start();
+    wait_for_metric(metrics_port, &finality_end_metric(&ep_a, 10_001)).await;
+
+    writer
+        .send(Message::Binary(
+            build_blocks_request_v1(100, 200, 5, true).into(),
+        ))
+        .await
+        .unwrap();
+
+    let heads = read_block_heads(&mut reader, 3).await;
+    println!("  Finality route: heads = {:?}", heads);
+    assert!(
+        !heads.is_empty(),
+        "expected blocks from the upstream whose finality range covers block 100"
+    );
+    assert!(
+        heads.iter().all(|head| *head == 5000),
+        "fetch_finality_data request must use upstream A (head 5000), got {heads:?}"
+    );
+
+    // A now has the live client. A new client is least-connections onto B, and a
+    // request that does not ask for finality data must stay there.
+    let (mut writer_b, mut reader_b) = ws_connect(&router.ws_url()).await;
+    let _abi_b = read_one(&mut reader_b).await;
+    writer_b
+        .send(Message::Binary(build_blocks_request(100, 200, 5).into()))
+        .await
+        .unwrap();
+    let heads_b = read_block_heads(&mut reader_b, 3).await;
+    println!("  Non-finality route: heads = {:?}", heads_b);
+    assert!(
+        !heads_b.is_empty(),
+        "expected blocks from the least-loaded upstream"
+    );
+    assert!(
+        heads_b.iter().all(|head| *head == 9000),
+        "request without fetch_finality_data keeps v0 routing (head 9000), got {heads_b:?}"
+    );
+
+    drop(writer);
+    drop(reader);
+    drop(writer_b);
+    drop(reader_b);
+    drop(router);
+    ha.shutdown().await;
+    hb.shutdown().await;
 }

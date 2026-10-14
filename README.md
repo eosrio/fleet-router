@@ -14,7 +14,7 @@ It is written in Rust on [tokio](https://tokio.rs/) and [tokio-tungstenite](http
 
 ## Features
 
-- **Range-aware, least-connections load balancing** — prefers an upstream whose trace range covers the requested block; otherwise routes to the least-loaded healthy upstream.
+- **Range-aware, least-connections load balancing** — prefers an upstream whose trace range covers the requested block; otherwise routes to the least-loaded healthy upstream. A `get_blocks_request_v1` with `fetch_finality_data` is sent only to an upstream whose finality-data range covers that block (learned from `get_status_result_v1`). If no upstream reports a covering range, routing stays on the trace-range rules.
 - **Automatic failover with de-duplication** — on upstream loss, reconnects to another suitable node, resumes `get_blocks` at the next block, de-duplicates replayed blocks, and buffers/replays client frames sent during the swap.
 - **Stale-upstream deprioritization** — upstreams that stop advancing their chain state are flagged stale and deprioritized (not hard-excluded) when routing.
 - **Graceful shutdown** — handles `SIGINT`/`SIGTERM` with a bounded drain and WebSocket close frames to connected clients.

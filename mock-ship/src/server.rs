@@ -11,8 +11,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::abi::SHIP_ABI_JSON;
 use crate::protocol::{
-    decode_request, encode_blocks_result_v0_with_data, encode_status_result_v0, generate_fake_data,
-    ShipRequest,
+    decode_request, encode_blocks_result_v0_with_data, encode_status_result_v0,
+    encode_status_result_v1, generate_fake_data, ShipRequest,
 };
 
 /// Configuration for a mock SHiP server instance.
@@ -44,6 +44,13 @@ pub struct MockShipConfig {
     pub status_requests: Option<Arc<AtomicUsize>>,
     /// Highest number of `get_status` requests observed on any single session.
     pub max_status_per_session: Option<Arc<AtomicUsize>>,
+    /// Reply to status requests with `get_status_result_v1` (includes finality range).
+    /// Default false keeps the historical v0 status result.
+    pub emit_status_v1: bool,
+    /// First block with finality data. Used when `emit_status_v1` is set.
+    pub finality_data_begin_block: u32,
+    /// One past the last block with finality data. Used when `emit_status_v1` is set.
+    pub finality_data_end_block: u32,
 }
 
 /// How the mock treats `get_status` requests. Used to exercise monitor limits.
@@ -76,6 +83,9 @@ impl Default for MockShipConfig {
             status_fault: None,
             status_requests: None,
             max_status_per_session: None,
+            emit_status_v1: false,
+            finality_data_begin_block: 0,
+            finality_data_end_block: 0,
         }
     }
 }
@@ -87,6 +97,30 @@ fn observe_status(config: &MockShipConfig, session_status: usize) {
     if let Some(max) = &config.max_status_per_session {
         max.fetch_max(session_status, Ordering::Relaxed);
     }
+}
+
+/// Whether this mock should stream `start_block_num`.
+///
+/// A block outside the configured trace range closes the session (the proxy
+/// then fails over). A `fetch_finality_data` request outside the finality
+/// range is still served, so tests can see which upstream actually answered.
+fn serve_blocks(config: &MockShipConfig, start_block_num: u32, fetch_finality_data: bool) -> bool {
+    if fetch_finality_data
+        && config.finality_data_end_block > 0
+        && (start_block_num < config.finality_data_begin_block
+            || start_block_num >= config.finality_data_end_block)
+    {
+        eprintln!(
+            "[mock-ship] fetch_finality_data block {start_block_num} is outside finality range {}..{}; serving anyway",
+            config.finality_data_begin_block, config.finality_data_end_block
+        );
+    }
+    if config.trace_end_block > 0
+        && (start_block_num < config.trace_begin_block || start_block_num >= config.trace_end_block)
+    {
+        return false;
+    }
+    true
 }
 
 /// A mock SHiP WebSocket server for testing fleet-router.
@@ -323,13 +357,25 @@ impl MockShipServer {
                             } else {
                                 config.head_block + 1
                             };
-                            let result = encode_status_result_v0(
-                                config.head_block,
-                                config.lib_block,
-                                &config.chain_id,
-                                config.trace_begin_block,
-                                trace_end,
-                            );
+                            let result = if config.emit_status_v1 {
+                                encode_status_result_v1(
+                                    config.head_block,
+                                    config.lib_block,
+                                    &config.chain_id,
+                                    config.trace_begin_block,
+                                    trace_end,
+                                    config.finality_data_begin_block,
+                                    config.finality_data_end_block,
+                                )
+                            } else {
+                                encode_status_result_v0(
+                                    config.head_block,
+                                    config.lib_block,
+                                    &config.chain_id,
+                                    config.trace_begin_block,
+                                    trace_end,
+                                )
+                            };
                             if writer.send(Message::Binary(result.into())).await.is_err() {
                                 return;
                             }
@@ -357,23 +403,28 @@ impl MockShipServer {
                             fetch_block: fb,
                             fetch_traces: ft,
                             fetch_deltas: fd,
+                        } => {
+                            if !serve_blocks(&config, start_block_num, false) {
+                                return;
+                            }
+                            current_block = Some(start_block_num);
+                            end_block = end_block_num;
+                            send_credits = max_messages_in_flight;
+                            blocks_sent = 0;
+                            fetch_block = fb;
+                            fetch_traces = ft;
+                            fetch_deltas = fd;
                         }
-                        | ShipRequest::GetBlocksV1 {
+                        ShipRequest::GetBlocksV1 {
                             start_block_num,
                             end_block_num,
                             max_messages_in_flight,
                             fetch_block: fb,
                             fetch_traces: ft,
                             fetch_deltas: fd,
+                            fetch_finality_data,
                         } => {
-                            // When an explicit trace range is configured, model a
-                            // real node that cannot serve blocks outside it: close
-                            // the connection so the proxy fails over to a covering
-                            // upstream. (No effect when trace_end_block is unset.)
-                            if config.trace_end_block > 0
-                                && (start_block_num < config.trace_begin_block
-                                    || start_block_num >= config.trace_end_block)
-                            {
+                            if !serve_blocks(&config, start_block_num, fetch_finality_data) {
                                 return;
                             }
                             current_block = Some(start_block_num);

@@ -294,6 +294,25 @@ pub const STATUS_RESULT_V0_FIELDS: [(&ZCDType, &str, usize); 9] = [
     (&Checksum256, "chain_id", 32),
 ];
 
+/// `get_status_result_v1` (result variant 3). Same prefix as v0, plus the
+/// finality-data block range. `finality_data_end_block` is one past the last
+/// block that has finality data, matching `trace_end_block`.
+///
+/// Unlike v0, `chain_id` and both finality bounds are required.
+pub const STATUS_RESULT_V1_FIELDS: [(&ZCDType, &str, usize); 11] = [
+    (&U32, "head_block_num", 4),
+    (&Checksum256, "head_block_id", 32),
+    (&U32, "last_irreversible_block_num", 4),
+    (&Checksum256, "last_irreversible_block_id", 32),
+    (&U32, "trace_begin_block", 4),
+    (&U32, "trace_end_block", 4),
+    (&U32, "chain_state_begin_block", 4),
+    (&U32, "chain_state_end_block", 4),
+    (&Checksum256, "chain_id", 32),
+    (&U32, "finality_data_begin_block", 4),
+    (&U32, "finality_data_end_block", 4),
+];
+
 fn zcd_builder<'a>(buffer: &'a [u8], fields: &'a [(&ZCDType, &str, usize)]) -> ZCD<'a> {
     let mut offset = 0;
     let mut hash_map = HashMap::new();
@@ -366,17 +385,21 @@ pub fn deserialize_with<'a, 'b: 'a>(
     zcd_builder(buffer, fields)
 }
 
-/// Decode a `get_status_result_v0` body (no leading result-variant byte).
+/// Walk fixed-width status fields.
 ///
-/// `chain_id` is a binary extension, so a frame that ends immediately after
-/// `chain_state_end_block` is valid. A frame that stops before a required
-/// field, or that includes only part of a field, is returned as an error.
-pub fn deserialize_status_result(buffer: &[u8]) -> Result<ZCD<'_>, ZcdError> {
+/// `optional_extension` names a trailing field that may be omitted entirely
+/// (`get_status_result_v0`'s `chain_id`). A partial copy of that field is still
+/// [`ZcdError::Malformed`]. Bytes past the last field are ignored.
+fn decode_fixed_fields<'a>(
+    buffer: &'a [u8],
+    fields: &'static [(&'static ZCDType, &'static str, usize)],
+    optional_extension: Option<&str>,
+) -> Result<ZCD<'a>, ZcdError> {
     let mut offset = 0usize;
     let mut hash_map = HashMap::new();
-    let last = STATUS_RESULT_V0_FIELDS.len().saturating_sub(1);
+    let last = fields.len().saturating_sub(1);
 
-    for (index, &(f_type, field, size)) in STATUS_RESULT_V0_FIELDS.iter().enumerate() {
+    for (index, &(f_type, field, size)) in fields.iter().enumerate() {
         let width = type_width(f_type).ok_or(ZcdError::Malformed {
             field,
             expected: size,
@@ -391,9 +414,7 @@ pub fn deserialize_status_result(buffer: &[u8]) -> Result<ZCD<'_>, ZcdError> {
         }
 
         let remaining = buffer.len().saturating_sub(offset);
-        // chain_id is the optional trailing extension. Ending exactly on the
-        // previous field is a complete older frame, not a truncated one.
-        if remaining == 0 && field == "chain_id" && index == last {
+        if remaining == 0 && optional_extension == Some(field) && index == last {
             break;
         }
         if remaining < size {
@@ -427,6 +448,23 @@ pub fn deserialize_status_result(buffer: &[u8]) -> Result<ZCD<'_>, ZcdError> {
     Ok(ZCD::from(buffer, hash_map))
 }
 
+/// Decode a `get_status_result_v0` body (no leading result-variant byte).
+///
+/// `chain_id` is a binary extension, so a frame that ends immediately after
+/// `chain_state_end_block` is valid. A frame that stops before a required
+/// field, or that includes only part of a field, is returned as an error.
+pub fn deserialize_status_result(buffer: &[u8]) -> Result<ZCD<'_>, ZcdError> {
+    decode_fixed_fields(buffer, &STATUS_RESULT_V0_FIELDS, Some("chain_id"))
+}
+
+/// Decode a `get_status_result_v1` body (no leading result-variant byte).
+///
+/// `chain_id` and both finality-data bounds are required. A truncated or
+/// partial field is an error; trailing bytes past the last field are ignored.
+pub fn deserialize_status_result_v1(buffer: &[u8]) -> Result<ZCD<'_>, ZcdError> {
+    decode_fixed_fields(buffer, &STATUS_RESULT_V1_FIELDS, None)
+}
+
 pub fn deserialize_result(buffer: &[u8]) -> ZCD<'_> {
     zcd_builder(buffer, &RESULT_V0_FIELDS)
 }
@@ -457,6 +495,14 @@ mod tests {
         if include_chain_id {
             push_id(&mut buf, 0xAB);
         }
+        buf
+    }
+
+    /// v0 body plus both finality bounds.
+    fn status_body_v1(begin: u32, end: u32) -> Vec<u8> {
+        let mut buf = status_body(true);
+        push_u32(&mut buf, begin);
+        push_u32(&mut buf, end);
         buf
     }
 
@@ -650,6 +696,51 @@ mod tests {
         assert_eq!(
             parsed.get_type("missing").expect_err("type"),
             ZcdError::MissingField
+        );
+    }
+
+    #[test]
+    fn status_v1_frame_parses_finality_range() {
+        let body = status_body_v1(10, 500);
+        let parsed = deserialize_status_result_v1(&body).expect("valid v1");
+        assert_eq!(expect_u32(&parsed, "head_block_num"), 1000);
+        assert_eq!(expect_u32(&parsed, "trace_begin_block"), 10);
+        assert_eq!(expect_u32(&parsed, "trace_end_block"), 1001);
+        assert_eq!(expect_u32(&parsed, "chain_state_begin_block"), 5);
+        assert_eq!(expect_u32(&parsed, "chain_state_end_block"), 1000);
+        assert_eq!(expect_u32(&parsed, "finality_data_begin_block"), 10);
+        assert_eq!(expect_u32(&parsed, "finality_data_end_block"), 500);
+        match parsed.get("chain_id").expect("chain id") {
+            Some(ZCDValues::Checksum256(id)) => assert_eq!(id, [0xAB; 32]),
+            other => panic!("expected checksum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_v1_missing_finality_is_truncated() {
+        let err = deserialize_status_result_v1(&status_body(true)).expect_err("missing finality");
+        assert_eq!(
+            err,
+            ZcdError::Truncated {
+                field: "finality_data_begin_block",
+                expected: 4,
+                remaining: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn status_v1_partial_finality_u32_is_malformed() {
+        let mut body = status_body_v1(10, 500);
+        body.truncate(body.len() - 2);
+        let err = deserialize_status_result_v1(&body).expect_err("partial u32");
+        assert_eq!(
+            err,
+            ZcdError::Malformed {
+                field: "finality_data_end_block",
+                expected: 4,
+                actual: 2,
+            }
         );
     }
 }

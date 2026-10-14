@@ -127,6 +127,7 @@ pub(crate) fn upstream_ws_config(max_message_bytes: usize) -> WebSocketConfig {
 async fn mark_offline(server_state_db: &ServerStateDb, endpoint: &str) {
     if let Some(state) = server_state_db.lock().await.get_mut(endpoint) {
         state.online = false;
+        state.chain_id = None;
     }
 }
 
@@ -482,15 +483,12 @@ async fn apply_status_update(
     };
 
     let mut db = server_state_db.lock().await;
+    // Only currently online peers anchor an unpinned pool's chain_id so an
+    // offline node's last reported chain_id cannot lock out active peers.
     let peer_chain_id = db
         .iter()
         .filter(|(ep, s)| *ep != &server.endpoint && s.online)
-        .find_map(|(_, s)| s.chain_id)
-        .or_else(|| {
-            db.iter()
-                .filter(|(ep, _)| *ep != &server.endpoint)
-                .find_map(|(_, s)| s.chain_id)
-        });
+        .find_map(|(_, s)| s.chain_id);
 
     if let Some(state) = db.get_mut(&server.endpoint) {
         if let Some(expected) = state.expected_chain_id {
@@ -505,6 +503,7 @@ async fn apply_status_update(
                         "upstream chain_id does not match configured chain_id; marking offline"
                     );
                     state.online = false;
+                    state.chain_id = None;
                     return Ok(Some(variant));
                 }
                 None => {
@@ -515,6 +514,7 @@ async fn apply_status_update(
                         "upstream status omitted chain_id while chain_id is pinned; marking offline"
                     );
                     state.online = false;
+                    state.chain_id = None;
                     return Ok(Some(variant));
                 }
             }
@@ -528,6 +528,7 @@ async fn apply_status_update(
                     "upstream chain_id mismatches pool chain_id; marking offline"
                 );
                 state.online = false;
+                state.chain_id = None;
                 return Ok(Some(variant));
             }
         }
@@ -910,5 +911,45 @@ mod tests {
         let state = guard.get(&s1.endpoint).unwrap();
         assert!(state.online);
         assert_eq!(state.chain_id, Some([0xAB; 32]));
+    }
+
+    #[tokio::test]
+    async fn offline_peer_chain_id_does_not_poison_unpinned_pool() {
+        let s1 = Server {
+            name: "alpha".to_string(),
+            endpoint: "127.0.0.1:18080".to_string(),
+            enabled: true,
+        };
+        let s2 = Server {
+            name: "beta".to_string(),
+            endpoint: "127.0.0.1:18081".to_string(),
+            enabled: true,
+        };
+        let db = build_state_db(vec![s1.clone(), s2.clone()]);
+
+        // First server comes online with chain_id [0xAB; 32], then goes offline.
+        apply_status_update(&status_message(&status_body()), &db, &s1)
+            .await
+            .expect("s1 status");
+        super::mark_offline(&db, &s1.endpoint).await;
+
+        // Even if an offline peer still had a chain_id recorded, only online peers anchor the pool.
+        db.lock().await.get_mut(&s1.endpoint).unwrap().chain_id = Some([0xAB; 32]);
+
+        // Second server reporting [0xCD; 32] comes online cleanly because no online peer holds a conflicting chain_id.
+        let mut s2_body = status_body();
+        let len = s2_body.len();
+        s2_body[len - 32..].copy_from_slice(&[0xCD; 32]);
+        apply_status_update(&status_message(&s2_body), &db, &s2)
+            .await
+            .expect("s2 status");
+
+        let guard = db.lock().await;
+        let state2 = guard.get(&s2.endpoint).unwrap();
+        assert!(
+            state2.online,
+            "an offline peer must not block an incoming upstream from establishing the pool chain_id"
+        );
+        assert_eq!(state2.chain_id, Some([0xCD; 32]));
     }
 }

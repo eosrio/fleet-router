@@ -128,6 +128,7 @@ async fn main() -> Result<()> {
         let server_state_db: ServerStateDb = build_state_db_with_chain_id(
             listener_cfg.servers.clone(),
             listener_cfg.expected_chain_id,
+            listener_cfg.require_chain_id,
         );
 
         health_states.push(health::ListenerHealthState {

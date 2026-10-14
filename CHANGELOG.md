@@ -53,6 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The zero-copy decoder no longer panics on a type mismatch or on an array
+  field whose element count would overflow the computed span. `From<ZCDValues>`
+  conversions are now `TryFrom`, `get_type` returns `Option`, and the array
+  branch of `deserialize_with` uses checked arithmetic and bounds-checked
+  slices. Valid frames decode as before.
 - The hand-rolled SHiP status decoder rejects truncated and malformed upstream
   frames with an error instead of panicking on a short slice or a missing
   field. The monitoring loop logs the error and leaves that upstream's state

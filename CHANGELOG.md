@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pinned value or the rest of the pool is still rejected. When a status omits
   `chain_id`, the router logs a warning once per upstream that `chain_id`
   cannot be verified, and logs it again only after a later status reports one.
+  Reported by @eosusa (EOSUSA).
 
 ### Added
 

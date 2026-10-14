@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Pinning `chain_id` no longer marks an upstream offline when its SHiP status
+  omits `chain_id`. That field is an optional binary extension of
+  `get_status_result_v0`; older nodeos builds (FIO mainnet/testnet and other
+  EOSIO 2.0-based nodes) never send it, so the previous check kept every such
+  node permanently offline. A reported `chain_id` that does not match the
+  pinned value or the rest of the pool is still rejected. When a status omits
+  `chain_id`, the router logs a warning once per upstream that `chain_id`
+  cannot be verified, and logs it again only after a later status reports one.
+
+### Added
+
+- Optional `require_chain_id` (`false` by default), at the top level in
+  single-listener mode or on each listener. Set it to restore the previous
+  reject-when-missing behaviour. It is rejected by config validation unless
+  `chain_id` is set on that same scope.
+
 ## [0.3.1] - 2026-10-14
 
 ### Changed

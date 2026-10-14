@@ -163,6 +163,11 @@ pub struct ListenerConfig {
     /// Optional expected Antelope `chain_id` (64-character hex string) for upstreams in this pool.
     #[serde(default)]
     pub chain_id: Option<String>,
+    /// When `true`, a status that omits `chain_id` marks the upstream offline.
+    /// Requires [`Self::chain_id`]. Default `false` keeps older nodeos builds
+    /// (which never send that optional extension) online.
+    #[serde(default)]
+    pub require_chain_id: bool,
 }
 
 /// A validated, normalized listener ready to be bound and monitored at runtime.
@@ -174,6 +179,8 @@ pub struct ResolvedListener {
     pub listen_port: u16,
     pub max_connections: usize,
     pub expected_chain_id: Option<[u8; 32]>,
+    /// See [`ListenerConfig::require_chain_id`].
+    pub require_chain_id: bool,
     pub servers: Vec<Server>,
 }
 
@@ -209,6 +216,12 @@ pub struct ServerConfig {
     /// Optional expected Antelope `chain_id` (64-character hex string) in single-listener mode.
     #[serde(default)]
     pub chain_id: Option<String>,
+    /// When `true` in single-listener mode, a status that omits `chain_id` marks
+    /// the upstream offline. Requires [`Self::chain_id`]. Default `false` keeps
+    /// older nodeos builds (which never send that optional extension) online.
+    /// Cannot be combined with [`Self::listeners`]; set it on each listener.
+    #[serde(default)]
+    pub require_chain_id: bool,
     /// Named ingress listeners for multi-port / multi-network deployments.
     #[serde(default)]
     pub listeners: Vec<ListenerConfig>,
@@ -382,6 +395,9 @@ impl ServerConfig {
             if let Some(cid) = &self.chain_id {
                 parse_chain_id(cid, None)?;
             }
+            if self.require_chain_id && self.chain_id.is_none() {
+                bail!("require_chain_id requires chain_id to be set");
+            }
             validate_servers(&self.servers, None)?;
         } else {
             if self.listen_port != 0 {
@@ -392,6 +408,11 @@ impl ServerConfig {
             if self.chain_id.is_some() {
                 bail!(
                     "top-level 'chain_id' cannot be combined with 'listeners'; set 'chain_id' on each listener"
+                );
+            }
+            if self.require_chain_id {
+                bail!(
+                    "top-level 'require_chain_id' cannot be combined with 'listeners'; set 'require_chain_id' on each listener"
                 );
             }
             let mut seen_names = HashMap::<String, usize>::new();
@@ -434,6 +455,9 @@ impl ServerConfig {
                 }
                 if let Some(cid) = &listener.chain_id {
                     parse_chain_id(cid, Some(name))?;
+                }
+                if listener.require_chain_id && listener.chain_id.is_none() {
+                    bail!("listener '{name}': require_chain_id requires chain_id to be set");
                 }
 
                 for (prev_name, prev_addr, prev_port) in &bound_listeners {
@@ -482,6 +506,7 @@ impl ServerConfig {
                     .chain_id
                     .as_deref()
                     .and_then(|c| parse_chain_id(c, None).ok()),
+                require_chain_id: self.require_chain_id,
                 servers: self.servers.clone(),
             }]
         } else {
@@ -509,6 +534,7 @@ impl ServerConfig {
                         .chain_id
                         .as_deref()
                         .and_then(|c| parse_chain_id(c, Some(&l.name)).ok()),
+                    require_chain_id: l.require_chain_id,
                     servers: l.servers.clone(),
                 })
                 .collect()
@@ -577,6 +603,13 @@ pub struct ServerState {
     pub stale: bool,
     /// Optional configured `chain_id` that every upstream in this pool must match.
     pub expected_chain_id: Option<[u8; 32]>,
+    /// When `true` and [`Self::expected_chain_id`] is set, a status that omits
+    /// `chain_id` marks this upstream offline. Otherwise the omission is warned
+    /// once and the upstream stays online.
+    pub require_chain_id: bool,
+    /// Set after the one-time warning that this upstream omitted `chain_id`.
+    /// Cleared when a later status reports a `chain_id`.
+    pub chain_id_unverified_warned: bool,
     /// Last valid `chain_id` reported by this upstream in `get_status_result`.
     pub chain_id: Option<[u8; 32]>,
     pub trace_begin_block: u32,
@@ -597,12 +630,21 @@ impl ServerState {
     }
 
     pub fn with_expected_chain_id(expected_chain_id: Option<[u8; 32]>) -> ServerState {
+        Self::with_chain_policy(expected_chain_id, false)
+    }
+
+    pub fn with_chain_policy(
+        expected_chain_id: Option<[u8; 32]>,
+        require_chain_id: bool,
+    ) -> ServerState {
         ServerState {
             connections: Arc::new(AtomicUsize::new(0)),
             enabled: true,
             online: false,
             stale: false,
             expected_chain_id,
+            require_chain_id,
+            chain_id_unverified_warned: false,
             chain_id: None,
             trace_begin_block: 0,
             trace_end_block: 0,
@@ -646,12 +688,13 @@ pub struct ProxyLimits {
 
 #[cfg(test)]
 pub fn build_state_db(servers: Vec<Server>) -> ServerStateDb {
-    build_state_db_with_chain_id(servers, None)
+    build_state_db_with_chain_id(servers, None, false)
 }
 
 pub fn build_state_db_with_chain_id(
     servers: Vec<Server>,
     expected_chain_id: Option<[u8; 32]>,
+    require_chain_id: bool,
 ) -> ServerStateDb {
     Arc::new(Mutex::new(
         servers
@@ -660,7 +703,7 @@ pub fn build_state_db_with_chain_id(
             .map(|s| {
                 (
                     s.endpoint.clone(),
-                    ServerState::with_expected_chain_id(expected_chain_id),
+                    ServerState::with_chain_policy(expected_chain_id, require_chain_id),
                 )
             })
             .collect::<HashMap<String, ServerState>>(),
@@ -1064,6 +1107,97 @@ mod tests {
         let err = bad_cid.validate().unwrap_err().to_string();
         assert!(
             err.contains("must be a 64-character hex string"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn require_chain_id_defaults_false_and_needs_chain_id() {
+        let cfg: ServerConfig = serde_json::from_value(minimal_config()).unwrap();
+        assert!(!cfg.require_chain_id);
+        cfg.validate().unwrap();
+        let resolved = cfg.resolved_listeners();
+        assert!(!resolved[0].require_chain_id);
+        assert!(resolved[0].expected_chain_id.is_none());
+
+        let missing: ServerConfig = serde_json::from_value({
+            let mut value = minimal_config();
+            value["require_chain_id"] = serde_json::json!(true);
+            value
+        })
+        .unwrap();
+        let err = missing.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("require_chain_id requires chain_id to be set"),
+            "unexpected error: {err}"
+        );
+
+        let valid_cid = "aca376f206b8fc25a6ed44dbdc66547c36c6c33e3a119ffbeaef943642f0e906";
+        let mut pinned = minimal_config();
+        pinned["chain_id"] = serde_json::json!(valid_cid);
+        pinned["require_chain_id"] = serde_json::json!(true);
+        let cfg: ServerConfig = serde_json::from_value(pinned).unwrap();
+        cfg.validate().unwrap();
+        let resolved = cfg.resolved_listeners();
+        assert!(resolved[0].require_chain_id);
+        assert!(resolved[0].expected_chain_id.is_some());
+
+        let listener_missing: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "listeners": [
+                {
+                    "name": "fio",
+                    "listen_port": 17000,
+                    "require_chain_id": true,
+                    "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+                }
+            ]
+        }))
+        .unwrap();
+        let err = listener_missing.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("listener 'fio': require_chain_id requires chain_id to be set"),
+            "unexpected error: {err}"
+        );
+
+        let listener_ok: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "listeners": [
+                {
+                    "name": "fio",
+                    "listen_port": 17000,
+                    "chain_id": valid_cid,
+                    "require_chain_id": true,
+                    "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+                }
+            ]
+        }))
+        .unwrap();
+        listener_ok.validate().unwrap();
+        assert!(listener_ok.resolved_listeners()[0].require_chain_id);
+
+        let top_level_with_listeners: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "require_chain_id": true,
+            "listeners": [
+                {
+                    "name": "fio",
+                    "listen_port": 17000,
+                    "chain_id": valid_cid,
+                    "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+                }
+            ]
+        }))
+        .unwrap();
+        let err = top_level_with_listeners.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("top-level 'require_chain_id' cannot be combined with 'listeners'"),
             "unexpected error: {err}"
         );
     }

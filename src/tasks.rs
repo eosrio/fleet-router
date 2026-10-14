@@ -443,6 +443,14 @@ async fn handle_monitoring_msg(
 /// learned finality range. `Ok(None)` means some other result and was ignored.
 /// A truncated or malformed status body leaves the stored state unchanged and
 /// returns the decode error; that error is not a valid reply.
+///
+/// A reported `chain_id` that differs from the pinned value, or from the
+/// `chain_id` of another online peer in an unpinned pool, marks the upstream
+/// offline. `chain_id` on `get_status_result_v0` is an optional extension that
+/// older nodeos builds never send. Omitting it cannot be verified, so the
+/// upstream stays online and a warning is logged once until a later status
+/// reports a `chain_id`. `require_chain_id` restores the reject-when-missing
+/// behaviour for a pinned pool.
 async fn apply_status_update(
     bin_msg: &[u8],
     server_state_db: &ServerStateDb,
@@ -491,45 +499,59 @@ async fn apply_status_update(
         .find_map(|(_, s)| s.chain_id);
 
     if let Some(state) = db.get_mut(&server.endpoint) {
-        if let Some(expected) = state.expected_chain_id {
-            match reported_chain_id {
-                Some(actual) if actual == expected => {}
-                Some(actual) => {
-                    tracing::warn!(
-                        name = %server.name,
-                        upstream = %server.endpoint,
-                        expected_chain_id = %hex_32(&expected),
-                        reported_chain_id = %hex_32(&actual),
-                        "upstream chain_id does not match configured chain_id; marking offline"
-                    );
-                    state.online = false;
-                    state.chain_id = None;
-                    return Ok(Some(variant));
-                }
-                None => {
-                    tracing::warn!(
-                        name = %server.name,
-                        upstream = %server.endpoint,
-                        expected_chain_id = %hex_32(&expected),
-                        "upstream status omitted chain_id while chain_id is pinned; marking offline"
-                    );
-                    state.online = false;
-                    state.chain_id = None;
-                    return Ok(Some(variant));
+        match reported_chain_id {
+            Some(actual) => {
+                // A later status that includes chain_id may omit it again; warn once more then.
+                state.chain_id_unverified_warned = false;
+                if let Some(expected) = state.expected_chain_id {
+                    if actual != expected {
+                        tracing::warn!(
+                            name = %server.name,
+                            upstream = %server.endpoint,
+                            expected_chain_id = %hex_32(&expected),
+                            reported_chain_id = %hex_32(&actual),
+                            "upstream chain_id does not match configured chain_id; marking offline"
+                        );
+                        state.online = false;
+                        state.chain_id = None;
+                        return Ok(Some(variant));
+                    }
+                } else if let Some(pool_cid) = peer_chain_id {
+                    if actual != pool_cid {
+                        tracing::warn!(
+                            name = %server.name,
+                            upstream = %server.endpoint,
+                            pool_chain_id = %hex_32(&pool_cid),
+                            reported_chain_id = %hex_32(&actual),
+                            "upstream chain_id mismatches pool chain_id; marking offline"
+                        );
+                        state.online = false;
+                        state.chain_id = None;
+                        return Ok(Some(variant));
+                    }
                 }
             }
-        } else if let (Some(pool_cid), Some(actual)) = (peer_chain_id, reported_chain_id) {
-            if actual != pool_cid {
-                tracing::warn!(
-                    name = %server.name,
-                    upstream = %server.endpoint,
-                    pool_chain_id = %hex_32(&pool_cid),
-                    reported_chain_id = %hex_32(&actual),
-                    "upstream chain_id mismatches pool chain_id; marking offline"
-                );
-                state.online = false;
-                state.chain_id = None;
-                return Ok(Some(variant));
+            None => {
+                if let Some(expected) = state.expected_chain_id {
+                    if state.require_chain_id {
+                        tracing::warn!(
+                            name = %server.name,
+                            upstream = %server.endpoint,
+                            expected_chain_id = %hex_32(&expected),
+                            "upstream status omitted chain_id while chain_id is pinned; marking offline"
+                        );
+                        state.online = false;
+                        state.chain_id = None;
+                        return Ok(Some(variant));
+                    }
+                }
+                // Older SHiP (EOSIO 2.0 / FIO) never sends the optional extension.
+                // Keep the last reported chain_id, if any, so this peer can still
+                // anchor an unpinned pool against a later mismatched report.
+                if !state.chain_id_unverified_warned {
+                    warn_unverified_chain_id(server, state.expected_chain_id);
+                    state.chain_id_unverified_warned = true;
+                }
             }
         }
 
@@ -551,6 +573,33 @@ async fn apply_status_update(
         }
     }
     Ok(Some(variant))
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNVERIFIED_CHAIN_ID_WARNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn warn_unverified_chain_id(server: &Server, expected: Option<[u8; 32]>) {
+    #[cfg(test)]
+    UNVERIFIED_CHAIN_ID_WARNS.with(|count| count.set(count.get().saturating_add(1)));
+    match expected {
+        Some(expected) => {
+            tracing::warn!(
+                name = %server.name,
+                upstream = %server.endpoint,
+                expected_chain_id = %hex_32(&expected),
+                "chain_id cannot be verified for this upstream (older SHiP without chain_id extension)"
+            );
+        }
+        None => {
+            tracing::warn!(
+                name = %server.name,
+                upstream = %server.endpoint,
+                "chain_id cannot be verified for this upstream (older SHiP without chain_id extension)"
+            );
+        }
+    }
 }
 
 fn hex_32(bytes: &[u8; 32]) -> String {
@@ -878,39 +927,217 @@ mod tests {
         assert_eq!(state2.chain_state_end_block, 0);
     }
 
+    fn pinned_server(require_chain_id: bool) -> (Server, crate::models::ServerStateDb) {
+        let server = Server {
+            name: "alpha".to_string(),
+            endpoint: "127.0.0.1:18080".to_string(),
+            enabled: true,
+        };
+        let db = crate::models::build_state_db_with_chain_id(
+            vec![server.clone()],
+            Some([0xAB; 32]),
+            require_chain_id,
+        );
+        (server, db)
+    }
+
+    /// `get_status_result_v0` without the optional `chain_id` extension.
+    fn status_v0_without_chain_id() -> Vec<u8> {
+        status_message(&status_body()[..88])
+    }
+
     #[tokio::test]
-    async fn pinned_expected_chain_id_rejects_mismatch_and_missing_extension() {
+    async fn pinned_v0_without_chain_id_stays_online() {
+        let (server, db) = pinned_server(false);
+        assert_eq!(
+            apply_status_update(&status_v0_without_chain_id(), &db, &server)
+                .await
+                .expect("v0 without chain_id"),
+            Some(0)
+        );
+        let guard = db.lock().await;
+        let state = guard.get(&server.endpoint).unwrap();
+        assert!(
+            state.online,
+            "older SHiP that omits chain_id must stay online when chain_id is pinned"
+        );
+        assert_eq!(state.chain_id, None);
+        assert!(state.chain_id_unverified_warned);
+        assert_eq!(state.trace_begin_block, 10);
+        assert_eq!(state.trace_end_block, 1001);
+        assert_eq!(state.chain_state_begin_block, 5);
+        assert_eq!(state.chain_state_end_block, 1000);
+    }
+
+    #[tokio::test]
+    async fn require_chain_id_marks_missing_chain_id_offline() {
+        let (server, db) = pinned_server(true);
+        apply_status_update(&status_v0_without_chain_id(), &db, &server)
+            .await
+            .expect("v0 without chain_id");
+        {
+            let guard = db.lock().await;
+            let state = guard.get(&server.endpoint).unwrap();
+            assert!(
+                !state.online,
+                "require_chain_id restores reject-when-missing"
+            );
+            assert_eq!(state.chain_id, None);
+            assert_eq!(state.chain_state_end_block, 0);
+            assert!(!state.chain_id_unverified_warned);
+        }
+
+        apply_status_update(&status_message(&status_body()), &db, &server)
+            .await
+            .expect("matching chain_id");
+        {
+            let guard = db.lock().await;
+            let state = guard.get(&server.endpoint).unwrap();
+            assert!(state.online);
+            assert_eq!(state.chain_id, Some([0xAB; 32]));
+        }
+
+        apply_status_update(&status_v0_without_chain_id(), &db, &server)
+            .await
+            .expect("omitted again");
+        let guard = db.lock().await;
+        let state = guard.get(&server.endpoint).unwrap();
+        assert!(!state.online);
+        assert_eq!(state.chain_id, None);
+    }
+
+    #[tokio::test]
+    async fn pinned_chain_id_mismatch_marks_upstream_offline() {
+        let (server, db) = pinned_server(false);
+        let mut wrong_body = status_body();
+        let len = wrong_body.len();
+        wrong_body[len - 32..].copy_from_slice(&[0xFF; 32]);
+        apply_status_update(&status_message(&wrong_body), &db, &server)
+            .await
+            .expect("wrong chain_id");
+        let guard = db.lock().await;
+        let state = guard.get(&server.endpoint).unwrap();
+        assert!(
+            !state.online,
+            "a reported chain_id that mismatches the pin must stay offline"
+        );
+        assert_eq!(state.chain_id, None);
+        assert_eq!(state.chain_state_end_block, 0);
+    }
+
+    #[tokio::test]
+    async fn omitted_chain_id_stays_online_when_pool_peer_reported_one() {
         let s1 = Server {
             name: "alpha".to_string(),
             endpoint: "127.0.0.1:18080".to_string(),
             enabled: true,
         };
-        let db = crate::models::build_state_db_with_chain_id(vec![s1.clone()], Some([0xAB; 32]));
-
-        // Status v0 without the optional chain_id extension (88 bytes instead of 120) must be rejected when pinned.
-        let v0_no_chain_id = &status_body()[..88];
-        apply_status_update(&status_message(v0_no_chain_id), &db, &s1)
-            .await
-            .expect("v0 without chain_id");
-        assert!(!db.lock().await.get(&s1.endpoint).unwrap().online);
-
-        // Status with wrong chain_id must be rejected.
-        let mut wrong_body = status_body();
-        let len = wrong_body.len();
-        wrong_body[len - 32..].copy_from_slice(&[0xFF; 32]);
-        apply_status_update(&status_message(&wrong_body), &db, &s1)
-            .await
-            .expect("wrong chain_id");
-        assert!(!db.lock().await.get(&s1.endpoint).unwrap().online);
-
-        // Status with matching chain_id [0xAB; 32] succeeds.
+        let s2 = Server {
+            name: "beta".to_string(),
+            endpoint: "127.0.0.1:18081".to_string(),
+            enabled: true,
+        };
+        let db = build_state_db(vec![s1.clone(), s2.clone()]);
         apply_status_update(&status_message(&status_body()), &db, &s1)
             .await
-            .expect("matching chain_id");
+            .expect("s1 status");
+        apply_status_update(&status_v0_without_chain_id(), &db, &s2)
+            .await
+            .expect("s2 omits chain_id");
         let guard = db.lock().await;
-        let state = guard.get(&s1.endpoint).unwrap();
+        let state2 = guard.get(&s2.endpoint).unwrap();
+        assert!(state2.online, "omitting chain_id is not a pool mismatch");
+        assert_eq!(state2.chain_id, None);
+        assert!(state2.chain_id_unverified_warned);
+        assert!(guard.get(&s1.endpoint).unwrap().online);
+    }
+
+    fn unverified_warns() -> u32 {
+        super::UNVERIFIED_CHAIN_ID_WARNS.with(std::cell::Cell::get)
+    }
+
+    #[tokio::test]
+    async fn omitted_chain_id_warning_is_once_per_upstream() {
+        // Cargo reuses worker threads, so a previous test on this thread may
+        // already have counted a warning. The counter is thread-local.
+        super::UNVERIFIED_CHAIN_ID_WARNS.with(|count| count.set(0));
+
+        let server = Server {
+            name: "alpha".to_string(),
+            endpoint: "127.0.0.1:18080".to_string(),
+            enabled: true,
+        };
+        let other = Server {
+            name: "beta".to_string(),
+            endpoint: "127.0.0.1:18081".to_string(),
+            enabled: true,
+        };
+        let db = crate::models::build_state_db_with_chain_id(
+            vec![server.clone(), other.clone()],
+            Some([0xAB; 32]),
+            false,
+        );
+
+        apply_status_update(&status_v0_without_chain_id(), &db, &server)
+            .await
+            .expect("first omission");
+        apply_status_update(&status_v0_without_chain_id(), &db, &server)
+            .await
+            .expect("second omission");
+        assert_eq!(
+            unverified_warns(),
+            1,
+            "a pinned upstream that keeps omitting chain_id warns once"
+        );
+        assert!(db.lock().await.get(&server.endpoint).unwrap().online);
+        assert!(
+            db.lock()
+                .await
+                .get(&server.endpoint)
+                .unwrap()
+                .chain_id_unverified_warned
+        );
+
+        apply_status_update(&status_v0_without_chain_id(), &db, &other)
+            .await
+            .expect("other omission");
+        apply_status_update(&status_v0_without_chain_id(), &db, &other)
+            .await
+            .expect("other omission again");
+        assert_eq!(unverified_warns(), 2, "each upstream warns on its own");
+
+        apply_status_update(&status_message(&status_body()), &db, &server)
+            .await
+            .expect("matching chain_id");
+        {
+            let guard = db.lock().await;
+            let state = guard.get(&server.endpoint).unwrap();
+            assert!(state.online);
+            assert_eq!(state.chain_id, Some([0xAB; 32]));
+            assert!(!state.chain_id_unverified_warned);
+        }
+        assert_eq!(unverified_warns(), 2);
+
+        apply_status_update(&status_v0_without_chain_id(), &db, &server)
+            .await
+            .expect("omission after a report");
+        apply_status_update(&status_v0_without_chain_id(), &db, &server)
+            .await
+            .expect("repeat omission after reset");
+        assert_eq!(
+            unverified_warns(),
+            3,
+            "reporting a chain_id arms the one-time warning again"
+        );
+        let guard = db.lock().await;
+        let state = guard.get(&server.endpoint).unwrap();
         assert!(state.online);
-        assert_eq!(state.chain_id, Some([0xAB; 32]));
+        assert_eq!(
+            state.chain_id,
+            Some([0xAB; 32]),
+            "a later omission keeps the last reported chain_id"
+        );
+        assert!(state.chain_id_unverified_warned);
     }
 
     #[tokio::test]

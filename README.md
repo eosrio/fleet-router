@@ -20,6 +20,7 @@ It is written in Rust on [tokio](https://tokio.rs/) and [tokio-tungstenite](http
 - **Graceful shutdown** — handles `SIGINT`/`SIGTERM` with a bounded drain and WebSocket close frames to connected clients.
 - **Structured logging** — `tracing`-based, controlled with `RUST_LOG`.
 - **Optional health/metrics endpoint** — liveness, readiness, and Prometheus metrics over HTTP, enabled on demand.
+- **Upstream `wss://`** — optional TLS to SHiP nodes. A bare `host:port` stays `ws://`. Certificates are verified with rustls against the OS trust store. The client listener remains plaintext.
 - **Resource safety** — connection cap, handshake/idle timeouts, and a bounded maximum WebSocket message size.
 
 ## How it works
@@ -42,11 +43,12 @@ A client connects over WebSocket. The router selects an upstream (range-aware, t
 
 ## Requirements and supported platforms
 
-fleet-router is **pure Rust** and builds on **Linux, macOS, and Windows** (x86_64 and arm64) — no C/C++ toolchain, `clang`, or `libclang` required. The only prerequisite is a Rust toolchain.
+fleet-router builds on **Linux, macOS, and Windows** (x86_64 and arm64). ABI handling uses the pure-Rust `rs_abieos` backend, so `libclang` is not required. Upstream TLS links [aws-lc-rs](https://github.com/aws/aws-lc-rs) through rustls. Building that provider needs a C compiler and CMake on `PATH`.
 
 | Requirement | Notes |
 |---|---|
 | Rust ≥ 1.99 (MSRV) | Toolchain used to build, test, and publish fleet-router |
+| C compiler and CMake | Used to build `aws-lc-rs` for `wss://`. Not required at runtime. |
 
 If you do not already have Rust, install it via [rustup](https://rustup.rs/):
 
@@ -88,7 +90,7 @@ The image runs as a non-root user and defines a `HEALTHCHECK` that runs `fleet-r
    fleet-router config init ./config.json
    ```
 
-2. Edit `config.json` to list your SHiP nodes (set each `endpoint` to `host:port`, no scheme) and adjust the bind address/port and intervals.
+2. Edit `config.json` to list your SHiP nodes. A bare `host:port` is dialed as `ws://`; use `wss://host:port` when the node serves TLS. Adjust the bind address/port and intervals.
 
 3. Validate the config and test upstream connectivity:
 
@@ -112,7 +114,7 @@ INFO listening for clients address=0.0.0.0 port=17000
 
 ## Configuration
 
-Configuration is a single JSON file (`config.json` by default). The three `*_ms` fields are in **milliseconds**. Each upstream `endpoint` is `host:port` with **no scheme** — the router prepends `ws://` itself.
+Configuration is a single JSON file (`config.json` by default). The three `*_ms` fields are in **milliseconds**. An upstream `endpoint` is `host:port`, `ws://…`, or `wss://…`. A bare `host:port` is dialed as `ws://`, which is what existing configs already do.
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
@@ -136,8 +138,10 @@ Each entry in `servers` is an object:
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `name` | string | yes | Human-readable name used in logs. |
-| `endpoint` | string | yes | Upstream as `host:port` (no scheme; `ws://` is prepended). Endpoints must be unique. |
+| `endpoint` | string | yes | Upstream as `host:port`, `ws://host:port`, or `wss://host:port`. A bare `host:port` is dialed as `ws://`. Endpoints must be unique (see below). |
 | `enabled` | bool | yes | Whether the router may use this upstream. At least one enabled server is required. |
+
+`wss://` is dialed with rustls (not OpenSSL). The router verifies the upstream certificate against the operating-system trust store. The published container image installs CA certificates, so public CAs work there. For a private CA, install it into that store, or set `SSL_CERT_FILE` / `SSL_CERT_DIR` to PEM certificates — when either variable is set, those paths replace the OS store. Unknown schemes (`https://`, `http://`, …) are rejected. Uniqueness is the dial target: `127.0.0.1:8080` and `ws://127.0.0.1:8080` are the same upstream, and so are `ws://host` and `ws://host:80`. `ws://` and `wss://` to the same host are different. The client-facing listener stays plaintext `ws://`.
 
 Client requests are capped by `max_client_message_bytes` (default 64 KiB) on both the WebSocket message size and the frame size. Upstream block payloads still use `max_message_bytes`. While an upstream failover is in progress, client frames that cannot be forwarded are buffered up to **64 KiB** per session. Each buffered frame counts as at least one byte, so empty frames cannot grow the queue without a bound. Exceeding that cap closes the session with WebSocket close code 1008 (policy violation).
 
@@ -256,8 +260,8 @@ The image runs as a non-root user. Its `HEALTHCHECK` runs `fleet-router check`, 
 
 ## Security and limitations
 
-- Transport is **plaintext `ws://`** on both the client listener and the upstream connections. No TLS / `wss://` is compiled in.
-- The client listener is **unauthenticated** — anyone who can reach the port can stream data.
+- The client listener is **plaintext `ws://`** and **unauthenticated** — anyone who can reach the port can stream data. Put TLS and access control for clients on a reverse proxy in front of fleet-router.
+- Upstream connections default to plaintext `ws://`. Set `endpoint` to `wss://host:port` to dial that node with TLS; the certificate is verified with rustls against the OS trust store.
 - `rs_abieos` (pure Rust) parses untrusted upstream data; treat your upstreams as part of the trust boundary.
 
 Because of the above:

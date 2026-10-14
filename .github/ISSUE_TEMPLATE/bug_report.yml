@@ -12,7 +12,7 @@ body:
         - For security vulnerabilities, do **not** open a public issue. Use private reporting per [SECURITY.md](../../SECURITY.md).
         - For questions or usage help, please use Discussions instead.
 
-        fleet-router is pure Rust and runs on Linux, macOS, and Windows (x86_64 and arm64). A prebuilt Docker image is also available (`ghcr.io/eosrio/fleet-router`).
+        fleet-router runs on Linux, macOS, and Windows (x86_64 and arm64). Building from source needs a C compiler and CMake for the aws-lc-rs crypto provider. A prebuilt Docker image is also available (`ghcr.io/eosrio/fleet-router`).
 
   - type: input
     id: version

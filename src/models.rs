@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -42,16 +42,107 @@ const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS: u64 = 10_000;
 pub struct Server {
     /// Human-readable name used in logs.
     pub name: String,
-    /// Upstream WebSocket endpoint as `host:port` (no scheme; `ws://` is prepended).
+    /// Upstream WebSocket address.
+    ///
+    /// `host:port` is dialed as plaintext `ws://`. An explicit `ws://` or
+    /// `wss://` scheme is preserved (`wss://` is TLS, verified against the OS
+    /// trust store).
     pub endpoint: String,
     /// Whether the router is allowed to use this upstream.
     pub enabled: bool,
 }
 
 impl Server {
+    /// URL passed to the WebSocket client.
+    ///
+    /// A bare `host:port` becomes `ws://host:port`. An explicit scheme is
+    /// lowercased; `validate` has already rejected anything other than `ws`
+    /// or `wss`.
     pub fn ws_url(&self) -> String {
-        format!("ws://{}", self.endpoint)
+        dial_url(&self.endpoint)
     }
+}
+
+/// True when `scheme` matches RFC 3986's scheme production.
+fn is_uri_scheme(scheme: &str) -> bool {
+    let mut chars = scheme.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// Dial URL for `endpoint`. Bare addresses get a `ws://` prefix.
+fn dial_url(endpoint: &str) -> String {
+    let endpoint = endpoint.trim();
+    if let Some((scheme, rest)) = endpoint.split_once("://") {
+        if is_uri_scheme(scheme) {
+            return format!("{}://{rest}", scheme.to_ascii_lowercase());
+        }
+    }
+    format!("ws://{endpoint}")
+}
+
+/// Canonical dial target used to reject two spellings of the same upstream.
+///
+/// `127.0.0.1:8080` and `ws://127.0.0.1:8080` share an identity. `ws://` and
+/// `wss://` do not. The default port is included (`80` for `ws`, `443` for
+/// `wss`) so `ws://host` and `ws://host:80` collide.
+fn upstream_identity(endpoint: &str) -> Result<String> {
+    let trimmed = endpoint.trim();
+    if let Some((scheme, _)) = trimmed.split_once("://") {
+        if !is_uri_scheme(scheme) {
+            bail!(
+                "endpoint '{endpoint}' has a malformed scheme; expected host:port, ws://, or wss://"
+            );
+        }
+        let scheme = scheme.to_ascii_lowercase();
+        if scheme != "ws" && scheme != "wss" {
+            bail!(
+                "endpoint '{endpoint}' uses unsupported scheme '{scheme}'; expected host:port, ws://, or wss://"
+            );
+        }
+    }
+
+    let url = dial_url(trimmed);
+    let uri: http::Uri = url.parse().map_err(|err| {
+        anyhow!(
+            "endpoint '{endpoint}' is not a valid WebSocket URL ({err}); expected host:port, ws://, or wss://"
+        )
+    })?;
+    let scheme = uri.scheme_str().unwrap_or("");
+    if scheme != "ws" && scheme != "wss" {
+        bail!(
+            "endpoint '{endpoint}' uses unsupported scheme '{scheme}'; expected host:port, ws://, or wss://"
+        );
+    }
+    let Some(authority) = uri.authority() else {
+        bail!(
+            "endpoint '{endpoint}' is missing a host; expected host:port, ws://host:port, or wss://host:port"
+        );
+    };
+    // `Authority::host` keeps the brackets on an IPv6 literal.
+    let host = authority.host();
+    if host.is_empty() {
+        bail!(
+            "endpoint '{endpoint}' is missing a host; expected host:port, ws://host:port, or wss://host:port"
+        );
+    }
+    let port = authority
+        .port_u16()
+        .unwrap_or(if scheme == "wss" { 443 } else { 80 });
+    let host = host.to_ascii_lowercase();
+    let userinfo = match authority.as_str().rsplit_once('@') {
+        Some((user, _)) => format!("{user}@"),
+        None => String::new(),
+    };
+    let path = uri.path();
+    let query = uri
+        .query()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+    Ok(format!("{scheme}://{userinfo}{host}:{port}{path}{query}"))
 }
 
 /// The on-disk `config.json` schema.
@@ -138,15 +229,32 @@ impl ServerConfig {
         if enabled.is_empty() {
             bail!("config must have at least one enabled server");
         }
-        let mut seen = HashSet::new();
-        for s in &enabled {
+        // Uniqueness is the dial target, not the raw string, so `host:port`
+        // and `ws://host:port` cannot both be enabled. Disabled entries are
+        // still parsed so a bad scheme fails `config test` before it is turned on.
+        let mut seen: HashMap<String, String> = HashMap::new();
+        for s in &self.servers {
             if s.endpoint.trim().is_empty() {
-                bail!("server '{}' has an empty endpoint", s.name);
+                if s.enabled {
+                    bail!("server '{}' has an empty endpoint", s.name);
+                }
+                continue;
             }
-            if !seen.insert(s.endpoint.as_str()) {
+            let identity = upstream_identity(&s.endpoint)
+                .map_err(|err| anyhow!("server '{}': {err}", s.name))?;
+            if !s.enabled {
+                continue;
+            }
+            if let Some(previous) = seen.insert(identity, s.endpoint.clone()) {
+                if previous == s.endpoint {
+                    bail!(
+                        "duplicate upstream endpoint '{}' — endpoints must be unique",
+                        s.endpoint
+                    );
+                }
                 bail!(
-                    "duplicate upstream endpoint '{}' — endpoints must be unique",
-                    s.endpoint
+                    "duplicate upstream endpoint '{}' — same target as '{}'; endpoints must be unique",
+                    s.endpoint, previous
                 );
             }
         }
@@ -323,5 +431,100 @@ mod tests {
             err.contains("max_client_message_bytes"),
             "unexpected error: {err}"
         );
+    }
+
+    fn config_with_servers(servers: serde_json::Value) -> ServerConfig {
+        let mut value = minimal_config();
+        value["servers"] = servers;
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn bare_endpoint_dials_plaintext_ws() {
+        let cfg = config_with_servers(serde_json::json!([
+            { "name": "a", "endpoint": " 127.0.0.1:18080 ", "enabled": true }
+        ]));
+        cfg.validate().unwrap();
+        assert_eq!(cfg.servers[0].ws_url(), "ws://127.0.0.1:18080");
+    }
+
+    #[test]
+    fn explicit_ws_and_wss_schemes_are_preserved() {
+        let cfg = config_with_servers(serde_json::json!([
+            { "name": "plain", "endpoint": "WS://ship.example:18080/v1", "enabled": true },
+            { "name": "tls", "endpoint": "wss://ship.example:443", "enabled": true }
+        ]));
+        cfg.validate().unwrap();
+        assert_eq!(cfg.servers[0].ws_url(), "ws://ship.example:18080/v1");
+        assert_eq!(cfg.servers[1].ws_url(), "wss://ship.example:443");
+    }
+
+    #[test]
+    fn ipv6_wss_endpoint_keeps_brackets() {
+        let cfg = config_with_servers(serde_json::json!([
+            { "name": "a", "endpoint": "wss://[::1]:8443", "enabled": true }
+        ]));
+        cfg.validate().unwrap();
+        assert_eq!(cfg.servers[0].ws_url(), "wss://[::1]:8443");
+    }
+
+    #[test]
+    fn unknown_and_malformed_schemes_are_rejected() {
+        let https = config_with_servers(serde_json::json!([
+            { "name": "a", "endpoint": "https://127.0.0.1:443", "enabled": true }
+        ]));
+        let err = https.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported scheme 'https'"),
+            "unexpected error: {err}"
+        );
+
+        let disabled = config_with_servers(serde_json::json!([
+            { "name": "ok", "endpoint": "127.0.0.1:1", "enabled": true },
+            { "name": "bad", "endpoint": "http://127.0.0.1:2", "enabled": false }
+        ]));
+        let err = disabled.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported scheme 'http'"),
+            "unexpected error: {err}"
+        );
+
+        let malformed = config_with_servers(serde_json::json!([
+            { "name": "a", "endpoint": "://127.0.0.1:1", "enabled": true }
+        ]));
+        let err = malformed.validate().unwrap_err().to_string();
+        assert!(err.contains("malformed scheme"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn endpoint_uniqueness_ignores_ws_spelling_and_default_port() {
+        let spelled = config_with_servers(serde_json::json!([
+            { "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true },
+            { "name": "b", "endpoint": "ws://127.0.0.1:18080", "enabled": true }
+        ]));
+        let err = spelled.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate upstream endpoint"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("127.0.0.1:18080"), "unexpected error: {err}");
+
+        let ports = config_with_servers(serde_json::json!([
+            { "name": "a", "endpoint": "ws://ship.example", "enabled": true },
+            { "name": "b", "endpoint": "ws://SHIP.example:80", "enabled": true }
+        ]));
+        assert!(ports.validate().is_err());
+
+        let tls_is_distinct = config_with_servers(serde_json::json!([
+            { "name": "plain", "endpoint": "ws://127.0.0.1:18080", "enabled": true },
+            { "name": "tls", "endpoint": "wss://127.0.0.1:18080", "enabled": true }
+        ]));
+        tls_is_distinct.validate().unwrap();
+
+        let wss_default_port = config_with_servers(serde_json::json!([
+            { "name": "a", "endpoint": "wss://ship.example", "enabled": true },
+            { "name": "b", "endpoint": "wss://ship.example:443", "enabled": true }
+        ]));
+        assert!(wss_default_port.validate().is_err());
     }
 }

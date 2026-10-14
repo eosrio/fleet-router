@@ -47,6 +47,13 @@ mod zcd;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 0.23 panics while building a ClientConfig when both the ring and
+    // aws-lc-rs providers are linked and neither was installed. This binary
+    // selects aws-lc-rs, the provider reqwest 0.13 already uses.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .ok();
+
     let config: ServerConfig = match process_args() {
         Ok(Some((test, conf))) => {
             if test {

@@ -13,13 +13,16 @@ project spaces and interactions.
 
 ## Prerequisites
 
-fleet-router is pure Rust and builds on **Linux, macOS, and Windows** (x86_64
-and arm64) — no C/C++ toolchain, `clang`, or `libclang` required. See the
+fleet-router builds on **Linux, macOS, and Windows** (x86_64 and arm64).
+ABI handling uses the pure-Rust `rs_abieos` backend, so `libclang` is not
+required. Upstream TLS compiles the `aws-lc-rs` crypto provider, which needs a
+C compiler and CMake. See the
 [Requirements section in the README](README.md#requirements-and-supported-platforms).
 
 You need:
 
 - Rust **1.99+** (the Minimum Supported Rust Version)
+- A C compiler (`cc`, `gcc`, `clang`, or `cl`) and CMake on `PATH`
 - `git`
 
 Install Rust via [rustup](https://rustup.rs/) if you do not already have a

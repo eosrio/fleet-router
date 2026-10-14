@@ -193,8 +193,16 @@ To expose multiple ingress ports for different chains (each backed by its own re
          "listen_port": 17000,
          "chain_id": "aca376f206b8fc25a6ed44dbdc66547c36c6c33e3a119ffbeaef943642f0e906",
          "servers": [
-           { "name": "EOS SHiP 1", "endpoint": "10.0.1.10:8080", "enabled": true },
-           { "name": "EOS SHiP 2", "endpoint": "10.0.1.11:8080", "enabled": true }
+           {
+             "name": "EOS SHiP 1",
+             "endpoint": "10.0.1.10:8080",
+             "enabled": true
+           },
+           {
+             "name": "EOS SHiP 2",
+             "endpoint": "10.0.1.11:8080",
+             "enabled": true
+           }
          ]
        },
        {
@@ -202,8 +210,16 @@ To expose multiple ingress ports for different chains (each backed by its own re
          "listen_port": 17001,
          "chain_id": "1064487b3cd1a897ce03ae5b6a865651747e2e152090f99c1d19d44e01aea5a4",
          "servers": [
-           { "name": "WAX SHiP 1", "endpoint": "10.0.2.10:8080", "enabled": true },
-           { "name": "WAX SHiP 2", "endpoint": "10.0.2.11:8080", "enabled": true }
+           {
+             "name": "WAX SHiP 1",
+             "endpoint": "10.0.2.10:8080",
+             "enabled": true
+           },
+           {
+             "name": "WAX SHiP 2",
+             "endpoint": "10.0.2.11:8080",
+             "enabled": true
+           }
          ]
        }
      ]

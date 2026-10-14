@@ -183,7 +183,7 @@ To expose multiple ingress ports for different chains (each backed by its own re
    | `listen_port` | u16 | yes (non-zero) | Ingress TCP port for this listener. Must not collide with other listeners or `metrics_port`. |
    | `listen_address` | string | no | Bind address override; defaults to top-level `listen_address` (or `"0.0.0.0"`). |
    | `max_connections` | usize | no | Per-listener concurrent client cap; defaults to top-level `max_connections`. |
-   | `chain_id` | string | no | Optional 64-character hex `chain_id` for this network; upstreams reporting a different `chain_id` are rejected and kept offline. Even when omitted, any upstream whose reported `chain_id` mismatches the rest of its pool is automatically rejected. |
+   | `chain_id` | string | no | Recommended 64-character hex `chain_id` for this network; upstreams reporting a different `chain_id` are rejected and kept offline. When omitted, `fleet-router` logs a startup warning and trusts the first currently-online upstream in the pool as the reference `chain_id` (if a misconfigured wrong-chain node answers first, the remaining nodes will be rejected until it goes offline). Always pin `chain_id` in multi-network setups. |
    | `servers` | array | yes (≥ 1 enabled) | Redundant SHiP nodes belonging to this network. Referencing the same `endpoint` across two different listeners is allowed (e.g. a dedicated VIP vs. a public port) and spawns an independent upstream monitor per listener. |
 
    ```json

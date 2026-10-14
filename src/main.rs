@@ -97,6 +97,13 @@ async fn main() -> Result<()> {
                     port = listener_cfg.listen_port,
                     "listening for clients"
                 );
+                if listener_cfg.expected_chain_id.is_none() {
+                    tracing::warn!(
+                        listener = %name,
+                        port = listener_cfg.listen_port,
+                        "listener has no pinned chain_id; first online upstream will establish the pool chain_id (set chain_id in config to prevent cross-chain misconfiguration)"
+                    );
+                }
             }
             None => {
                 tracing::info!(
@@ -342,11 +349,16 @@ async fn run_tests(config: &ServerConfig) {
     for listener in config.resolved_listeners() {
         if let Some(name) = &listener.name {
             cprintln!(
-                "\n 🌐 Listener <bright-magenta,bold>{}</> (<cyan>{}:{}</>)",
+                "\n 🌐 Listener <bright-magenta,bold>{}</> (<cyan>{}</>)",
                 name,
-                listener.listen_address,
-                listener.listen_port
+                format_bind_addr(&listener.listen_address, listener.listen_port)
             );
+            if listener.expected_chain_id.is_none() {
+                cprintln!(
+                    " ⚠️  <yellow>No chain_id pinned for listener '{}'; first online upstream will establish the pool chain_id</>",
+                    name
+                );
+            }
         }
         let mut listener_valid = 0;
         for server in &listener.servers {

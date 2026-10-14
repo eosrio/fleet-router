@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Multi-ingress (`listeners`) configuration for routing multiple local ports to
+  isolated pools of redundant SHiP nodes (e.g. one ingress port per blockchain
+  network) within a single `fleet-router` process. Existing single-port configs
+  (`listen_port` + `servers`) remain unchanged. Supports optional `chain_id`
+  pinning (top-level or per-listener) and automatic pool-wide `chain_id`
+  consistency checks so a misconfigured upstream on a different chain is kept
+  offline. In multi-listener mode, `/metrics` labels each series with
+  `listener="<name>"`, `/ready` requires at least one online upstream in every
+  listener, and `/ready/<name>` probes a single listener. Also added
+  `deploy/docker-compose.multi-network.yml` and `deploy/fleet-router@.service`
+  for multi-instance deployments.
 - Upstream `endpoint` values may include a `ws://` or `wss://` scheme. A bare
   `host:port` still dials plaintext `ws://`, so existing configs are unchanged.
   `wss://` uses rustls with the `aws-lc-rs` provider (not OpenSSL) and verifies the

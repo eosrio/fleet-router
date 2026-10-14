@@ -476,9 +476,65 @@ async fn apply_status_update(
     } else {
         None
     };
+    let reported_chain_id = match result.get("chain_id")? {
+        Some(ZCDValues::Checksum256(bytes)) => Some(bytes),
+        _ => None,
+    };
 
     let mut db = server_state_db.lock().await;
+    let peer_chain_id = db
+        .iter()
+        .filter(|(ep, s)| *ep != &server.endpoint && s.online)
+        .find_map(|(_, s)| s.chain_id)
+        .or_else(|| {
+            db.iter()
+                .filter(|(ep, _)| *ep != &server.endpoint)
+                .find_map(|(_, s)| s.chain_id)
+        });
+
     if let Some(state) = db.get_mut(&server.endpoint) {
+        if let Some(expected) = state.expected_chain_id {
+            match reported_chain_id {
+                Some(actual) if actual == expected => {}
+                Some(actual) => {
+                    tracing::warn!(
+                        name = %server.name,
+                        upstream = %server.endpoint,
+                        expected_chain_id = %hex_32(&expected),
+                        reported_chain_id = %hex_32(&actual),
+                        "upstream chain_id does not match configured chain_id; marking offline"
+                    );
+                    state.online = false;
+                    return Ok(Some(variant));
+                }
+                None => {
+                    tracing::warn!(
+                        name = %server.name,
+                        upstream = %server.endpoint,
+                        expected_chain_id = %hex_32(&expected),
+                        "upstream status omitted chain_id while chain_id is pinned; marking offline"
+                    );
+                    state.online = false;
+                    return Ok(Some(variant));
+                }
+            }
+        } else if let (Some(pool_cid), Some(actual)) = (peer_chain_id, reported_chain_id) {
+            if actual != pool_cid {
+                tracing::warn!(
+                    name = %server.name,
+                    upstream = %server.endpoint,
+                    pool_chain_id = %hex_32(&pool_cid),
+                    reported_chain_id = %hex_32(&actual),
+                    "upstream chain_id mismatches pool chain_id; marking offline"
+                );
+                state.online = false;
+                return Ok(Some(variant));
+            }
+        }
+
+        if let Some(cid) = reported_chain_id {
+            state.chain_id = Some(cid);
+        }
         state.enabled = true;
         state.online = true;
         state.trace_begin_block = trace_begin;
@@ -494,6 +550,15 @@ async fn apply_status_update(
         }
     }
     Ok(Some(variant))
+}
+
+fn hex_32(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
 }
 
 fn require_u32(result: &zcd::ZCD<'_>, field: &'static str) -> Result<u32, zcd::ZcdError> {
@@ -773,5 +838,77 @@ mod tests {
                 assert!(matches!(inbound, Inbound::AbiRejected));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn pool_chain_id_mismatch_is_rejected_and_marked_offline() {
+        let s1 = Server {
+            name: "alpha".to_string(),
+            endpoint: "127.0.0.1:18080".to_string(),
+            enabled: true,
+        };
+        let s2 = Server {
+            name: "beta".to_string(),
+            endpoint: "127.0.0.1:18081".to_string(),
+            enabled: true,
+        };
+        let db = build_state_db(vec![s1.clone(), s2.clone()]);
+
+        // First server comes online with chain_id [0xAB; 32].
+        apply_status_update(&status_message(&status_body()), &db, &s1)
+            .await
+            .expect("s1 status");
+        assert!(db.lock().await.get(&s1.endpoint).unwrap().online);
+
+        // Second server reports a different chain_id ([0xCD; 32]).
+        let mut wrong_body = status_body();
+        let len = wrong_body.len();
+        wrong_body[len - 32..].copy_from_slice(&[0xCD; 32]);
+        apply_status_update(&status_message(&wrong_body), &db, &s2)
+            .await
+            .expect("s2 status");
+
+        let guard = db.lock().await;
+        let state2 = guard.get(&s2.endpoint).unwrap();
+        assert!(
+            !state2.online,
+            "mismatched chain_id in same pool must stay offline"
+        );
+        assert_eq!(state2.chain_state_end_block, 0);
+    }
+
+    #[tokio::test]
+    async fn pinned_expected_chain_id_rejects_mismatch_and_missing_extension() {
+        let s1 = Server {
+            name: "alpha".to_string(),
+            endpoint: "127.0.0.1:18080".to_string(),
+            enabled: true,
+        };
+        let db = crate::models::build_state_db_with_chain_id(vec![s1.clone()], Some([0xAB; 32]));
+
+        // Status v0 without the optional chain_id extension (88 bytes instead of 120) must be rejected when pinned.
+        let v0_no_chain_id = &status_body()[..88];
+        apply_status_update(&status_message(v0_no_chain_id), &db, &s1)
+            .await
+            .expect("v0 without chain_id");
+        assert!(!db.lock().await.get(&s1.endpoint).unwrap().online);
+
+        // Status with wrong chain_id must be rejected.
+        let mut wrong_body = status_body();
+        let len = wrong_body.len();
+        wrong_body[len - 32..].copy_from_slice(&[0xFF; 32]);
+        apply_status_update(&status_message(&wrong_body), &db, &s1)
+            .await
+            .expect("wrong chain_id");
+        assert!(!db.lock().await.get(&s1.endpoint).unwrap().online);
+
+        // Status with matching chain_id [0xAB; 32] succeeds.
+        apply_status_update(&status_message(&status_body()), &db, &s1)
+            .await
+            .expect("matching chain_id");
+        let guard = db.lock().await;
+        let state = guard.get(&s1.endpoint).unwrap();
+        assert!(state.online);
+        assert_eq!(state.chain_id, Some([0xAB; 32]));
     }
 }

@@ -145,12 +145,54 @@ fn upstream_identity(endpoint: &str) -> Result<String> {
     Ok(format!("{scheme}://{userinfo}{host}:{port}{path}{query}"))
 }
 
+/// An ingress listener mapping a local port to a dedicated pool of upstream SHiP nodes.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ListenerConfig {
+    /// Unique name for this listener/network (used in logs, `/metrics`, and `/ready/<name>`).
+    pub name: String,
+    /// Optional bind address override; falls back to top-level `listen_address` or `"0.0.0.0"`.
+    #[serde(default)]
+    pub listen_address: Option<String>,
+    /// Port the proxy listens on for client connections for this network.
+    pub listen_port: u16,
+    /// The upstream SHiP nodes to load-balance across for this listener.
+    pub servers: Vec<Server>,
+    /// Optional per-listener connection cap; falls back to top-level `max_connections`.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+    /// Optional expected Antelope `chain_id` (64-character hex string) for upstreams in this pool.
+    #[serde(default)]
+    pub chain_id: Option<String>,
+}
+
+/// A validated, normalized listener ready to be bound and monitored at runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedListener {
+    /// `None` in legacy single-port mode, `Some(name)` in multi-listener mode.
+    pub name: Option<String>,
+    pub listen_address: String,
+    pub listen_port: u16,
+    pub max_connections: usize,
+    pub expected_chain_id: Option<[u8; 32]>,
+    pub servers: Vec<Server>,
+}
+
 /// The on-disk `config.json` schema.
+///
+/// Supports two mutually exclusive topology modes:
+/// 1. **Single-listener mode** (legacy / default): top-level `listen_address`,
+///    `listen_port`, and `servers`.
+/// 2. **Multi-listener mode**: top-level `listeners` array, where each entry
+///    binds its own `listen_port` and load-balances across an isolated `servers`
+///    pool (e.g. one ingress port per blockchain network).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
-    /// Address the proxy listens on for client connections.
+    /// Address the proxy listens on for client connections (required in single-listener mode;
+    /// acts as the default bind address for `listeners` and `metrics_address` in multi-listener mode).
+    #[serde(default)]
     pub listen_address: String,
-    /// Port the proxy listens on for client connections.
+    /// Port the proxy listens on for client connections in single-listener mode.
+    #[serde(default)]
     pub listen_port: u16,
     /// Interval (ms) between reconnection attempts to a downed upstream.
     pub upstream_reconnect_ms: u64,
@@ -161,10 +203,19 @@ pub struct ServerConfig {
     /// The monitor keeps a single `get_status_request` in flight and treats this
     /// same interval as the reply deadline. A miss marks the upstream offline.
     pub upstream_status_ms: u64,
-    /// The upstream SHiP nodes to load-balance across.
+    /// The upstream SHiP nodes to load-balance across in single-listener mode.
+    #[serde(default)]
     pub servers: Vec<Server>,
+    /// Optional expected Antelope `chain_id` (64-character hex string) in single-listener mode.
+    #[serde(default)]
+    pub chain_id: Option<String>,
+    /// Named ingress listeners for multi-port / multi-network deployments.
+    #[serde(default)]
+    pub listeners: Vec<ListenerConfig>,
 
     /// Maximum number of concurrent client connections accepted (backpressure).
+    /// In multi-listener mode, acts as the default per-listener cap when a
+    /// listener omits `max_connections`.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
     /// Timeout (ms) for completing the client WebSocket handshake. 0 = disabled.
@@ -187,7 +238,7 @@ pub struct ServerConfig {
     /// How long (ms) to wait for in-flight connections to drain on shutdown.
     #[serde(default = "default_shutdown_grace_ms")]
     pub shutdown_grace_ms: u64,
-    /// Optional address for the HTTP health/metrics endpoint. Defaults to `listen_address`.
+    /// Optional address for the HTTP health/metrics endpoint. Defaults to `listen_address` (or `"0.0.0.0"`).
     #[serde(default)]
     pub metrics_address: Option<String>,
     /// Optional port for the HTTP health/metrics endpoint. When unset, the endpoint is disabled.
@@ -195,15 +246,104 @@ pub struct ServerConfig {
     pub metrics_port: Option<u16>,
 }
 
+/// Format a `host` and `port` for `TcpListener::bind`, bracketing bare IPv6
+/// literals (e.g. `::` -> `[::]:17000`, `::1` -> `[::1]:17000`).
+pub fn format_bind_addr(host: &str, port: u16) -> String {
+    let host = host.trim();
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn normalize_bind_host(addr: &str) -> &str {
+    let trimmed = addr.trim();
+    trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed)
+}
+
+fn is_unspecified_addr(addr: &str) -> bool {
+    matches!(
+        normalize_bind_host(addr),
+        "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0"
+    )
+}
+
+fn addresses_conflict(a: &str, b: &str) -> bool {
+    let a = normalize_bind_host(a);
+    let b = normalize_bind_host(b);
+    a.eq_ignore_ascii_case(b) || is_unspecified_addr(a) || is_unspecified_addr(b)
+}
+
+/// Parse a 64-character hex string into a 32-byte `chain_id`.
+pub fn parse_chain_id(raw: &str, listener_ctx: Option<&str>) -> Result<[u8; 32]> {
+    let prefix = match listener_ctx {
+        Some(name) => format!("listener '{name}': "),
+        None => String::new(),
+    };
+    let hex = raw.trim();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("{prefix}chain_id '{raw}' must be a 64-character hex string (32 bytes)");
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let s = std::str::from_utf8(chunk).unwrap();
+        out[i] = u8::from_str_radix(s, 16).unwrap();
+    }
+    Ok(out)
+}
+
+fn validate_servers(servers: &[Server], listener_ctx: Option<&str>) -> Result<()> {
+    let prefix = match listener_ctx {
+        Some(name) => format!("listener '{name}': "),
+        None => String::new(),
+    };
+    if servers.is_empty() {
+        bail!("{prefix}config must define at least one server");
+    }
+    let enabled: Vec<&Server> = servers.iter().filter(|s| s.enabled).collect();
+    if enabled.is_empty() {
+        bail!("{prefix}config must have at least one enabled server");
+    }
+    // Uniqueness is the dial target, not the raw string, so `host:port`
+    // and `ws://host:port` cannot both be enabled. Disabled entries are
+    // still parsed so a bad scheme fails `config test` before it is turned on.
+    let mut seen: HashMap<String, String> = HashMap::new();
+    for s in servers {
+        if s.endpoint.trim().is_empty() {
+            if s.enabled {
+                bail!("{prefix}server '{}' has an empty endpoint", s.name);
+            }
+            continue;
+        }
+        let identity = upstream_identity(&s.endpoint)
+            .map_err(|err| anyhow!("{prefix}server '{}': {err}", s.name))?;
+        if !s.enabled {
+            continue;
+        }
+        if let Some(previous) = seen.insert(identity, s.endpoint.clone()) {
+            if previous == s.endpoint {
+                bail!(
+                    "{prefix}duplicate upstream endpoint '{}' — endpoints must be unique",
+                    s.endpoint
+                );
+            }
+            bail!(
+                "{prefix}duplicate upstream endpoint '{}' — same target as '{}'; endpoints must be unique",
+                s.endpoint,
+                previous
+            );
+        }
+    }
+    Ok(())
+}
+
 impl ServerConfig {
     /// Validate the configuration, returning a clear error for any invalid field.
     pub fn validate(&self) -> Result<()> {
-        if self.listen_address.trim().is_empty() {
-            bail!("listen_address must not be empty");
-        }
-        if self.listen_port == 0 {
-            bail!("listen_port must be non-zero");
-        }
         if self.upstream_reconnect_ms == 0 {
             bail!("upstream_reconnect_ms must be greater than 0");
         }
@@ -222,46 +362,185 @@ impl ServerConfig {
         if self.max_client_message_bytes == 0 {
             bail!("max_client_message_bytes must be greater than 0");
         }
-        if self.servers.is_empty() {
-            bail!("config must define at least one server");
-        }
-        let enabled: Vec<&Server> = self.servers.iter().filter(|s| s.enabled).collect();
-        if enabled.is_empty() {
-            bail!("config must have at least one enabled server");
-        }
-        // Uniqueness is the dial target, not the raw string, so `host:port`
-        // and `ws://host:port` cannot both be enabled. Disabled entries are
-        // still parsed so a bad scheme fails `config test` before it is turned on.
-        let mut seen: HashMap<String, String> = HashMap::new();
-        for s in &self.servers {
-            if s.endpoint.trim().is_empty() {
-                if s.enabled {
-                    bail!("server '{}' has an empty endpoint", s.name);
-                }
-                continue;
-            }
-            let identity = upstream_identity(&s.endpoint)
-                .map_err(|err| anyhow!("server '{}': {err}", s.name))?;
-            if !s.enabled {
-                continue;
-            }
-            if let Some(previous) = seen.insert(identity, s.endpoint.clone()) {
-                if previous == s.endpoint {
-                    bail!(
-                        "duplicate upstream endpoint '{}' — endpoints must be unique",
-                        s.endpoint
-                    );
-                }
-                bail!(
-                    "duplicate upstream endpoint '{}' — same target as '{}'; endpoints must be unique",
-                    s.endpoint, previous
-                );
-            }
-        }
         if let Some(0) = self.metrics_port {
             bail!("metrics_port must be non-zero when set");
         }
+
+        if !self.servers.is_empty() && !self.listeners.is_empty() {
+            bail!(
+                "config cannot specify both top-level 'servers' and 'listeners'; move all pools into 'listeners'"
+            );
+        }
+
+        if self.listeners.is_empty() {
+            if self.listen_address.trim().is_empty() {
+                bail!("listen_address must not be empty");
+            }
+            if self.listen_port == 0 {
+                bail!("listen_port must be non-zero");
+            }
+            if let Some(cid) = &self.chain_id {
+                parse_chain_id(cid, None)?;
+            }
+            validate_servers(&self.servers, None)?;
+        } else {
+            if self.listen_port != 0 {
+                bail!(
+                    "top-level 'listen_port' cannot be combined with 'listeners'; set 'listen_port' on each listener"
+                );
+            }
+            if self.chain_id.is_some() {
+                bail!(
+                    "top-level 'chain_id' cannot be combined with 'listeners'; set 'chain_id' on each listener"
+                );
+            }
+            let mut seen_names = HashMap::<String, usize>::new();
+            let mut bound_listeners = Vec::<(String, String, u16)>::new();
+
+            for (idx, listener) in self.listeners.iter().enumerate() {
+                let name = listener.name.trim();
+                if name.is_empty() {
+                    bail!("listener at index {idx} has an empty name");
+                }
+                if name.contains('/') || name.chars().any(char::is_whitespace) {
+                    bail!("listener '{name}': name must not contain '/' or whitespace");
+                }
+                if seen_names.insert(name.to_string(), idx).is_some() {
+                    bail!("duplicate listener name '{name}' — listener names must be unique");
+                }
+
+                let addr = match &listener.listen_address {
+                    Some(a) => {
+                        if a.trim().is_empty() {
+                            bail!("listener '{name}': listen_address must not be empty");
+                        }
+                        a.trim().to_string()
+                    }
+                    None => {
+                        let top = self.listen_address.trim();
+                        if top.is_empty() {
+                            "0.0.0.0".to_string()
+                        } else {
+                            top.to_string()
+                        }
+                    }
+                };
+
+                if listener.listen_port == 0 {
+                    bail!("listener '{name}': listen_port must be non-zero");
+                }
+                if let Some(0) = listener.max_connections {
+                    bail!("listener '{name}': max_connections must be greater than 0");
+                }
+                if let Some(cid) = &listener.chain_id {
+                    parse_chain_id(cid, Some(name))?;
+                }
+
+                for (prev_name, prev_addr, prev_port) in &bound_listeners {
+                    if *prev_port == listener.listen_port && addresses_conflict(prev_addr, &addr) {
+                        bail!(
+                            "listener '{name}' ({}) conflicts with listener '{prev_name}' ({})",
+                            format_bind_addr(&addr, listener.listen_port),
+                            format_bind_addr(prev_addr, *prev_port)
+                        );
+                    }
+                }
+                bound_listeners.push((name.to_string(), addr, listener.listen_port));
+
+                validate_servers(&listener.servers, Some(name))?;
+            }
+        }
+
+        if let Some((metrics_host, metrics_port)) = self.resolved_metrics_host_port() {
+            for listener in self.resolved_listeners() {
+                if listener.listen_port == metrics_port
+                    && addresses_conflict(&metrics_host, &listener.listen_address)
+                {
+                    bail!(
+                        "metrics_port {metrics_port} on {metrics_host} conflicts with listener port {}",
+                        listener.listen_port
+                    );
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// Normalized list of ingress listeners to run.
+    ///
+    /// Returns a single unnamed [`ResolvedListener`] in legacy single-port mode,
+    /// or one named [`ResolvedListener`] per entry in `self.listeners`.
+    pub fn resolved_listeners(&self) -> Vec<ResolvedListener> {
+        if self.listeners.is_empty() {
+            vec![ResolvedListener {
+                name: None,
+                listen_address: self.listen_address.trim().to_string(),
+                listen_port: self.listen_port,
+                max_connections: self.max_connections,
+                expected_chain_id: self
+                    .chain_id
+                    .as_deref()
+                    .and_then(|c| parse_chain_id(c, None).ok()),
+                servers: self.servers.clone(),
+            }]
+        } else {
+            let default_addr = {
+                let top = self.listen_address.trim();
+                if top.is_empty() {
+                    "0.0.0.0".to_string()
+                } else {
+                    top.to_string()
+                }
+            };
+            self.listeners
+                .iter()
+                .map(|l| ResolvedListener {
+                    name: Some(l.name.trim().to_string()),
+                    listen_address: l
+                        .listen_address
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or(&default_addr)
+                        .to_string(),
+                    listen_port: l.listen_port,
+                    max_connections: l.max_connections.unwrap_or(self.max_connections),
+                    expected_chain_id: l
+                        .chain_id
+                        .as_deref()
+                        .and_then(|c| parse_chain_id(c, Some(&l.name)).ok()),
+                    servers: l.servers.clone(),
+                })
+                .collect()
+        }
+    }
+
+    /// Resolved `(host, port)` for the optional health/metrics HTTP server.
+    pub fn resolved_metrics_host_port(&self) -> Option<(String, u16)> {
+        let port = self.metrics_port?;
+        let host = self
+            .metrics_address
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                let top = self.listen_address.trim();
+                if !top.is_empty() {
+                    top.to_string()
+                } else if let Some(first) = self.listeners.first() {
+                    first
+                        .listen_address
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("0.0.0.0")
+                        .to_string()
+                } else {
+                    "0.0.0.0".to_string()
+                }
+            });
+        Some((host, port))
     }
 
     /// Bound for monitor connects, the wait for an upstream ABI, and `config test`.
@@ -296,6 +575,10 @@ pub struct ServerState {
     /// Set by the monitoring loop when an upstream stops advancing its chain
     /// state. Stale upstreams are deprioritized (but not excluded) when routing.
     pub stale: bool,
+    /// Optional configured `chain_id` that every upstream in this pool must match.
+    pub expected_chain_id: Option<[u8; 32]>,
+    /// Last valid `chain_id` reported by this upstream in `get_status_result`.
+    pub chain_id: Option<[u8; 32]>,
     pub trace_begin_block: u32,
     pub trace_end_block: u32,
     pub chain_state_begin_block: u32,
@@ -310,11 +593,17 @@ pub struct ServerState {
 
 impl ServerState {
     pub fn new() -> ServerState {
+        Self::with_expected_chain_id(None)
+    }
+
+    pub fn with_expected_chain_id(expected_chain_id: Option<[u8; 32]>) -> ServerState {
         ServerState {
             connections: Arc::new(AtomicUsize::new(0)),
             enabled: true,
             online: false,
             stale: false,
+            expected_chain_id,
+            chain_id: None,
             trace_begin_block: 0,
             trace_end_block: 0,
             chain_state_begin_block: 0,
@@ -355,12 +644,25 @@ pub struct ProxyLimits {
     pub max_client_message_bytes: usize,
 }
 
+#[cfg(test)]
 pub fn build_state_db(servers: Vec<Server>) -> ServerStateDb {
+    build_state_db_with_chain_id(servers, None)
+}
+
+pub fn build_state_db_with_chain_id(
+    servers: Vec<Server>,
+    expected_chain_id: Option<[u8; 32]>,
+) -> ServerStateDb {
     Arc::new(Mutex::new(
         servers
             .iter()
             .filter(|s| s.enabled)
-            .map(|s| (s.endpoint.clone(), ServerState::new()))
+            .map(|s| {
+                (
+                    s.endpoint.clone(),
+                    ServerState::with_expected_chain_id(expected_chain_id),
+                )
+            })
             .collect::<HashMap<String, ServerState>>(),
     ))
 }
@@ -526,5 +828,243 @@ mod tests {
             { "name": "b", "endpoint": "wss://ship.example:443", "enabled": true }
         ]));
         assert!(wss_default_port.validate().is_err());
+    }
+
+    #[test]
+    fn multi_listener_config_resolves_defaults_and_overrides() {
+        let cfg: ServerConfig = serde_json::from_value(serde_json::json!({
+            "listen_address": "127.0.0.1",
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "max_connections": 2000,
+            "metrics_port": 19090,
+            "listeners": [
+                {
+                    "name": "eos",
+                    "listen_port": 17000,
+                    "servers": [
+                        { "name": "eos-1", "endpoint": "127.0.0.1:18080", "enabled": true },
+                        { "name": "eos-2", "endpoint": "127.0.0.1:18081", "enabled": true }
+                    ]
+                },
+                {
+                    "name": "wax",
+                    "listen_address": "0.0.0.0",
+                    "listen_port": 17001,
+                    "max_connections": 500,
+                    "servers": [
+                        { "name": "wax-1", "endpoint": "127.0.0.1:28080", "enabled": true }
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+
+        cfg.validate().unwrap();
+        let resolved = cfg.resolved_listeners();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name.as_deref(), Some("eos"));
+        assert_eq!(resolved[0].listen_address, "127.0.0.1");
+        assert_eq!(resolved[0].listen_port, 17000);
+        assert_eq!(resolved[0].max_connections, 2000);
+        assert_eq!(resolved[0].servers.len(), 2);
+
+        assert_eq!(resolved[1].name.as_deref(), Some("wax"));
+        assert_eq!(resolved[1].listen_address, "0.0.0.0");
+        assert_eq!(resolved[1].listen_port, 17001);
+        assert_eq!(resolved[1].max_connections, 500);
+        assert_eq!(resolved[1].servers.len(), 1);
+
+        assert_eq!(
+            cfg.resolved_metrics_host_port(),
+            Some(("127.0.0.1".to_string(), 19090))
+        );
+    }
+
+    #[test]
+    fn multi_listener_rejects_mixed_servers_and_listeners() {
+        let mut value = minimal_config();
+        value["listeners"] = serde_json::json!([
+            {
+                "name": "eos",
+                "listen_port": 17001,
+                "servers": [
+                    { "name": "a", "endpoint": "127.0.0.1:18081", "enabled": true }
+                ]
+            }
+        ]);
+        let cfg: ServerConfig = serde_json::from_value(value).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("cannot specify both top-level 'servers' and 'listeners'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn multi_listener_rejects_duplicate_names_and_conflicting_ports() {
+        let dup_names: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "listeners": [
+                {
+                    "name": "eos",
+                    "listen_port": 17000,
+                    "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+                },
+                {
+                    "name": "eos",
+                    "listen_port": 17001,
+                    "servers": [{ "name": "b", "endpoint": "127.0.0.1:18081", "enabled": true }]
+                }
+            ]
+        }))
+        .unwrap();
+        let err = dup_names.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate listener name 'eos'"),
+            "unexpected error: {err}"
+        );
+
+        let dup_ports: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "listeners": [
+                {
+                    "name": "eos",
+                    "listen_address": "127.0.0.1",
+                    "listen_port": 17000,
+                    "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+                },
+                {
+                    "name": "wax",
+                    "listen_address": "0.0.0.0",
+                    "listen_port": 17000,
+                    "servers": [{ "name": "b", "endpoint": "127.0.0.1:18081", "enabled": true }]
+                }
+            ]
+        }))
+        .unwrap();
+        let err = dup_ports.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("conflicts with listener 'eos'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn multi_listener_rejects_invalid_names_and_metrics_port_collision() {
+        let slash_name: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "listeners": [
+                {
+                    "name": "eos/main",
+                    "listen_port": 17000,
+                    "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+                }
+            ]
+        }))
+        .unwrap();
+        let err = slash_name.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("name must not contain '/' or whitespace"),
+            "unexpected error: {err}"
+        );
+
+        let metrics_collision: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "metrics_port": 17000,
+            "listeners": [
+                {
+                    "name": "eos",
+                    "listen_port": 17000,
+                    "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+                }
+            ]
+        }))
+        .unwrap();
+        let err = metrics_collision.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("metrics_port 17000"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ipv6_bind_formatting_and_conflict_detection() {
+        assert_eq!(format_bind_addr("::", 17000), "[::]:17000");
+        assert_eq!(format_bind_addr("::1", 17000), "[::1]:17000");
+        assert_eq!(format_bind_addr("[::1]", 17000), "[::1]:17000");
+        assert_eq!(format_bind_addr("127.0.0.1", 17000), "127.0.0.1:17000");
+
+        let ipv6_conflict: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "listeners": [
+                {
+                    "name": "eos",
+                    "listen_address": "::1",
+                    "listen_port": 17000,
+                    "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+                },
+                {
+                    "name": "wax",
+                    "listen_address": "[::1]",
+                    "listen_port": 17000,
+                    "servers": [{ "name": "b", "endpoint": "127.0.0.1:18081", "enabled": true }]
+                }
+            ]
+        }))
+        .unwrap();
+        let err = ipv6_conflict.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("conflicts with listener 'eos'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn chain_id_validation_accepts_64_hex_and_rejects_invalid() {
+        let valid_cid = "aca376f206b8fc25a6ed44dbdc66547c36c6c33e3a119ffbeaef943642f0e906";
+        let cfg: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "listeners": [
+                {
+                    "name": "eos",
+                    "listen_port": 17000,
+                    "chain_id": valid_cid,
+                    "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+                }
+            ]
+        }))
+        .unwrap();
+        cfg.validate().expect("valid 64-hex chain_id should pass");
+        assert!(cfg.resolved_listeners()[0].expected_chain_id.is_some());
+
+        let bad_cid: ServerConfig = serde_json::from_value(serde_json::json!({
+            "listen_address": "127.0.0.1",
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "chain_id": "1234",
+            "listen_port": 17000,
+            "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+        }))
+        .unwrap();
+        let err = bad_cid.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("must be a 64-character hex string"),
+            "unexpected error: {err}"
+        );
     }
 }

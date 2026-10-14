@@ -1,12 +1,10 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
-use rs_abieos::Abieos;
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 use tokio::time::{sleep, sleep_until, timeout, Instant};
 use tokio_tungstenite::{
     connect_async_with_config,
@@ -15,6 +13,7 @@ use tokio_tungstenite::{
 };
 use tungstenite::protocol::WebSocketConfig;
 
+use crate::abi::accept_upstream_abi;
 use crate::models::{Server, ServerStateDb, StaticConfig};
 use crate::zcd;
 use crate::zcd::ZCDValues;
@@ -160,7 +159,6 @@ pub async fn monitoring_connection(
     server: Server,
     static_config: StaticConfig,
     server_state_db: ServerStateDb,
-    abieos: Arc<Mutex<Abieos>>,
     mut shutdown: broadcast::Receiver<()>,
 ) {
     let mut backoff_attempts: u32 = 0;
@@ -214,7 +212,6 @@ pub async fn monitoring_connection(
             &server,
             &static_config,
             &server_state_db,
-            &abieos,
             &mut shutdown,
             &mut status_request,
         )
@@ -268,7 +265,6 @@ async fn run_monitor_session(
     server: &Server,
     static_config: &StaticConfig,
     server_state_db: &ServerStateDb,
-    abieos: &Arc<Mutex<Abieos>>,
     shutdown: &mut broadcast::Receiver<()>,
     status_request: &mut u8,
 ) -> SessionEnd {
@@ -300,7 +296,7 @@ async fn run_monitor_session(
             _ = shutdown.recv() => return SessionEnd::Stop,
             next = receiver.next() => match next {
                 Some(Ok(msg)) => {
-                    match handle_monitoring_msg(msg, &mut ship_abi, abieos, server_state_db, server).await {
+                    match handle_monitoring_msg(msg, &mut ship_abi, server_state_db, server).await {
                         Inbound::AbiAccepted => {
                             abi_ready = true;
                             let variant = *status_request;
@@ -392,7 +388,6 @@ async fn run_monitor_session(
 async fn handle_monitoring_msg(
     message: Message,
     ship_abi: &mut Option<String>,
-    abieos: &Arc<Mutex<Abieos>>,
     server_state_db: &ServerStateDb,
     server: &Server,
 ) -> Inbound {
@@ -403,17 +398,12 @@ async fn handle_monitoring_msg(
                 return Inbound::Ignore;
             }
             let text = msg.to_string();
-            let loaded = {
-                let abieos = abieos.lock().await;
-                abieos.set_abi_json_native(0u64, &text)
-            };
+            // Same check as a client handshake: parse, then drop the handle.
+            // The text is kept only so a later text frame is ignored.
+            let loaded = accept_upstream_abi(&text);
             *ship_abi = Some(text);
             match loaded {
-                Ok(true) => Inbound::AbiAccepted,
-                Ok(false) => {
-                    tracing::warn!(upstream = %server.endpoint, "abieos rejected upstream ABI");
-                    Inbound::AbiRejected
-                }
+                Ok(()) => Inbound::AbiAccepted,
                 Err(_) => {
                     tracing::warn!(upstream = %server.endpoint, "error setting ABI for upstream");
                     Inbound::AbiRejected
@@ -519,10 +509,6 @@ fn require_u32(result: &zcd::ZCD<'_>, field: &'static str) -> Result<u32, zcd::Z
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use rs_abieos::Abieos;
-    use tokio::sync::Mutex;
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{apply_status_update, handle_monitoring_msg, Inbound};
@@ -639,12 +625,10 @@ mod tests {
     #[tokio::test]
     async fn rejected_status_frame_is_not_a_reply() {
         let (server, db) = fixture();
-        let abieos = Arc::new(Mutex::new(Abieos::new()));
         let mut ship_abi = None;
         let inbound = handle_monitoring_msg(
             Message::Binary(vec![0u8].into()),
             &mut ship_abi,
-            &abieos,
             &db,
             &server,
         )
@@ -665,12 +649,10 @@ mod tests {
             .await
             .expect("non-status");
         assert_eq!(reply, None);
-        let abieos = Arc::new(Mutex::new(Abieos::new()));
         let mut ship_abi = None;
         let inbound = handle_monitoring_msg(
             Message::Binary(vec![1u8].into()),
             &mut ship_abi,
-            &abieos,
             &db,
             &server,
         )
@@ -733,7 +715,6 @@ mod tests {
         let inbound = handle_monitoring_msg(
             Message::Binary(status_message_v1(&status_body()).into()),
             &mut None,
-            &Arc::new(Mutex::new(Abieos::new())),
             &db,
             &server,
         )
@@ -747,5 +728,50 @@ mod tests {
         assert_eq!(state.trace_end_block, 1001);
         assert_eq!(state.finality_data_begin_block, 10);
         assert_eq!(state.finality_data_end_block, 800);
+    }
+
+    fn tiny_abi(action: &str) -> String {
+        format!(
+            r#"{{"version":"eosio::abi/1.1","actions":[{{"name":"{action}","type":"uint32","ricardian_contract":""}}]}}"#
+        )
+    }
+
+    /// Monitors used to take the process-wide abieos mutex. Distinct ABIs
+    /// accepted at the same time must not change each other's result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_monitors_accept_their_own_abi() {
+        let (server, db) = fixture();
+        let mut tasks = Vec::new();
+        for i in 0..12 {
+            let server = server.clone();
+            let db = db.clone();
+            let json = if i % 3 == 2 {
+                "{".to_string()
+            } else if i % 2 == 0 {
+                tiny_abi("acta")
+            } else {
+                tiny_abi("actb")
+            };
+            let valid = json != "{";
+            tasks.push(tokio::spawn(async move {
+                let mut ship_abi = None;
+                let inbound =
+                    handle_monitoring_msg(Message::Text(json.into()), &mut ship_abi, &db, &server)
+                        .await;
+                (valid, inbound, ship_abi.is_some())
+            }));
+        }
+        for task in tasks {
+            let (valid, inbound, saw_text) = task.await.expect("task");
+            assert!(saw_text);
+            if valid {
+                assert!(
+                    matches!(inbound, Inbound::AbiAccepted),
+                    "a valid ABI must be accepted on its own handle"
+                );
+            } else {
+                assert!(matches!(inbound, Inbound::AbiRejected));
+            }
+        }
     }
 }

@@ -10,7 +10,7 @@ A reverse proxy and load balancer for the Antelope **SHiP** (State History Plugi
 
 Use it when you run more than one SHiP node and want clients (Hyperion, dfuse-style indexers, custom consumers) to see a single, resilient endpoint with load balancing and automatic failover, instead of pinning each consumer to one node.
 
-It is written in Rust on [tokio](https://tokio.rs/) and [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite), and uses [rs_abieos](https://github.com/eosrio/rs-abieos) (pure-Rust backend) for ABI handling.
+It is written in Rust on [tokio](https://tokio.rs/) and [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite), and uses [rs_abieos](https://github.com/eosrio/rs-abieos) (pure-Rust backend) to check that an upstream SHiP ABI parses. Each handshake, failover, and monitor builds a short-lived `AbiHandle` and drops it; connections do not share an abieos context.
 
 ## Features
 

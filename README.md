@@ -124,6 +124,7 @@ Configuration is a single JSON file (`config.json` by default). The three `*_ms`
 | `upstream_monitoring_ms` | u64 | yes (> 0) | — | Milliseconds between block-progress logging and staleness checks. |
 | `upstream_status_ms` | u64 | yes (> 0) | — | Milliseconds between status requests sent to each upstream. Only one request is in flight; a reply that misses this deadline marks the upstream offline. |
 | `servers` | array | yes in single-port mode (≥ 1 enabled) | — | List of upstream SHiP nodes (see below). Mutually exclusive with `listeners`. |
+| `chain_id` | string | no | unset | Optional 64-character hex `chain_id` in single-port mode; upstreams reporting a different `chain_id` are rejected and kept offline. Even when unset, any upstream whose reported `chain_id` mismatches the rest of its pool is automatically rejected. |
 | `listeners` | array | yes in multi-listener mode (≥ 1 entry) | — | Named ingress listeners mapping distinct ports to isolated SHiP pools (see [Multi-network / multi-port routing](#multi-network--multi-port-routing)). |
 | `max_connections` | usize | no | `10000` | Max concurrent client connections; excess are rejected (backpressure). Acts as the default per-listener cap when `listeners` is used. |
 | `handshake_timeout_ms` | u64 | no | `10000` | Client WebSocket handshake timeout; `0` disables it. The upstream monitor and `config test` use this same bound for connect and the first read, falling back to 10s when it is `0`. |
@@ -139,7 +140,7 @@ Each entry in `servers` is an object:
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `name` | string | yes | Human-readable name used in logs. |
-| `endpoint` | string | yes | Upstream as `host:port`, `ws://host:port`, or `wss://host:port`. A bare `host:port` is dialed as `ws://`. Endpoints must be unique (see below). |
+| `endpoint` | string | yes | Upstream as `host:port`, `ws://host:port`, or `wss://host:port`. A bare `host:port` is dialed as `ws://`. Endpoints must be unique within a listener's pool (see below). |
 | `enabled` | bool | yes | Whether the router may use this upstream. At least one enabled server is required. |
 
 `wss://` is dialed with rustls (not OpenSSL). The router verifies the upstream certificate against the operating-system trust store. The published container image installs CA certificates, so public CAs work there. For a private CA, install it into that store, or set `SSL_CERT_FILE` / `SSL_CERT_DIR` to PEM certificates — when either variable is set, those paths replace the OS store. Unknown schemes (`https://`, `http://`, …) are rejected. Uniqueness is the dial target: `127.0.0.1:8080` and `ws://127.0.0.1:8080` are the same upstream, and so are `ws://host` and `ws://host:80`. `ws://` and `wss://` to the same host are different. The client-facing listener stays plaintext `ws://`.
@@ -182,7 +183,8 @@ To expose multiple ingress ports for different chains (each backed by its own re
    | `listen_port` | u16 | yes (non-zero) | Ingress TCP port for this listener. Must not collide with other listeners or `metrics_port`. |
    | `listen_address` | string | no | Bind address override; defaults to top-level `listen_address` (or `"0.0.0.0"`). |
    | `max_connections` | usize | no | Per-listener concurrent client cap; defaults to top-level `max_connections`. |
-   | `servers` | array | yes (≥ 1 enabled) | Redundant SHiP nodes belonging to this network. |
+   | `chain_id` | string | no | Optional 64-character hex `chain_id` for this network; upstreams reporting a different `chain_id` are rejected and kept offline. Even when omitted, any upstream whose reported `chain_id` mismatches the rest of its pool is automatically rejected. |
+   | `servers` | array | yes (≥ 1 enabled) | Redundant SHiP nodes belonging to this network. Referencing the same `endpoint` across two different listeners is allowed (e.g. a dedicated VIP vs. a public port) and spawns an independent upstream monitor per listener. |
 
    ```json
    {
@@ -195,6 +197,7 @@ To expose multiple ingress ports for different chains (each backed by its own re
        {
          "name": "eos",
          "listen_port": 17000,
+         "chain_id": "aca376f206b8fc25a6ed44dbdc66547c36c6c33e3a119ffbeaef943642f0e906",
          "servers": [
            { "name": "EOS SHiP 1", "endpoint": "10.0.1.10:8080", "enabled": true },
            { "name": "EOS SHiP 2", "endpoint": "10.0.1.11:8080", "enabled": true }
@@ -203,6 +206,7 @@ To expose multiple ingress ports for different chains (each backed by its own re
        {
          "name": "wax",
          "listen_port": 17001,
+         "chain_id": "1064487b3cd1a897ce03ae5b6a865651747e2e152090f99c1d19d44e01aea5a4",
          "servers": [
            { "name": "WAX SHiP 1", "endpoint": "10.0.2.10:8080", "enabled": true },
            { "name": "WAX SHiP 2", "endpoint": "10.0.2.11:8080", "enabled": true }

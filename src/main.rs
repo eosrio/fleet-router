@@ -31,7 +31,8 @@ use tracing::Instrument;
 use crate::config_sample::CONFIG_SAMPLE;
 use crate::connection_handler::handle_client;
 use crate::models::{
-    build_config_db, build_state_db, ServerConfig, ServerConfigDb, ServerStateDb, StaticConfig,
+    build_config_db, build_state_db_with_chain_id, format_bind_addr, ServerConfig, ServerConfigDb,
+    ServerStateDb, StaticConfig,
 };
 use crate::tasks::{monitoring_connection, state_monitoring_loop, upstream_ws_config};
 
@@ -84,10 +85,7 @@ async fn main() -> Result<()> {
     // Bind all client TCP listeners up front so any port conflict fails fast.
     let mut bound_listeners = Vec::with_capacity(resolved_listeners.len());
     for listener_cfg in resolved_listeners {
-        let bind_addr = format!(
-            "{}:{}",
-            listener_cfg.listen_address, listener_cfg.listen_port
-        );
+        let bind_addr = format_bind_addr(&listener_cfg.listen_address, listener_cfg.listen_port);
         let tcp_listener = TcpListener::bind(&bind_addr)
             .await
             .map_err(|e| anyhow::anyhow!("error binding to {}: {}", bind_addr, e))?;
@@ -120,7 +118,10 @@ async fn main() -> Result<()> {
 
     for (listener_cfg, tcp_listener) in bound_listeners {
         let server_config_db: ServerConfigDb = build_config_db(listener_cfg.servers.clone());
-        let server_state_db: ServerStateDb = build_state_db(listener_cfg.servers.clone());
+        let server_state_db: ServerStateDb = build_state_db_with_chain_id(
+            listener_cfg.servers.clone(),
+            listener_cfg.expected_chain_id,
+        );
 
         health_states.push(health::ListenerHealthState {
             name: listener_cfg.name.clone(),
@@ -228,7 +229,7 @@ async fn main() -> Result<()> {
 
     // Optional health/metrics HTTP endpoint.
     if let Some((host, port)) = config.resolved_metrics_host_port() {
-        let addr = format!("{host}:{port}");
+        let addr = format_bind_addr(&host, port);
         spawn(health::run_metrics_server(
             addr,
             health_states,

@@ -103,7 +103,8 @@ async fn handle_request(
     let request_line = head.lines().next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("");
+    let raw_path = parts.next().unwrap_or("");
+    let path = raw_path.split('?').next().unwrap_or("");
 
     let (status, content_type, body) = if method != "GET" {
         (
@@ -429,5 +430,45 @@ mod tests {
         assert!(metrics.contains(
             "fleet_router_upstream_up{listener=\"wax\",endpoint=\"127.0.0.1:28080\"} 1\n"
         ));
+    }
+
+    #[tokio::test]
+    async fn handle_request_strips_query_string_on_routes() {
+        let db_eos = build_state_db(vec![Server {
+            name: "eos-1".to_string(),
+            endpoint: "127.0.0.1:18080".to_string(),
+            enabled: true,
+        }]);
+        db_eos
+            .lock()
+            .await
+            .get_mut("127.0.0.1:18080")
+            .unwrap()
+            .online = true;
+        let listeners = vec![ListenerHealthState {
+            name: Some("eos".to_string()),
+            state_db: db_eos,
+        }];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_listeners = listeners.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_request(stream, &server_listeners).await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /ready/eos?probe=k8s&v=1 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = String::new();
+        client.read_to_string(&mut resp).await.unwrap();
+        server_task.await.unwrap();
+
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {resp}");
+        assert!(resp.contains("ready (eos): 1 upstream(s) online\n"));
     }
 }

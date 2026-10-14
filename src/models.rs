@@ -160,6 +160,9 @@ pub struct ListenerConfig {
     /// Optional per-listener connection cap; falls back to top-level `max_connections`.
     #[serde(default)]
     pub max_connections: Option<usize>,
+    /// Optional expected Antelope `chain_id` (64-character hex string) for upstreams in this pool.
+    #[serde(default)]
+    pub chain_id: Option<String>,
 }
 
 /// A validated, normalized listener ready to be bound and monitored at runtime.
@@ -170,6 +173,7 @@ pub struct ResolvedListener {
     pub listen_address: String,
     pub listen_port: u16,
     pub max_connections: usize,
+    pub expected_chain_id: Option<[u8; 32]>,
     pub servers: Vec<Server>,
 }
 
@@ -202,6 +206,9 @@ pub struct ServerConfig {
     /// The upstream SHiP nodes to load-balance across in single-listener mode.
     #[serde(default)]
     pub servers: Vec<Server>,
+    /// Optional expected Antelope `chain_id` (64-character hex string) in single-listener mode.
+    #[serde(default)]
+    pub chain_id: Option<String>,
     /// Named ingress listeners for multi-port / multi-network deployments.
     #[serde(default)]
     pub listeners: Vec<ListenerConfig>,
@@ -239,17 +246,54 @@ pub struct ServerConfig {
     pub metrics_port: Option<u16>,
 }
 
+/// Format a `host` and `port` for `TcpListener::bind`, bracketing bare IPv6
+/// literals (e.g. `::` -> `[::]:17000`, `::1` -> `[::1]:17000`).
+pub fn format_bind_addr(host: &str, port: u16) -> String {
+    let host = host.trim();
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn normalize_bind_host(addr: &str) -> &str {
+    let trimmed = addr.trim();
+    trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed)
+}
+
 fn is_unspecified_addr(addr: &str) -> bool {
     matches!(
-        addr.trim(),
-        "0.0.0.0" | "::" | "[::]" | "0:0:0:0:0:0:0:0" | "[0:0:0:0:0:0:0:0]"
+        normalize_bind_host(addr),
+        "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0"
     )
 }
 
 fn addresses_conflict(a: &str, b: &str) -> bool {
-    let a = a.trim();
-    let b = b.trim();
+    let a = normalize_bind_host(a);
+    let b = normalize_bind_host(b);
     a.eq_ignore_ascii_case(b) || is_unspecified_addr(a) || is_unspecified_addr(b)
+}
+
+/// Parse a 64-character hex string into a 32-byte `chain_id`.
+pub fn parse_chain_id(raw: &str, listener_ctx: Option<&str>) -> Result<[u8; 32]> {
+    let prefix = match listener_ctx {
+        Some(name) => format!("listener '{name}': "),
+        None => String::new(),
+    };
+    let hex = raw.trim();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("{prefix}chain_id '{raw}' must be a 64-character hex string (32 bytes)");
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let s = std::str::from_utf8(chunk).unwrap();
+        out[i] = u8::from_str_radix(s, 16).unwrap();
+    }
+    Ok(out)
 }
 
 fn validate_servers(servers: &[Server], listener_ctx: Option<&str>) -> Result<()> {
@@ -335,11 +379,19 @@ impl ServerConfig {
             if self.listen_port == 0 {
                 bail!("listen_port must be non-zero");
             }
+            if let Some(cid) = &self.chain_id {
+                parse_chain_id(cid, None)?;
+            }
             validate_servers(&self.servers, None)?;
         } else {
             if self.listen_port != 0 {
                 bail!(
                     "top-level 'listen_port' cannot be combined with 'listeners'; set 'listen_port' on each listener"
+                );
+            }
+            if self.chain_id.is_some() {
+                bail!(
+                    "top-level 'chain_id' cannot be combined with 'listeners'; set 'chain_id' on each listener"
                 );
             }
             let mut seen_names = HashMap::<String, usize>::new();
@@ -380,12 +432,16 @@ impl ServerConfig {
                 if let Some(0) = listener.max_connections {
                     bail!("listener '{name}': max_connections must be greater than 0");
                 }
+                if let Some(cid) = &listener.chain_id {
+                    parse_chain_id(cid, Some(name))?;
+                }
 
                 for (prev_name, prev_addr, prev_port) in &bound_listeners {
                     if *prev_port == listener.listen_port && addresses_conflict(prev_addr, &addr) {
                         bail!(
-                            "listener '{name}' ({addr}:{}) conflicts with listener '{prev_name}' ({prev_addr}:{prev_port})",
-                            listener.listen_port
+                            "listener '{name}' ({}) conflicts with listener '{prev_name}' ({})",
+                            format_bind_addr(&addr, listener.listen_port),
+                            format_bind_addr(prev_addr, *prev_port)
                         );
                     }
                 }
@@ -422,6 +478,10 @@ impl ServerConfig {
                 listen_address: self.listen_address.trim().to_string(),
                 listen_port: self.listen_port,
                 max_connections: self.max_connections,
+                expected_chain_id: self
+                    .chain_id
+                    .as_deref()
+                    .and_then(|c| parse_chain_id(c, None).ok()),
                 servers: self.servers.clone(),
             }]
         } else {
@@ -445,6 +505,10 @@ impl ServerConfig {
                         .to_string(),
                     listen_port: l.listen_port,
                     max_connections: l.max_connections.unwrap_or(self.max_connections),
+                    expected_chain_id: l
+                        .chain_id
+                        .as_deref()
+                        .and_then(|c| parse_chain_id(c, Some(&l.name)).ok()),
                     servers: l.servers.clone(),
                 })
                 .collect()
@@ -511,6 +575,10 @@ pub struct ServerState {
     /// Set by the monitoring loop when an upstream stops advancing its chain
     /// state. Stale upstreams are deprioritized (but not excluded) when routing.
     pub stale: bool,
+    /// Optional configured `chain_id` that every upstream in this pool must match.
+    pub expected_chain_id: Option<[u8; 32]>,
+    /// Last valid `chain_id` reported by this upstream in `get_status_result`.
+    pub chain_id: Option<[u8; 32]>,
     pub trace_begin_block: u32,
     pub trace_end_block: u32,
     pub chain_state_begin_block: u32,
@@ -525,11 +593,17 @@ pub struct ServerState {
 
 impl ServerState {
     pub fn new() -> ServerState {
+        Self::with_expected_chain_id(None)
+    }
+
+    pub fn with_expected_chain_id(expected_chain_id: Option<[u8; 32]>) -> ServerState {
         ServerState {
             connections: Arc::new(AtomicUsize::new(0)),
             enabled: true,
             online: false,
             stale: false,
+            expected_chain_id,
+            chain_id: None,
             trace_begin_block: 0,
             trace_end_block: 0,
             chain_state_begin_block: 0,
@@ -570,12 +644,25 @@ pub struct ProxyLimits {
     pub max_client_message_bytes: usize,
 }
 
+#[cfg(test)]
 pub fn build_state_db(servers: Vec<Server>) -> ServerStateDb {
+    build_state_db_with_chain_id(servers, None)
+}
+
+pub fn build_state_db_with_chain_id(
+    servers: Vec<Server>,
+    expected_chain_id: Option<[u8; 32]>,
+) -> ServerStateDb {
     Arc::new(Mutex::new(
         servers
             .iter()
             .filter(|s| s.enabled)
-            .map(|s| (s.endpoint.clone(), ServerState::new()))
+            .map(|s| {
+                (
+                    s.endpoint.clone(),
+                    ServerState::with_expected_chain_id(expected_chain_id),
+                )
+            })
             .collect::<HashMap<String, ServerState>>(),
     ))
 }
@@ -906,6 +993,77 @@ mod tests {
         let err = metrics_collision.validate().unwrap_err().to_string();
         assert!(
             err.contains("metrics_port 17000"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ipv6_bind_formatting_and_conflict_detection() {
+        assert_eq!(format_bind_addr("::", 17000), "[::]:17000");
+        assert_eq!(format_bind_addr("::1", 17000), "[::1]:17000");
+        assert_eq!(format_bind_addr("[::1]", 17000), "[::1]:17000");
+        assert_eq!(format_bind_addr("127.0.0.1", 17000), "127.0.0.1:17000");
+
+        let ipv6_conflict: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "listeners": [
+                {
+                    "name": "eos",
+                    "listen_address": "::1",
+                    "listen_port": 17000,
+                    "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+                },
+                {
+                    "name": "wax",
+                    "listen_address": "[::1]",
+                    "listen_port": 17000,
+                    "servers": [{ "name": "b", "endpoint": "127.0.0.1:18081", "enabled": true }]
+                }
+            ]
+        }))
+        .unwrap();
+        let err = ipv6_conflict.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("conflicts with listener 'eos'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn chain_id_validation_accepts_64_hex_and_rejects_invalid() {
+        let valid_cid = "aca376f206b8fc25a6ed44dbdc66547c36c6c33e3a119ffbeaef943642f0e906";
+        let cfg: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "listeners": [
+                {
+                    "name": "eos",
+                    "listen_port": 17000,
+                    "chain_id": valid_cid,
+                    "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+                }
+            ]
+        }))
+        .unwrap();
+        cfg.validate().expect("valid 64-hex chain_id should pass");
+        assert!(cfg.resolved_listeners()[0].expected_chain_id.is_some());
+
+        let bad_cid: ServerConfig = serde_json::from_value(serde_json::json!({
+            "listen_address": "127.0.0.1",
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "chain_id": "1234",
+            "listen_port": 17000,
+            "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+        }))
+        .unwrap();
+        let err = bad_cid.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("must be a 64-character hex string"),
             "unexpected error: {err}"
         );
     }

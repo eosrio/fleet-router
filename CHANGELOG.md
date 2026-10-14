@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-14
+
 ### Security
 
 - Cap client WebSocket messages separately from upstream messages with
@@ -155,5 +157,6 @@ First public release on crates.io and GitHub.
 - Upstream handshake now skips leading control frames and retries against
   another upstream instead of dropping the client on an unexpected first frame.
 
-[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/eosrio/fleet-router/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/eosrio/fleet-router/releases/tag/v0.2.0

@@ -79,110 +79,172 @@ async fn main() -> Result<()> {
         max_message_bytes: config.max_message_bytes,
     };
     let limits = config.proxy_limits();
+    let resolved_listeners = config.resolved_listeners();
 
-    let server_config_db: ServerConfigDb = build_config_db(config.servers.clone());
-    let server_state_db: ServerStateDb = build_state_db(config.servers.clone());
-
-    // Graceful-shutdown broadcast: every long-lived task subscribes.
-    let (shutdown_tx, _) = broadcast::channel::<()>(16);
-
-    // Per-upstream monitoring loops.
-    for server in config.servers.iter().filter(|s| s.enabled).cloned() {
-        tracing::info!(name = %server.name, upstream = %server.endpoint, "starting upstream monitor");
-        spawn(monitoring_connection(
-            server,
-            static_config.clone(),
-            server_state_db.clone(),
-            shutdown_tx.subscribe(),
-        ));
-    }
-
-    // Periodic block-progress / staleness monitor.
-    spawn(state_monitoring_loop(
-        server_state_db.clone(),
-        static_config.upstream_monitoring_ms,
-        shutdown_tx.subscribe(),
-    ));
-
-    // Optional health/metrics HTTP endpoint.
-    if let Some(port) = config.metrics_port {
-        let addr = format!(
+    // Bind all client TCP listeners up front so any port conflict fails fast.
+    let mut bound_listeners = Vec::with_capacity(resolved_listeners.len());
+    for listener_cfg in resolved_listeners {
+        let bind_addr = format!(
             "{}:{}",
-            config
-                .metrics_address
-                .clone()
-                .unwrap_or_else(|| config.listen_address.clone()),
-            port
+            listener_cfg.listen_address, listener_cfg.listen_port
         );
-        spawn(health::run_metrics_server(
-            addr,
-            server_state_db.clone(),
-            shutdown_tx.subscribe(),
-        ));
-    }
-
-    let bind_addr = format!("{}:{}", config.listen_address, config.listen_port);
-    let listener = TcpListener::bind(&bind_addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("error binding to {}: {}", bind_addr, e))?;
-    tracing::info!(address = %config.listen_address, port = config.listen_port, "listening for clients");
-
-    // Connection backpressure: at most `max_connections` concurrent clients.
-    let conn_limit = Arc::new(Semaphore::new(config.max_connections));
-    let max_connections = config.max_connections;
-
-    loop {
-        tokio::select! {
-            result = listener.accept() => {
-                let (client_stream, client_addr) = match result {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "error accepting incoming connection");
-                        continue;
-                    }
-                };
-
-                // Reject immediately when at capacity (backpressure, not queueing).
-                let permit = match conn_limit.clone().try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        tracing::warn!(%client_addr, max = max_connections, "connection limit reached; rejecting");
-                        drop(client_stream);
-                        continue;
-                    }
-                };
-
-                tracing::debug!(%client_addr, "accepted tcp connection");
-
-                let s_state_db = server_state_db.clone();
-                let s_config_db = server_config_db.clone();
-                let shutdown_rx = shutdown_tx.subscribe();
-
-                spawn(
-                    async move {
-                        let _permit = permit; // released when this task ends
-                        handle_client(
-                            client_stream,
-                            client_addr,
-                            s_state_db,
-                            s_config_db,
-                            limits,
-                            shutdown_rx,
-                        )
-                        .await;
-                    }
-                    .instrument(tracing::info_span!("client", addr = %client_addr)),
+        let tcp_listener = TcpListener::bind(&bind_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("error binding to {}: {}", bind_addr, e))?;
+        match &listener_cfg.name {
+            Some(name) => {
+                tracing::info!(
+                    listener = %name,
+                    address = %listener_cfg.listen_address,
+                    port = listener_cfg.listen_port,
+                    "listening for clients"
                 );
             }
-            _ = shutdown_signal() => {
-                tracing::info!("shutdown signal received; draining connections");
-                let _ = shutdown_tx.send(());
-                drain_connections(&conn_limit, max_connections, config.shutdown_grace_ms).await;
-                tracing::info!("shutdown complete");
-                break Ok(());
+            None => {
+                tracing::info!(
+                    address = %listener_cfg.listen_address,
+                    port = listener_cfg.listen_port,
+                    "listening for clients"
+                );
             }
         }
+        bound_listeners.push((listener_cfg, tcp_listener));
     }
+
+    // Graceful-shutdown broadcast: every long-lived task subscribes.
+    let (shutdown_tx, _) = broadcast::channel::<()>(64);
+
+    let mut health_states = Vec::with_capacity(bound_listeners.len());
+    let mut conn_limits = Vec::with_capacity(bound_listeners.len());
+    let mut accept_handles = Vec::with_capacity(bound_listeners.len());
+
+    for (listener_cfg, tcp_listener) in bound_listeners {
+        let server_config_db: ServerConfigDb = build_config_db(listener_cfg.servers.clone());
+        let server_state_db: ServerStateDb = build_state_db(listener_cfg.servers.clone());
+
+        health_states.push(health::ListenerHealthState {
+            name: listener_cfg.name.clone(),
+            state_db: server_state_db.clone(),
+        });
+
+        // Per-upstream monitoring loops for this listener's pool.
+        for server in listener_cfg.servers.iter().filter(|s| s.enabled).cloned() {
+            match &listener_cfg.name {
+                Some(listener_name) => {
+                    tracing::info!(
+                        listener = %listener_name,
+                        name = %server.name,
+                        upstream = %server.endpoint,
+                        "starting upstream monitor"
+                    );
+                }
+                None => {
+                    tracing::info!(
+                        name = %server.name,
+                        upstream = %server.endpoint,
+                        "starting upstream monitor"
+                    );
+                }
+            }
+            spawn(monitoring_connection(
+                server,
+                static_config.clone(),
+                server_state_db.clone(),
+                shutdown_tx.subscribe(),
+            ));
+        }
+
+        // Periodic block-progress / staleness monitor for this listener's pool.
+        spawn(state_monitoring_loop(
+            server_state_db.clone(),
+            static_config.upstream_monitoring_ms,
+            shutdown_tx.subscribe(),
+        ));
+
+        // Connection backpressure: at most `max_connections` concurrent clients on this listener.
+        let conn_limit = Arc::new(Semaphore::new(listener_cfg.max_connections));
+        let max_connections = listener_cfg.max_connections;
+        conn_limits.push((conn_limit.clone(), max_connections));
+
+        let listener_name = listener_cfg.name.clone();
+        let listener_shutdown_tx = shutdown_tx.clone();
+        let mut accept_shutdown_rx = shutdown_tx.subscribe();
+
+        accept_handles.push(spawn(async move {
+            loop {
+                tokio::select! {
+                    result = tcp_listener.accept() => {
+                        let (client_stream, client_addr) = match result {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "error accepting incoming connection");
+                                continue;
+                            }
+                        };
+
+                        // Reject immediately when at capacity (backpressure, not queueing).
+                        let permit = match conn_limit.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                tracing::warn!(%client_addr, max = max_connections, "connection limit reached; rejecting");
+                                drop(client_stream);
+                                continue;
+                            }
+                        };
+
+                        tracing::debug!(%client_addr, "accepted tcp connection");
+
+                        let s_state_db = server_state_db.clone();
+                        let s_config_db = server_config_db.clone();
+                        let shutdown_rx = listener_shutdown_tx.subscribe();
+                        let span = match &listener_name {
+                            Some(name) => tracing::info_span!("client", listener = %name, addr = %client_addr),
+                            None => tracing::info_span!("client", addr = %client_addr),
+                        };
+
+                        spawn(
+                            async move {
+                                let _permit = permit; // released when this task ends
+                                handle_client(
+                                    client_stream,
+                                    client_addr,
+                                    s_state_db,
+                                    s_config_db,
+                                    limits,
+                                    shutdown_rx,
+                                )
+                                .await;
+                            }
+                            .instrument(span),
+                        );
+                    }
+                    _ = accept_shutdown_rx.recv() => {
+                        break;
+                    }
+                }
+            }
+        }));
+    }
+
+    // Optional health/metrics HTTP endpoint.
+    if let Some((host, port)) = config.resolved_metrics_host_port() {
+        let addr = format!("{host}:{port}");
+        spawn(health::run_metrics_server(
+            addr,
+            health_states,
+            shutdown_tx.subscribe(),
+        ));
+    }
+
+    shutdown_signal().await;
+    tracing::info!("shutdown signal received; draining connections");
+    let _ = shutdown_tx.send(());
+    for handle in accept_handles {
+        let _ = handle.await;
+    }
+    drain_connections(&conn_limits, config.shutdown_grace_ms).await;
+    tracing::info!("shutdown complete");
+    Ok(())
 }
 
 /// Initialize `tracing` with a `RUST_LOG`-driven filter (default `info`).
@@ -214,12 +276,18 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// Wait (up to `grace_ms`) for active client connections to drain.
-async fn drain_connections(conn_limit: &Arc<Semaphore>, max: usize, grace_ms: u64) {
+/// Wait (up to `grace_ms`) for active client connections across all listeners to drain.
+async fn drain_connections(conn_limits: &[(Arc<Semaphore>, usize)], grace_ms: u64) {
     let start = Instant::now();
-    while conn_limit.available_permits() < max {
+    loop {
+        let remaining: usize = conn_limits
+            .iter()
+            .map(|(sem, max)| max.saturating_sub(sem.available_permits()))
+            .sum();
+        if remaining == 0 {
+            break;
+        }
         if start.elapsed() >= Duration::from_millis(grace_ms) {
-            let remaining = max - conn_limit.available_permits();
             tracing::warn!(remaining, "shutdown grace period elapsed; forcing exit");
             break;
         }
@@ -266,63 +334,80 @@ async fn probe_upstream(endpoint: &str, max_message_bytes: usize, bound: Duratio
 }
 
 async fn run_tests(config: &ServerConfig) {
-    let mut valid_count = 0;
+    let mut total_valid = 0;
+    let mut all_listeners_valid = true;
     let bound = Duration::from_millis(config.upstream_connect_timeout_ms());
-    for server in &config.servers {
-        let endpoint = server.ws_url();
-        cprintln!("\n 🧪 Testing <bright-cyan>{}</>", endpoint);
-        match probe_upstream(&endpoint, config.max_message_bytes, bound).await {
-            Probe::Abi => {
-                cprintln!(" ✅  <green>Websocket connected!</>");
-                cprintln!(" ✅  <green>ABI Received!</>");
-                valid_count += 1;
-            }
-            Probe::ConnectTimeout => {
-                cprintln!(
-                    " ❌  <red>{}:</> Websocket connect timed out after {} ms",
-                    endpoint,
-                    bound.as_millis()
-                );
-            }
-            Probe::ConnectFailed(e) => {
-                cprintln!(" ❌  <red>Connection failed! Error: {}</>", e);
-            }
-            Probe::ReadTimeout => {
-                cprintln!(" ✅  <green>Websocket connected!</>");
-                cprintln!(
-                    " ❌  <red>{}:</> Timed out waiting for the ABI after {} ms",
-                    endpoint,
-                    bound.as_millis()
-                );
-            }
-            Probe::NoMessage => {
-                cprintln!(" ✅  <green>Websocket connected!</>");
-                cprintln!(" ❌  <red>{}:</> No Message Received!", endpoint);
-            }
-            Probe::ReadFailed(e) => {
-                cprintln!(" ✅  <green>Websocket connected!</>");
-                cprintln!(
-                    " ❌  <red>{}:</> Failed to read message! Error: {}",
-                    endpoint,
-                    e
-                );
-            }
-            Probe::InvalidAbi => {
-                cprintln!(" ✅  <green>Websocket connected!</>");
-                cprintln!(" ❌  <red>{}:</> Invalid ABI!", endpoint);
-            }
-            Probe::Unexpected(kind) => {
-                cprintln!(" ✅  <green>Websocket connected!</>");
-                cprintln!(
-                    " ❌  <red>{}:</> Unexpected Message type: {}",
-                    endpoint,
-                    kind
-                );
+
+    for listener in config.resolved_listeners() {
+        if let Some(name) = &listener.name {
+            cprintln!(
+                "\n 🌐 Listener <bright-magenta,bold>{}</> (<cyan>{}:{}</>)",
+                name,
+                listener.listen_address,
+                listener.listen_port
+            );
+        }
+        let mut listener_valid = 0;
+        for server in &listener.servers {
+            let endpoint = server.ws_url();
+            cprintln!("\n 🧪 Testing <bright-cyan>{}</>", endpoint);
+            match probe_upstream(&endpoint, config.max_message_bytes, bound).await {
+                Probe::Abi => {
+                    cprintln!(" ✅  <green>Websocket connected!</>");
+                    cprintln!(" ✅  <green>ABI Received!</>");
+                    listener_valid += 1;
+                    total_valid += 1;
+                }
+                Probe::ConnectTimeout => {
+                    cprintln!(
+                        " ❌  <red>{}:</> Websocket connect timed out after {} ms",
+                        endpoint,
+                        bound.as_millis()
+                    );
+                }
+                Probe::ConnectFailed(e) => {
+                    cprintln!(" ❌  <red>Connection failed! Error: {}</>", e);
+                }
+                Probe::ReadTimeout => {
+                    cprintln!(" ✅  <green>Websocket connected!</>");
+                    cprintln!(
+                        " ❌  <red>{}:</> Timed out waiting for the ABI after {} ms",
+                        endpoint,
+                        bound.as_millis()
+                    );
+                }
+                Probe::NoMessage => {
+                    cprintln!(" ✅  <green>Websocket connected!</>");
+                    cprintln!(" ❌  <red>{}:</> No Message Received!", endpoint);
+                }
+                Probe::ReadFailed(e) => {
+                    cprintln!(" ✅  <green>Websocket connected!</>");
+                    cprintln!(
+                        " ❌  <red>{}:</> Failed to read message! Error: {}",
+                        endpoint,
+                        e
+                    );
+                }
+                Probe::InvalidAbi => {
+                    cprintln!(" ✅  <green>Websocket connected!</>");
+                    cprintln!(" ❌  <red>{}:</> Invalid ABI!", endpoint);
+                }
+                Probe::Unexpected(kind) => {
+                    cprintln!(" ✅  <green>Websocket connected!</>");
+                    cprintln!(
+                        " ❌  <red>{}:</> Unexpected Message type: {}",
+                        endpoint,
+                        kind
+                    );
+                }
             }
         }
+        if listener_valid == 0 {
+            all_listeners_valid = false;
+        }
     }
-    if valid_count > 0 {
-        cprintln!("\n ✅  Valid servers: <cyan,bold>{}</>", valid_count);
+    if total_valid > 0 && all_listeners_valid {
+        cprintln!("\n ✅  Valid servers: <cyan,bold>{}</>", total_valid);
     } else {
         cprintln!("\n ❌  <red,bold>No valid servers, please check your configuration file!</>");
     }

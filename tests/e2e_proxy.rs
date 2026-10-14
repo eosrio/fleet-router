@@ -1310,3 +1310,197 @@ async fn e2e_proxy_routes_finality_requests_by_v1_range() {
     ha.shutdown().await;
     hb.shutdown().await;
 }
+
+// ===========================================================================
+// E2E TEST 14: Multi-listener network isolation, failover, and observability
+// ===========================================================================
+
+/// Single `fleet-router` process configured with two listeners (`eos` and `wax`):
+/// - `eos` listener has two redundant mock SHiP nodes (head=5000 and head=5500,
+///   first node disconnects after 3 blocks to trigger failover within `eos`).
+/// - `wax` listener has one mock SHiP node (head=9000).
+///
+/// Verifies:
+/// 1. Clients on the `eos` port only ever receive blocks from `eos` upstreams
+///    (5000 / 5500) and fail over within the `eos` pool, never crossing to `wax`.
+/// 2. Clients on the `wax` port only ever receive blocks from `wax` (9000).
+/// 3. `/ready`, `/ready/eos`, and `/ready/wax` report 200 OK, `/ready/unknown`
+///    reports 404, and `/metrics` carries `listener="eos"` and `listener="wax"`.
+#[tokio::test]
+async fn e2e_proxy_multi_listener_network_isolation() {
+    let eos_mock_1 = MockShipServer::new(MockShipConfig {
+        head_block: 5000,
+        lib_block: 4990,
+        blocks_to_stream: 0,
+        disconnect_after: Some(3),
+        ..Default::default()
+    })
+    .await;
+    let eos_mock_2 = MockShipServer::new(MockShipConfig {
+        head_block: 5500,
+        lib_block: 5490,
+        blocks_to_stream: 0,
+        ..Default::default()
+    })
+    .await;
+    let wax_mock_1 = MockShipServer::new(MockShipConfig {
+        head_block: 9000,
+        lib_block: 8990,
+        blocks_to_stream: 0,
+        ..Default::default()
+    })
+    .await;
+
+    let eos_ep_1 = eos_mock_1.endpoint();
+    let eos_ep_2 = eos_mock_2.endpoint();
+    let wax_ep_1 = wax_mock_1.endpoint();
+
+    let h_eos_1 = eos_mock_1.start();
+    let h_eos_2 = eos_mock_2.start();
+    let h_wax_1 = wax_mock_1.start();
+
+    let eos_port = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let wax_port = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let metrics_port = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    };
+
+    let config = serde_json::json!({
+        "listen_address": "127.0.0.1",
+        "upstream_reconnect_ms": 200,
+        "upstream_monitoring_ms": 1000,
+        "upstream_status_ms": 200,
+        "metrics_address": "127.0.0.1",
+        "metrics_port": metrics_port,
+        "listeners": [
+            {
+                "name": "eos",
+                "listen_port": eos_port,
+                "servers": [
+                    { "name": "eos-1", "endpoint": eos_ep_1, "enabled": true },
+                    { "name": "eos-2", "endpoint": eos_ep_2, "enabled": true }
+                ]
+            },
+            {
+                "name": "wax",
+                "listen_port": wax_port,
+                "servers": [
+                    { "name": "wax-1", "endpoint": wax_ep_1, "enabled": true }
+                ]
+            }
+        ]
+    });
+
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+    config_file
+        .write_all(config.to_string().as_bytes())
+        .unwrap();
+    config_file.flush().unwrap();
+
+    let binary = FleetRouterProcess::find_binary();
+    let child = Command::new(&binary)
+        .arg("--config")
+        .arg(config_file.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn multi-listener fleet-router");
+
+    let router = FleetRouterProcess {
+        child,
+        listen_port: eos_port,
+        _config_file: config_file,
+    };
+    router.wait_for_ready().await;
+
+    // Wait for all three upstreams across both listeners to report online in /metrics
+    wait_for_metric(
+        metrics_port,
+        &format!("fleet_router_upstream_up{{listener=\"eos\",endpoint=\"{eos_ep_1}\"}} 1"),
+    )
+    .await;
+    wait_for_metric(
+        metrics_port,
+        &format!("fleet_router_upstream_up{{listener=\"eos\",endpoint=\"{eos_ep_2}\"}} 1"),
+    )
+    .await;
+    wait_for_metric(
+        metrics_port,
+        &format!("fleet_router_upstream_up{{listener=\"wax\",endpoint=\"{wax_ep_1}\"}} 1"),
+    )
+    .await;
+
+    // Verify /ready, /ready/eos, /ready/wax, and /ready/unknown
+    let http = reqwest::Client::new();
+    let ready_resp = http
+        .get(format!("http://127.0.0.1:{metrics_port}/ready"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready_resp.status().as_u16(), 200);
+
+    let eos_ready = http
+        .get(format!("http://127.0.0.1:{metrics_port}/ready/eos"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(eos_ready.status().as_u16(), 200);
+
+    let wax_ready = http
+        .get(format!("http://127.0.0.1:{metrics_port}/ready/wax"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wax_ready.status().as_u16(), 200);
+
+    let unknown_ready = http
+        .get(format!("http://127.0.0.1:{metrics_port}/ready/telos"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown_ready.status().as_u16(), 404);
+
+    // Stream 8 blocks from the `eos` port (triggers failover after 3 if routed to eos-1)
+    let (mut eos_writer, mut eos_reader) = ws_connect(&format!("ws://127.0.0.1:{eos_port}")).await;
+    let _ = read_one(&mut eos_reader).await;
+    eos_writer
+        .send(Message::Binary(build_blocks_request(1, 20, 20).into()))
+        .await
+        .unwrap();
+    let eos_heads = read_block_heads(&mut eos_reader, 8).await;
+    assert_eq!(eos_heads.len(), 8);
+    assert!(
+        eos_heads.iter().all(|h| *h == 5000 || *h == 5500),
+        "eos listener must only stream from eos upstreams (5000/5500), got {eos_heads:?}"
+    );
+
+    // Stream 5 blocks from the `wax` port
+    let (mut wax_writer, mut wax_reader) = ws_connect(&format!("ws://127.0.0.1:{wax_port}")).await;
+    let _ = read_one(&mut wax_reader).await;
+    wax_writer
+        .send(Message::Binary(build_blocks_request(1, 20, 20).into()))
+        .await
+        .unwrap();
+    let wax_heads = read_block_heads(&mut wax_reader, 5).await;
+    assert_eq!(wax_heads.len(), 5);
+    assert!(
+        wax_heads.iter().all(|h| *h == 9000),
+        "wax listener must only stream from wax upstream (9000), got {wax_heads:?}"
+    );
+
+    drop(eos_writer);
+    drop(eos_reader);
+    drop(wax_writer);
+    drop(wax_reader);
+    drop(router);
+    h_eos_1.shutdown().await;
+    h_eos_2.shutdown().await;
+    h_wax_1.shutdown().await;
+}

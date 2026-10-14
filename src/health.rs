@@ -2,11 +2,13 @@
 //! Prometheus metrics. Opt-in via the `metrics_port` config field.
 //!
 //! Routes (GET only):
-//!   - `/health`, `/healthz` -> 200 while the process is running
-//!   - `/ready`,  `/readyz`  -> 200 if at least one upstream is online, else 503
-//!   - `/metrics`            -> Prometheus text exposition of upstream state
+//!   - `/health`, `/healthz`           -> 200 while the process is running
+//!   - `/ready`,  `/readyz`            -> 200 if every configured listener has ≥1 upstream online, else 503
+//!   - `/ready/<name>`, `/readyz/<name>` -> 200 if named listener has ≥1 upstream online, 503 if 0, 404 if unknown
+//!   - `/metrics`                      -> Prometheus text exposition of upstream state
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,10 +18,18 @@ use tokio::time::timeout;
 
 use crate::models::ServerStateDb;
 
+/// Health and metrics state for a single ingress listener.
+#[derive(Clone)]
+pub struct ListenerHealthState {
+    /// `None` in legacy single-port mode, `Some(name)` in multi-listener mode.
+    pub name: Option<String>,
+    pub state_db: ServerStateDb,
+}
+
 /// Run the health/metrics HTTP server until a shutdown signal is received.
 pub async fn run_metrics_server(
     addr: String,
-    state_db: ServerStateDb,
+    listeners: Vec<ListenerHealthState>,
     mut shutdown: broadcast::Receiver<()>,
 ) {
     let listener = match TcpListener::bind(&addr).await {
@@ -31,14 +41,16 @@ pub async fn run_metrics_server(
     };
     tracing::info!(%addr, "health/metrics endpoint listening");
 
+    let listeners = Arc::new(listeners);
+
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _peer)) => {
-                        let db = state_db.clone();
+                        let pools = listeners.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_request(stream, db).await {
+                            if let Err(e) = handle_request(stream, &pools).await {
                                 tracing::debug!(error = %e, "health/metrics request error");
                             }
                         });
@@ -54,7 +66,10 @@ pub async fn run_metrics_server(
     }
 }
 
-async fn handle_request(mut stream: TcpStream, state_db: ServerStateDb) -> std::io::Result<()> {
+async fn handle_request(
+    mut stream: TcpStream,
+    listeners: &[ListenerHealthState],
+) -> std::io::Result<()> {
     // Read just enough to parse the request line, bounded by a single overall
     // timeout (so a slow client can't hold the connection open by dripping
     // bytes) and a fixed buffer size.
@@ -99,28 +114,22 @@ async fn handle_request(mut stream: TcpStream, state_db: ServerStateDb) -> std::
     } else {
         match path {
             "/health" | "/healthz" => ("200 OK", "text/plain", "ok\n".to_string()),
-            "/ready" | "/readyz" => {
-                let online = count_online(&state_db).await;
-                if online > 0 {
-                    (
-                        "200 OK",
-                        "text/plain",
-                        format!("ready: {} upstream(s) online\n", online),
-                    )
-                } else {
-                    (
-                        "503 Service Unavailable",
-                        "text/plain",
-                        "not ready: no upstreams online\n".to_string(),
-                    )
-                }
-            }
+            "/ready" | "/readyz" => evaluate_overall_readiness(listeners).await,
             "/metrics" => (
                 "200 OK",
                 "text/plain; version=0.0.4",
-                render_metrics(&state_db).await,
+                render_metrics(listeners).await,
             ),
-            _ => ("404 Not Found", "text/plain", "not found\n".to_string()),
+            _ => {
+                if let Some(target) = path
+                    .strip_prefix("/ready/")
+                    .or_else(|| path.strip_prefix("/readyz/"))
+                {
+                    evaluate_listener_readiness(listeners, target).await
+                } else {
+                    ("404 Not Found", "text/plain", "not found\n".to_string())
+                }
+            }
         }
     };
 
@@ -133,12 +142,127 @@ async fn handle_request(mut stream: TcpStream, state_db: ServerStateDb) -> std::
     Ok(())
 }
 
+async fn evaluate_overall_readiness(
+    listeners: &[ListenerHealthState],
+) -> (&'static str, &'static str, String) {
+    if listeners.len() == 1 && listeners[0].name.is_none() {
+        let online = count_online(&listeners[0].state_db).await;
+        return if online > 0 {
+            (
+                "200 OK",
+                "text/plain",
+                format!("ready: {} upstream(s) online\n", online),
+            )
+        } else {
+            (
+                "503 Service Unavailable",
+                "text/plain",
+                "not ready: no upstreams online\n".to_string(),
+            )
+        };
+    }
+
+    let mut total_online = 0usize;
+    let mut unready = Vec::new();
+    for l in listeners {
+        let online = count_online(&l.state_db).await;
+        total_online += online;
+        if online == 0 {
+            unready.push(l.name.as_deref().unwrap_or("default").to_string());
+        }
+    }
+
+    if unready.is_empty() && !listeners.is_empty() {
+        (
+            "200 OK",
+            "text/plain",
+            format!(
+                "ready: {} listener(s) ready, {} upstream(s) online\n",
+                listeners.len(),
+                total_online
+            ),
+        )
+    } else {
+        (
+            "503 Service Unavailable",
+            "text/plain",
+            format!(
+                "not ready: listener(s) with no online upstreams: {}\n",
+                unready.join(", ")
+            ),
+        )
+    }
+}
+
+async fn evaluate_listener_readiness(
+    listeners: &[ListenerHealthState],
+    target: &str,
+) -> (&'static str, &'static str, String) {
+    if target.is_empty() {
+        return ("404 Not Found", "text/plain", "not found\n".to_string());
+    }
+    let Some(listener) = listeners.iter().find(|l| l.name.as_deref() == Some(target)) else {
+        return ("404 Not Found", "text/plain", "not found\n".to_string());
+    };
+    let online = count_online(&listener.state_db).await;
+    if online > 0 {
+        (
+            "200 OK",
+            "text/plain",
+            format!("ready ({target}): {online} upstream(s) online\n"),
+        )
+    } else {
+        (
+            "503 Service Unavailable",
+            "text/plain",
+            format!("not ready ({target}): no upstreams online\n"),
+        )
+    }
+}
+
 async fn count_online(state_db: &ServerStateDb) -> usize {
     state_db.lock().await.values().filter(|s| s.online).count()
 }
 
-async fn render_metrics(state_db: &ServerStateDb) -> String {
-    let db = state_db.lock().await;
+fn format_labels(listener_name: Option<&str>, endpoint: &str) -> String {
+    match listener_name {
+        Some(name) => format!(
+            "listener=\"{}\",endpoint=\"{}\"",
+            escape(name),
+            escape(endpoint)
+        ),
+        None => format!("endpoint=\"{}\"", escape(endpoint)),
+    }
+}
+
+#[derive(Clone)]
+struct MetricSnapshot {
+    labels: String,
+    online: bool,
+    stale: bool,
+    connections: usize,
+    chain_state_end_block: u32,
+    finality_data_begin_block: u32,
+    finality_data_end_block: u32,
+}
+
+async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
+    let mut snapshots = Vec::new();
+    for l in listeners {
+        let db = l.state_db.lock().await;
+        for (endpoint, state) in db.iter() {
+            snapshots.push(MetricSnapshot {
+                labels: format_labels(l.name.as_deref(), endpoint),
+                online: state.online,
+                stale: state.stale,
+                connections: state.connections.load(Ordering::Relaxed),
+                chain_state_end_block: state.chain_state_end_block,
+                finality_data_begin_block: state.finality_data_begin_block,
+                finality_data_end_block: state.finality_data_end_block,
+            });
+        }
+    }
+
     let mut out = String::new();
 
     out.push_str("# HELP fleet_router_up Whether the router process is up.\n");
@@ -149,21 +273,21 @@ async fn render_metrics(state_db: &ServerStateDb) -> String {
         "# HELP fleet_router_upstream_up Whether an upstream is online (1) or offline (0).\n",
     );
     out.push_str("# TYPE fleet_router_upstream_up gauge\n");
-    for (endpoint, state) in db.iter() {
+    for s in &snapshots {
         out.push_str(&format!(
-            "fleet_router_upstream_up{{endpoint=\"{}\"}} {}\n",
-            escape(endpoint),
-            u8::from(state.online)
+            "fleet_router_upstream_up{{{}}} {}\n",
+            s.labels,
+            u8::from(s.online)
         ));
     }
 
     out.push_str("# HELP fleet_router_upstream_stale Whether an upstream has stopped advancing (1) or not (0).\n");
     out.push_str("# TYPE fleet_router_upstream_stale gauge\n");
-    for (endpoint, state) in db.iter() {
+    for s in &snapshots {
         out.push_str(&format!(
-            "fleet_router_upstream_stale{{endpoint=\"{}\"}} {}\n",
-            escape(endpoint),
-            u8::from(state.stale)
+            "fleet_router_upstream_stale{{{}}} {}\n",
+            s.labels,
+            u8::from(s.stale)
         ));
     }
 
@@ -171,41 +295,37 @@ async fn render_metrics(state_db: &ServerStateDb) -> String {
         "# HELP fleet_router_active_connections Active client connections routed to an upstream.\n",
     );
     out.push_str("# TYPE fleet_router_active_connections gauge\n");
-    for (endpoint, state) in db.iter() {
+    for s in &snapshots {
         out.push_str(&format!(
-            "fleet_router_active_connections{{endpoint=\"{}\"}} {}\n",
-            escape(endpoint),
-            state.connections.load(Ordering::Relaxed)
+            "fleet_router_active_connections{{{}}} {}\n",
+            s.labels, s.connections
         ));
     }
 
     out.push_str("# HELP fleet_router_upstream_chain_state_end_block Last chain-state block reported by an upstream.\n");
     out.push_str("# TYPE fleet_router_upstream_chain_state_end_block gauge\n");
-    for (endpoint, state) in db.iter() {
+    for s in &snapshots {
         out.push_str(&format!(
-            "fleet_router_upstream_chain_state_end_block{{endpoint=\"{}\"}} {}\n",
-            escape(endpoint),
-            state.chain_state_end_block
+            "fleet_router_upstream_chain_state_end_block{{{}}} {}\n",
+            s.labels, s.chain_state_end_block
         ));
     }
 
     out.push_str("# HELP fleet_router_upstream_finality_data_begin_block First block with finality data reported by an upstream (0 if unknown).\n");
     out.push_str("# TYPE fleet_router_upstream_finality_data_begin_block gauge\n");
-    for (endpoint, state) in db.iter() {
+    for s in &snapshots {
         out.push_str(&format!(
-            "fleet_router_upstream_finality_data_begin_block{{endpoint=\"{}\"}} {}\n",
-            escape(endpoint),
-            state.finality_data_begin_block
+            "fleet_router_upstream_finality_data_begin_block{{{}}} {}\n",
+            s.labels, s.finality_data_begin_block
         ));
     }
 
     out.push_str("# HELP fleet_router_upstream_finality_data_end_block One past the last block with finality data (0 if unknown).\n");
     out.push_str("# TYPE fleet_router_upstream_finality_data_end_block gauge\n");
-    for (endpoint, state) in db.iter() {
+    for s in &snapshots {
         out.push_str(&format!(
-            "fleet_router_upstream_finality_data_end_block{{endpoint=\"{}\"}} {}\n",
-            escape(endpoint),
-            state.finality_data_end_block
+            "fleet_router_upstream_finality_data_end_block{{{}}} {}\n",
+            s.labels, s.finality_data_end_block
         ));
     }
 
@@ -214,4 +334,100 @@ async fn render_metrics(state_db: &ServerStateDb) -> String {
 
 fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{build_state_db, Server};
+
+    #[tokio::test]
+    async fn single_listener_metrics_and_readiness_keep_legacy_format() {
+        let db = build_state_db(vec![Server {
+            name: "s1".to_string(),
+            endpoint: "127.0.0.1:18080".to_string(),
+            enabled: true,
+        }]);
+        let listeners = vec![ListenerHealthState {
+            name: None,
+            state_db: db.clone(),
+        }];
+
+        let (status, _, body) = evaluate_overall_readiness(&listeners).await;
+        assert_eq!(status, "503 Service Unavailable");
+        assert_eq!(body, "not ready: no upstreams online\n");
+
+        db.lock().await.get_mut("127.0.0.1:18080").unwrap().online = true;
+
+        let (status, _, body) = evaluate_overall_readiness(&listeners).await;
+        assert_eq!(status, "200 OK");
+        assert_eq!(body, "ready: 1 upstream(s) online\n");
+
+        let metrics = render_metrics(&listeners).await;
+        assert!(metrics.contains("fleet_router_upstream_up{endpoint=\"127.0.0.1:18080\"} 1\n"));
+    }
+
+    #[tokio::test]
+    async fn multi_listener_metrics_and_readiness_include_listener_names() {
+        let db_eos = build_state_db(vec![Server {
+            name: "eos-1".to_string(),
+            endpoint: "127.0.0.1:18080".to_string(),
+            enabled: true,
+        }]);
+        let db_wax = build_state_db(vec![Server {
+            name: "wax-1".to_string(),
+            endpoint: "127.0.0.1:28080".to_string(),
+            enabled: true,
+        }]);
+
+        db_eos
+            .lock()
+            .await
+            .get_mut("127.0.0.1:18080")
+            .unwrap()
+            .online = true;
+
+        let listeners = vec![
+            ListenerHealthState {
+                name: Some("eos".to_string()),
+                state_db: db_eos.clone(),
+            },
+            ListenerHealthState {
+                name: Some("wax".to_string()),
+                state_db: db_wax.clone(),
+            },
+        ];
+
+        // Overall readiness is 503 while 'wax' has 0 online upstreams.
+        let (status, _, body) = evaluate_overall_readiness(&listeners).await;
+        assert_eq!(status, "503 Service Unavailable");
+        assert!(body.contains("wax"), "unexpected body: {body}");
+
+        // Per-listener readiness reflects each pool independently.
+        let (eos_status, _, _) = evaluate_listener_readiness(&listeners, "eos").await;
+        assert_eq!(eos_status, "200 OK");
+        let (wax_status, _, _) = evaluate_listener_readiness(&listeners, "wax").await;
+        assert_eq!(wax_status, "503 Service Unavailable");
+        let (missing_status, _, _) = evaluate_listener_readiness(&listeners, "telos").await;
+        assert_eq!(missing_status, "404 Not Found");
+
+        // Once 'wax' comes online, overall readiness turns 200 OK.
+        db_wax
+            .lock()
+            .await
+            .get_mut("127.0.0.1:28080")
+            .unwrap()
+            .online = true;
+        let (status, _, body) = evaluate_overall_readiness(&listeners).await;
+        assert_eq!(status, "200 OK");
+        assert_eq!(body, "ready: 2 listener(s) ready, 2 upstream(s) online\n");
+
+        let metrics = render_metrics(&listeners).await;
+        assert!(metrics.contains(
+            "fleet_router_upstream_up{listener=\"eos\",endpoint=\"127.0.0.1:18080\"} 1\n"
+        ));
+        assert!(metrics.contains(
+            "fleet_router_upstream_up{listener=\"wax\",endpoint=\"127.0.0.1:28080\"} 1\n"
+        ));
+    }
 }

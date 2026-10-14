@@ -118,13 +118,14 @@ Configuration is a single JSON file (`config.json` by default). The three `*_ms`
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `listen_address` | string | yes | — | Bind address for client connections (e.g. `0.0.0.0`). |
-| `listen_port` | u16 | yes (non-zero) | `17000` (sample) | Port for client connections. |
+| `listen_address` | string | yes (single-port) / no (multi-listener) | `"0.0.0.0"` (with `listeners`) | Bind address for client connections (e.g. `0.0.0.0`). Acts as the default bind address for `listeners` and `metrics_address`. |
+| `listen_port` | u16 | yes (single-port, non-zero) | `17000` (sample) | Port for client connections in single-listener mode. Cannot be combined with `listeners`. |
 | `upstream_reconnect_ms` | u64 | yes (> 0) | — | Milliseconds between upstream reconnection attempts. |
 | `upstream_monitoring_ms` | u64 | yes (> 0) | — | Milliseconds between block-progress logging and staleness checks. |
 | `upstream_status_ms` | u64 | yes (> 0) | — | Milliseconds between status requests sent to each upstream. Only one request is in flight; a reply that misses this deadline marks the upstream offline. |
-| `servers` | array | yes (≥ 1 enabled) | — | List of upstream SHiP nodes (see below). |
-| `max_connections` | usize | no | `10000` | Max concurrent client connections; excess are rejected (backpressure). |
+| `servers` | array | yes in single-port mode (≥ 1 enabled) | — | List of upstream SHiP nodes (see below). Mutually exclusive with `listeners`. |
+| `listeners` | array | yes in multi-listener mode (≥ 1 entry) | — | Named ingress listeners mapping distinct ports to isolated SHiP pools (see [Multi-network / multi-port routing](#multi-network--multi-port-routing)). |
+| `max_connections` | usize | no | `10000` | Max concurrent client connections; excess are rejected (backpressure). Acts as the default per-listener cap when `listeners` is used. |
 | `handshake_timeout_ms` | u64 | no | `10000` | Client WebSocket handshake timeout; `0` disables it. The upstream monitor and `config test` use this same bound for connect and the first read, falling back to 10s when it is `0`. |
 | `idle_timeout_ms` | u64 | no | `0` (disabled) | Close a connection idle (no data in either direction) for this long. |
 | `max_message_bytes` | usize | no | `268435456` (256 MiB) | Max WebSocket message size on proxied upstreams and monitor connections. |
@@ -169,6 +170,50 @@ Client requests are capped by `max_client_message_bytes` (default 64 KiB) on bot
 }
 ```
 
+### Multi-network / multi-port routing
+
+To expose multiple ingress ports for different chains (each backed by its own redundant SHiP pool), you can either:
+
+1. **Use `listeners` in a single `fleet-router` process** — each entry in `listeners` binds its own port and maintains an isolated upstream pool, monitor loop, and connection semaphore:
+
+   | Field | Type | Required | Description |
+   |---|---|---|---|
+   | `name` | string | yes | Unique listener/network identifier (no `/` or whitespace). Used in logs, `/metrics` (`listener="<name>"`), and `/ready/<name>`. |
+   | `listen_port` | u16 | yes (non-zero) | Ingress TCP port for this listener. Must not collide with other listeners or `metrics_port`. |
+   | `listen_address` | string | no | Bind address override; defaults to top-level `listen_address` (or `"0.0.0.0"`). |
+   | `max_connections` | usize | no | Per-listener concurrent client cap; defaults to top-level `max_connections`. |
+   | `servers` | array | yes (≥ 1 enabled) | Redundant SHiP nodes belonging to this network. |
+
+   ```json
+   {
+     "listen_address": "0.0.0.0",
+     "upstream_reconnect_ms": 3000,
+     "upstream_monitoring_ms": 5000,
+     "upstream_status_ms": 5000,
+     "metrics_port": 9090,
+     "listeners": [
+       {
+         "name": "eos",
+         "listen_port": 17000,
+         "servers": [
+           { "name": "EOS SHiP 1", "endpoint": "10.0.1.10:8080", "enabled": true },
+           { "name": "EOS SHiP 2", "endpoint": "10.0.1.11:8080", "enabled": true }
+         ]
+       },
+       {
+         "name": "wax",
+         "listen_port": 17001,
+         "servers": [
+           { "name": "WAX SHiP 1", "endpoint": "10.0.2.10:8080", "enabled": true },
+           { "name": "WAX SHiP 2", "endpoint": "10.0.2.11:8080", "enabled": true }
+         ]
+       }
+     ]
+   }
+   ```
+
+2. **Run one `fleet-router` instance per network** for process/container-level isolation — see [`deploy/docker-compose.multi-network.yml`](deploy/docker-compose.multi-network.yml) and [`deploy/fleet-router@.service`](deploy/fleet-router@.service).
+
 ## Usage
 
 ```text
@@ -202,11 +247,12 @@ Set `metrics_port` (and optionally `metrics_address`) to enable an HTTP endpoint
 
 | Route | Response |
 |---|---|
-| `/health` | `200` while the process is running. |
-| `/ready` | `200` if at least one upstream is online, otherwise `503`. |
+| `/health`, `/healthz` | `200` while the process is running. |
+| `/ready`, `/readyz` | `200` if at least one upstream is online (or, in `listeners` mode, if **every** listener has at least one upstream online), otherwise `503`. |
+| `/ready/<listener>`, `/readyz/<listener>` | `200` if the named listener has at least one online upstream, `503` if none are online, or `404` if the listener name is unknown. |
 | `/metrics` | Prometheus text exposition of router and upstream state. |
 
-Exposed metrics include:
+Exposed metrics include (in multi-listener mode, each upstream series also carries `listener="<name>"`):
 
 ```text
 fleet_router_up
@@ -214,6 +260,8 @@ fleet_router_upstream_up{endpoint}
 fleet_router_upstream_stale{endpoint}
 fleet_router_active_connections{endpoint}
 fleet_router_upstream_chain_state_end_block{endpoint}
+fleet_router_upstream_finality_data_begin_block{endpoint}
+fleet_router_upstream_finality_data_end_block{endpoint}
 ```
 
 ## Running in production
@@ -221,6 +269,8 @@ fleet_router_upstream_chain_state_end_block{endpoint}
 > **Do not expose `fleet-router` directly to the public internet.** See [Security and limitations](#security-and-limitations).
 
 ### systemd
+
+For a single config file (either single-port or multi-listener):
 
 ```ini
 [Unit]
@@ -241,6 +291,8 @@ Environment=RUST_LOG=info
 WantedBy=multi-user.target
 ```
 
+To run **one isolated process per network** with systemd template units, copy [`deploy/fleet-router@.service`](deploy/fleet-router@.service) to `/etc/systemd/system/fleet-router@.service`, place each chain's config at `/etc/fleet-router/<chain>.json`, and start each unit (`systemctl enable --now fleet-router@eos fleet-router@wax`).
+
 `SIGTERM` (sent by `systemctl stop`) triggers graceful shutdown: the router stops accepting new connections, drains in-flight ones for up to `shutdown_grace_ms`, and sends WebSocket close frames to clients. Keep `TimeoutStopSec` comfortably larger than `shutdown_grace_ms`.
 
 ### Docker
@@ -251,7 +303,7 @@ docker run -p 17000:17000 \
   ghcr.io/eosrio/fleet-router run --config /etc/fleet-router.json
 ```
 
-The image runs as a non-root user. Its `HEALTHCHECK` runs `fleet-router check`, which dials `127.0.0.1:17000`.
+The image runs as a non-root user. Its `HEALTHCHECK` runs `fleet-router check`, which dials `127.0.0.1:17000`. For multi-container deployments (one container per network), see [`deploy/docker-compose.multi-network.yml`](deploy/docker-compose.multi-network.yml).
 
 ### Tuning notes
 

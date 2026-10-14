@@ -1,0 +1,46 @@
+# Multi-instance deployment example: one isolated fleet-router container per chain.
+#
+# Place per-chain configs in ./configs/config.<chain>.json (each listening on
+# 0.0.0.0:17000 and metrics_port 9090 inside its container) and run:
+#
+#   docker compose -f deploy/docker-compose.multi-network.yml up -d
+
+services:
+  fleet-router-eos:
+    image: ghcr.io/eosrio/fleet-router:latest
+    container_name: fleet-router-eos
+    restart: unless-stopped
+    command: ["run", "--config", "/etc/fleet-router/config.json"]
+    ports:
+      - "127.0.0.1:17000:17000"
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./configs/config.eos.json:/etc/fleet-router/config.json:ro
+    environment:
+      - RUST_LOG=info
+
+  fleet-router-wax:
+    image: ghcr.io/eosrio/fleet-router:latest
+    container_name: fleet-router-wax
+    restart: unless-stopped
+    command: ["run", "--config", "/etc/fleet-router/config.json"]
+    ports:
+      - "127.0.0.1:17001:17000"
+      - "127.0.0.1:9091:9090"
+    volumes:
+      - ./configs/config.wax.json:/etc/fleet-router/config.json:ro
+    environment:
+      - RUST_LOG=info
+
+  fleet-router-telos:
+    image: ghcr.io/eosrio/fleet-router:latest
+    container_name: fleet-router-telos
+    restart: unless-stopped
+    command: ["run", "--config", "/etc/fleet-router/config.json"]
+    ports:
+      - "127.0.0.1:17002:17000"
+      - "127.0.0.1:9092:9090"
+    volumes:
+      - ./configs/config.telos.json:/etc/fleet-router/config.json:ro
+    environment:
+      - RUST_LOG=info

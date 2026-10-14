@@ -1,0 +1,26 @@
+# systemd template unit for running one fleet-router process per network.
+#
+# Install to /etc/systemd/system/fleet-router@.service, place each network's
+# config at /etc/fleet-router/<network>.json (with distinct listen_port and
+# metrics_port), then enable and start per network:
+#
+#   sudo systemctl enable --now fleet-router@eos
+#   sudo systemctl enable --now fleet-router@wax
+#   sudo systemctl enable --now fleet-router@telos
+
+[Unit]
+Description=Fleet SHiP Router (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=fleet
+ExecStart=/usr/local/bin/fleet-router run --config /etc/fleet-router/%i.json
+Restart=on-failure
+# SIGTERM triggers a graceful, bounded drain. Allow more than shutdown_grace_ms
+# so systemd does not SIGKILL the process mid-drain.
+TimeoutStopSec=10
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

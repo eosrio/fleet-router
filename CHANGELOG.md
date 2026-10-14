@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Bump locked `rustls` from 0.23.45 to 0.23.46. This clears `RUSTSEC-2026-0346`,
+  `RUSTSEC-2026-0347`, `RUSTSEC-2026-0348`, and `RUSTSEC-2026-0349`.
+
 ### Fixed
 
 - Pinning `chain_id` no longer marks an upstream offline when its SHiP status

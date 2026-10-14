@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::sleep;
@@ -248,10 +249,12 @@ impl MockShipServer {
     }
 
     /// Handle a single WebSocket session according to the SHiP protocol.
-    async fn handle_session(
-        ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    async fn handle_session<S>(
+        ws_stream: tokio_tungstenite::WebSocketStream<S>,
         config: MockShipConfig,
-    ) {
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let (mut writer, mut reader) = ws_stream.split();
 
         // Step 1: Send ABI as Text frame
@@ -523,4 +526,17 @@ impl Drop for MockShipHandle {
             let _ = tx.send(());
         }
     }
+}
+
+/// Run one SHiP session on an already-upgraded WebSocket.
+///
+/// [`MockShipServer::start`] accepts plaintext TCP. Tests that terminate TLS
+/// themselves upgrade the socket, then hand the WebSocket here.
+pub async fn serve_websocket<S>(
+    config: MockShipConfig,
+    ws_stream: tokio_tungstenite::WebSocketStream<S>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    MockShipServer::handle_session(ws_stream, config).await;
 }

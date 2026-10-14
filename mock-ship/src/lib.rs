@@ -12,4 +12,4 @@ mod abi;
 mod protocol;
 mod server;
 
-pub use server::{MockShipConfig, MockShipServer, StatusFault};
+pub use server::{serve_websocket, MockShipConfig, MockShipServer, StatusFault};

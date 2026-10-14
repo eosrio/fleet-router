@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Upstream `endpoint` values may include a `ws://` or `wss://` scheme. A bare
+  `host:port` still dials plaintext `ws://`, so existing configs are unchanged.
+  `wss://` uses rustls with the `aws-lc-rs` provider (not OpenSSL) and verifies the
+  upstream certificate against the OS trust store. `SSL_CERT_FILE` and
+  `SSL_CERT_DIR` replace that store when set. Unknown schemes are rejected.
+  Endpoint uniqueness follows the dial target, so `host:port` and
+  `ws://host:port` are the same upstream. The client listener stays plaintext.
 - Optional configuration field `max_client_message_bytes`. Configs that omit it
   remain valid and use the default.
 - Parse `get_status_result_v1` and track each upstream's finality-data block
@@ -34,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Building from source now requires a C compiler and CMake. `wss://` links
+  rustls with `aws-lc-rs` (the same crypto provider as `reqwest` 0.13).
+  `rs_abieos` stays on its pure-Rust backend, and `libclang` is still not
+  required.
 - Upgrade `rs_abieos` from 0.5.0 to 0.6.0, still with default features off and
   `rust-backend` enabled.
 - Validate each upstream ABI with `AbiHandle::from_json` and drop the handle

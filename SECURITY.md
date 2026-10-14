@@ -56,10 +56,12 @@ be treated as such.**
 - **Unauthenticated listener.** The client-facing WebSocket listener performs no
   authentication or authorization. Anyone able to reach the listen address can
   open connections.
-- **Plaintext transport, no TLS.** All transport is plaintext `ws://` on **both**
-  the client listener and the upstream SHiP connections. No TLS / `wss://`
-  support is compiled in, so traffic is neither encrypted nor integrity-protected
-  in transit.
+- **Plaintext client listener.** The client-facing WebSocket listener is
+  plaintext `ws://`. TLS for clients is not terminated by fleet-router.
+- **Upstream TLS is opt-in.** A bare `host:port` (and an explicit `ws://` URL)
+  is still plaintext. `wss://` encrypts that upstream hop and verifies the
+  server certificate with rustls against the OS trust store. It does not
+  authenticate the client listener.
 - **Optional metrics endpoint is unauthenticated.** When enabled
   (`metrics_port`), the HTTP `/health`, `/ready`, and `/metrics` endpoints are
   served over plaintext HTTP with no authentication.

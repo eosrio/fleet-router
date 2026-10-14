@@ -1261,9 +1261,9 @@ dependencies = [
 
 [[package]]
 name = "rs_abieos"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5395074aa1a04cf96dc8321dd137ad3eb92afebf35fea9d187502931083a1c5"
+checksum = "1a4fb604abee4ceedfdb793b3439e9f5f1ca63fb06ac95c47be81a33854c2d0f"
 
 [[package]]
 name = "rustix"

@@ -34,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Upgrade `rs_abieos` from 0.5.0 to 0.6.0, still with default features off and
+  `rust-backend` enabled. The calls this crate makes (`Abieos::new`, `as_ptr`,
+  `from_context`, `set_abi_json`, and `set_abi_json_native`) keep their 0.5
+  signatures, so the shared context and the ABI validation on connect,
+  failover, and the upstream monitor are unchanged. 0.6's new row-decode
+  helpers and `AbiHandle` are unused: fleet-router only checks that an
+  upstream SHiP ABI parses. On the Rust backend, `set_abi*` still overwrites
+  an ABI already loaded for account `0`, which is what reconnect and failover
+  rely on.
 - Minimum supported Rust version is now 1.99.
 - The container image is built from digest-pinned `rust:1.99-trixie` and
   `debian:trixie-slim`. Its `HEALTHCHECK` runs `fleet-router check`, which

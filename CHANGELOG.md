@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-14
+
+### Changed
+
+- Reformat `README.md` configuration and route tables into bulleted definition
+  lists so the documentation renders cleanly within crates.io's 575px layout
+  without horizontal clipping or narrow multi-column wrapping.
+
 ## [0.3.0] - 2026-10-14
 
 ### Security
@@ -157,6 +165,7 @@ First public release on crates.io and GitHub.
 - Upstream handshake now skips leading control frames and retries against
   another upstream instead of dropping the client on an unexpected first frame.
 
-[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/eosrio/fleet-router/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/eosrio/fleet-router/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/eosrio/fleet-router/releases/tag/v0.2.0

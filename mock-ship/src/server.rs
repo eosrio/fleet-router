@@ -59,6 +59,11 @@ pub struct MockShipConfig {
     pub corrupt_block: Option<u32>,
     /// Counts how many times `corrupt_block` was hit (one per aborted session).
     pub corrupt_hits: Option<Arc<AtomicUsize>>,
+    /// Stop streaming when this block would be sent, and leave the socket open.
+    /// Models an upstream sitting at the chain tip with nothing new to send.
+    pub hold_at_block: Option<u32>,
+    /// Counts sessions that reached `hold_at_block` (once per session).
+    pub hold_hits: Option<Arc<AtomicUsize>>,
 }
 
 /// How the mock treats `get_status` requests. Used to exercise monitor limits.
@@ -96,6 +101,8 @@ impl Default for MockShipConfig {
             finality_data_end_block: 0,
             corrupt_block: None,
             corrupt_hits: None,
+            hold_at_block: None,
+            hold_hits: None,
         }
     }
 }
@@ -285,6 +292,7 @@ impl MockShipServer {
         let mut fetch_deltas = false;
         let mut session_status: usize = 0;
         let mut status_replies: u32 = 0;
+        let mut held = false;
 
         loop {
             // If we have credits and an active block request, send blocks
@@ -307,49 +315,62 @@ impl MockShipServer {
                             return; // abrupt drop, no Close frame (nodeos zlib error)
                         }
 
-                        // Optional delay
-                        if let Some(delay) = config.block_delay {
-                            sleep(delay).await;
+                        if config.hold_at_block == Some(block_num) {
+                            if !held {
+                                held = true;
+                                if let Some(hits) = &config.hold_hits {
+                                    hits.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            // Stay open with nothing to send. Zeroing credits
+                            // keeps a client ack from releasing the hold or
+                            // counting it again.
+                            send_credits = 0;
+                        } else {
+                            // Optional delay
+                            if let Some(delay) = config.block_delay {
+                                sleep(delay).await;
+                            }
+
+                            let block_data = if fetch_block && config.block_data_size > 0 {
+                                Some(generate_fake_data(block_num, config.block_data_size))
+                            } else {
+                                None
+                            };
+                            let traces_data = if fetch_traces && config.block_data_size > 0 {
+                                Some(generate_fake_data(
+                                    block_num.wrapping_add(1000),
+                                    config.block_data_size,
+                                ))
+                            } else {
+                                None
+                            };
+                            let deltas_data = if fetch_deltas && config.block_data_size > 0 {
+                                Some(generate_fake_data(
+                                    block_num.wrapping_add(2000),
+                                    config.block_data_size,
+                                ))
+                            } else {
+                                None
+                            };
+
+                            let result = encode_blocks_result_v0_with_data(
+                                config.head_block,
+                                config.lib_block,
+                                block_num,
+                                block_data.as_deref(),
+                                traces_data.as_deref(),
+                                deltas_data.as_deref(),
+                            );
+                            if writer.send(Message::Binary(result.into())).await.is_err() {
+                                return;
+                            }
+
+                            current_block = Some(block_num + 1);
+                            send_credits -= 1;
+                            blocks_sent += 1;
+                            continue; // Try to send more before reading
                         }
-
-                        let block_data = if fetch_block && config.block_data_size > 0 {
-                            Some(generate_fake_data(block_num, config.block_data_size))
-                        } else {
-                            None
-                        };
-                        let traces_data = if fetch_traces && config.block_data_size > 0 {
-                            Some(generate_fake_data(
-                                block_num.wrapping_add(1000),
-                                config.block_data_size,
-                            ))
-                        } else {
-                            None
-                        };
-                        let deltas_data = if fetch_deltas && config.block_data_size > 0 {
-                            Some(generate_fake_data(
-                                block_num.wrapping_add(2000),
-                                config.block_data_size,
-                            ))
-                        } else {
-                            None
-                        };
-
-                        let result = encode_blocks_result_v0_with_data(
-                            config.head_block,
-                            config.lib_block,
-                            block_num,
-                            block_data.as_deref(),
-                            traces_data.as_deref(),
-                            deltas_data.as_deref(),
-                        );
-                        if writer.send(Message::Binary(result.into())).await.is_err() {
-                            return;
-                        }
-
-                        current_block = Some(block_num + 1);
-                        send_credits -= 1;
-                        blocks_sent += 1;
-                        continue; // Try to send more before reading
                     }
                 }
             }

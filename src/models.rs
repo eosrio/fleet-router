@@ -796,6 +796,7 @@ impl ServerState {
         policy: Option<BlockFailureQuarantine>,
     ) -> bool {
         self.block_failures = self.block_failures.saturating_add(1);
+        self.prune_expired_quarantines(now);
         let Some(policy) = policy else {
             return false;
         };
@@ -816,7 +817,7 @@ impl ServerState {
         }
         self.block_strikes.retain(|strike| strike.block != block);
         self.quarantines
-            .retain(|quarantine| quarantine.active(now) && quarantine.block != block);
+            .retain(|quarantine| quarantine.block != block);
         self.quarantines.push(BlockQuarantine {
             block,
             range: policy.range,
@@ -825,24 +826,33 @@ impl ServerState {
         true
     }
 
-    /// Whether a request starting at `block` must skip this upstream.
-    pub fn quarantined_for(&self, block: u32, now: Instant) -> bool {
-        self.quarantines
-            .iter()
-            .any(|quarantine| quarantine.active(now) && quarantine.covers(block))
+    /// Drop exclusions whose TTL has passed so the list cannot grow without bound.
+    pub fn prune_expired_quarantines(&mut self, now: Instant) {
+        self.quarantines.retain(|quarantine| quarantine.active(now));
     }
 
-    pub fn any_quarantine_active(&self, now: Instant) -> bool {
+    /// Whether a request starting at `block` must skip this upstream.
+    ///
+    /// Expired exclusions are removed as part of the check.
+    pub fn quarantined_for(&mut self, block: u32, now: Instant) -> bool {
+        self.prune_expired_quarantines(now);
         self.quarantines
             .iter()
-            .any(|quarantine| quarantine.active(now))
+            .any(|quarantine| quarantine.covers(block))
+    }
+
+    pub fn any_quarantine_active(&mut self, now: Instant) -> bool {
+        self.prune_expired_quarantines(now);
+        !self.quarantines.is_empty()
     }
 
     /// Lowest start block among active exclusions, if any.
-    pub fn active_quarantine_block(&self, now: Instant) -> Option<u32> {
+    ///
+    /// Expired exclusions are removed as part of the check.
+    pub fn active_quarantine_block(&mut self, now: Instant) -> Option<u32> {
+        self.prune_expired_quarantines(now);
         self.quarantines
             .iter()
-            .filter(|quarantine| quarantine.active(now))
             .map(|quarantine| quarantine.block)
             .min()
     }
@@ -1613,5 +1623,54 @@ mod tests {
         assert!(state.quarantined_for(117, t0));
         assert!(!state.quarantined_for(118, t0));
         assert!(!state.quarantined_for(114, t0));
+    }
+
+    #[test]
+    fn expired_quarantines_are_pruned_when_read() {
+        let now = Instant::now();
+        let expired_at = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+        let mut state = ServerState::new();
+        for block in 1..=49 {
+            state.quarantines.push(BlockQuarantine {
+                block,
+                range: 1,
+                until: expired_at,
+            });
+        }
+        state.quarantines.push(BlockQuarantine {
+            block: 115,
+            range: 1,
+            until: now + Duration::from_secs(60),
+        });
+        assert_eq!(state.quarantines.len(), 50);
+
+        assert!(state.quarantined_for(115, now));
+        assert!(!state.quarantined_for(1, now));
+        assert_eq!(
+            state.quarantines.len(),
+            1,
+            "a block check must drop expired exclusions without arming a new one"
+        );
+        assert_eq!(state.quarantines[0].block, 115);
+
+        let after_ttl = now + Duration::from_secs(60);
+        assert!(!state.any_quarantine_active(after_ttl));
+        assert!(
+            state.quarantines.is_empty(),
+            "an activity check must drop an exclusion once its TTL has passed"
+        );
+        assert_eq!(state.active_quarantine_block(after_ttl), None);
+
+        let mut only_expired = ServerState::new();
+        only_expired.quarantines.push(BlockQuarantine {
+            block: 10,
+            range: 1,
+            until: expired_at,
+        });
+        assert_eq!(only_expired.active_quarantine_block(now), None);
+        assert!(
+            only_expired.quarantines.is_empty(),
+            "the metrics snapshot must drop expired exclusions"
+        );
     }
 }

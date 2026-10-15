@@ -133,7 +133,7 @@ pub fn should_reroute_for_finality(
 /// Otherwise selection is unchanged (v0 trace-range behaviour), including when
 /// no upstream has reported a covering finality range.
 pub fn select_backend_server(
-    servers: &HashMap<String, ServerState>,
+    servers: &mut HashMap<String, ServerState>,
     route: RouteRequest,
 ) -> Result<String, &'static str> {
     select_ranked(servers, route, true, None)
@@ -153,7 +153,7 @@ pub fn select_backend_server(
 /// returned when it is the only one that covers the block, or the only
 /// candidate at all.
 pub fn select_failover_server(
-    servers: &HashMap<String, ServerState>,
+    servers: &mut HashMap<String, ServerState>,
     route: RouteRequest,
     exclude: Option<&str>,
 ) -> Result<String, &'static str> {
@@ -164,7 +164,7 @@ pub fn select_failover_server(
 }
 
 fn select_ranked(
-    servers: &HashMap<String, ServerState>,
+    servers: &mut HashMap<String, ServerState>,
     route: RouteRequest,
     require_online: bool,
     exclude: Option<&str>,
@@ -181,7 +181,8 @@ fn select_ranked(
     let mut best: Option<(u8, usize, String)> = None;
     let mut best_other: Option<(u8, usize, String)> = None;
 
-    for (server, state) in servers.iter() {
+    for (server, state) in servers.iter_mut() {
+        state.prune_expired_quarantines(now);
         if !state.enabled || (require_online && !state.online) {
             continue;
         }
@@ -279,9 +280,9 @@ mod tests {
     fn new_sessions_skip_offline_upstreams() {
         let mut servers = HashMap::new();
         servers.insert("dead".into(), state(true, false, 0));
-        assert!(select_backend_server(&servers, RouteRequest::default()).is_err());
+        assert!(select_backend_server(&mut servers, RouteRequest::default()).is_err());
         assert_eq!(
-            select_failover_server(&servers, RouteRequest::default(), None).unwrap(),
+            select_failover_server(&mut servers, RouteRequest::default(), None).unwrap(),
             "dead"
         );
     }
@@ -292,11 +293,11 @@ mod tests {
         servers.insert("dead".into(), state(true, false, 0));
         servers.insert("live".into(), state(true, true, 5));
         assert_eq!(
-            select_backend_server(&servers, RouteRequest::default()).unwrap(),
+            select_backend_server(&mut servers, RouteRequest::default()).unwrap(),
             "live"
         );
         assert_eq!(
-            select_failover_server(&servers, RouteRequest::default(), None).unwrap(),
+            select_failover_server(&mut servers, RouteRequest::default(), None).unwrap(),
             "live"
         );
     }
@@ -306,8 +307,8 @@ mod tests {
         let mut servers = HashMap::new();
         servers.insert("off".into(), state(false, false, 0));
         servers.insert("also".into(), state(false, true, 0));
-        assert!(select_failover_server(&servers, RouteRequest::default(), None).is_err());
-        assert!(select_backend_server(&servers, RouteRequest::default()).is_err());
+        assert!(select_failover_server(&mut servers, RouteRequest::default(), None).is_err());
+        assert!(select_backend_server(&mut servers, RouteRequest::default()).is_err());
     }
 
     fn server(conns: usize, trace: (u32, u32), finality: (u32, u32)) -> ServerState {
@@ -376,8 +377,9 @@ mod tests {
 
     #[test]
     fn finality_request_skips_upstream_that_does_not_cover() {
+        let mut servers = fleet();
         let picked = select_backend_server(
-            &fleet(),
+            &mut servers,
             RouteRequest {
                 block: Some(100),
                 fetch_finality_data: true,
@@ -389,8 +391,9 @@ mod tests {
 
     #[test]
     fn non_finality_request_keeps_least_connections() {
+        let mut servers = fleet();
         let picked = select_backend_server(
-            &fleet(),
+            &mut servers,
             RouteRequest {
                 block: Some(100),
                 fetch_finality_data: false,
@@ -405,7 +408,7 @@ mod tests {
         let mut servers = fleet();
         servers.get_mut("a").unwrap().finality_data_end_block = 50; // does not cover 100
         let picked = select_backend_server(
-            &servers,
+            &mut servers,
             RouteRequest {
                 block: Some(100),
                 fetch_finality_data: true,
@@ -421,7 +424,7 @@ mod tests {
         servers.insert("busy".to_string(), server(4, (1, 500), (0, 0)));
         servers.insert("idle".to_string(), server(0, (1, 500), (0, 0)));
         let picked = select_backend_server(
-            &servers,
+            &mut servers,
             RouteRequest {
                 block: Some(10),
                 fetch_finality_data: true,
@@ -448,7 +451,7 @@ mod tests {
         servers.get_mut("a").unwrap().online = false;
         assert!(!should_reroute_for_finality(&servers, "b", 100));
         let err = select_backend_server(
-            &servers,
+            &mut servers,
             RouteRequest {
                 block: Some(100),
                 fetch_finality_data: true,
@@ -472,7 +475,7 @@ mod tests {
         // least-connections would pick it again.
         servers.insert("failed".to_string(), server(0, (1, 500), (0, 0)));
         servers.insert("other".to_string(), server(4, (1, 500), (0, 0)));
-        let picked = select_failover_server(&servers, route_at(100), Some("failed")).unwrap();
+        let picked = select_failover_server(&mut servers, route_at(100), Some("failed")).unwrap();
         assert_eq!(picked, "other");
     }
 
@@ -481,7 +484,7 @@ mod tests {
         let mut servers = HashMap::new();
         servers.insert("failed".to_string(), server(1, (1, 500), (0, 0)));
         servers.insert("short".to_string(), server(0, (1, 50), (0, 0)));
-        let picked = select_failover_server(&servers, route_at(100), Some("failed")).unwrap();
+        let picked = select_failover_server(&mut servers, route_at(100), Some("failed")).unwrap();
         assert_eq!(picked, "failed");
     }
 
@@ -489,7 +492,7 @@ mod tests {
     fn retry_of_the_only_upstream_still_selects_it() {
         let mut servers = HashMap::new();
         servers.insert("only".to_string(), server(1, (1, 500), (0, 0)));
-        let picked = select_failover_server(&servers, route_at(100), Some("only")).unwrap();
+        let picked = select_failover_server(&mut servers, route_at(100), Some("only")).unwrap();
         assert_eq!(picked, "only");
     }
 
@@ -511,16 +514,16 @@ mod tests {
         servers.insert("good".to_string(), server(5, (1, 500), (0, 0)));
 
         assert_eq!(
-            select_backend_server(&servers, route_at(115)).unwrap(),
+            select_backend_server(&mut servers, route_at(115)).unwrap(),
             "good"
         );
         assert_eq!(
-            select_backend_server(&servers, route_at(100)).unwrap(),
+            select_backend_server(&mut servers, route_at(100)).unwrap(),
             "bad",
             "a quarantine at 115 must not affect a request starting at 100"
         );
         assert_eq!(
-            select_backend_server(&servers, RouteRequest::default()).unwrap(),
+            select_backend_server(&mut servers, RouteRequest::default()).unwrap(),
             "bad",
             "initial connect has no block and must ignore range quarantine"
         );
@@ -544,7 +547,7 @@ mod tests {
         servers.insert("bad".to_string(), bad);
         servers.insert("good".to_string(), server(3, (1, 500), (0, 0)));
         assert_eq!(
-            select_backend_server(&servers, route_at(115)).unwrap(),
+            select_backend_server(&mut servers, route_at(115)).unwrap(),
             "bad"
         );
     }
@@ -563,10 +566,10 @@ mod tests {
             until: Instant::now() + Duration::from_secs(60),
         });
         servers.insert("only".to_string(), only);
-        assert!(select_backend_server(&servers, route_at(116)).is_err());
-        assert!(select_failover_server(&servers, route_at(116), Some("only")).is_err());
+        assert!(select_backend_server(&mut servers, route_at(116)).is_err());
+        assert!(select_failover_server(&mut servers, route_at(116), Some("only")).is_err());
         assert_eq!(
-            select_backend_server(&servers, route_at(117)).unwrap(),
+            select_backend_server(&mut servers, route_at(117)).unwrap(),
             "only"
         );
     }

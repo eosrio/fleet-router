@@ -60,12 +60,68 @@ fn next_block_after(last_seen: Option<u32>, request: Option<&[u8]>) -> Option<u3
         .map(|parsed| parsed.start_block_num)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UpstreamStop {
     Idle,
     /// TCP dropped, or the websocket ended without a Close frame.
     Unclean,
     /// Upstream sent a WebSocket Close frame.
     Clean,
+}
+
+struct SameBlockPlan {
+    /// Set when the unclean-drop budget at this block is exhausted.
+    close_reason: Option<String>,
+    delay: Duration,
+    /// Prefer an upstream other than the one that just failed.
+    exclude_failed: bool,
+    failures: u32,
+}
+
+/// Decide the next failover step.
+///
+/// Only an unclean drop consumes the per-block budget. An idle timeout or a
+/// clean close still fails over, with the historical 100 ms pause, and does
+/// not move `stuck_at`. A client following the chain tip waits at head+1;
+/// those waits must not close the session with 1011.
+fn plan_same_block_failover(
+    stuck_at: &mut Option<(u32, u32)>,
+    stop: Option<UpstreamStop>,
+    rerouted: bool,
+    next_block: Option<u32>,
+) -> SameBlockPlan {
+    let passthrough = SameBlockPlan {
+        close_reason: None,
+        delay: Duration::from_millis(100),
+        exclude_failed: false,
+        failures: 0,
+    };
+    if rerouted || !matches!(stop, Some(UpstreamStop::Unclean)) {
+        return passthrough;
+    }
+    let Some(block) = next_block else {
+        return passthrough;
+    };
+    let failures = match *stuck_at {
+        Some((stuck_block, seen)) if stuck_block == block => seen.saturating_add(1),
+        _ => 1,
+    };
+    *stuck_at = Some((block, failures));
+    if failures >= MAX_SAME_BLOCK_FAILURES {
+        SameBlockPlan {
+            close_reason: Some(block_unavailable_reason(block)),
+            delay: Duration::from_millis(100),
+            exclude_failed: false,
+            failures,
+        }
+    } else {
+        SameBlockPlan {
+            close_reason: None,
+            delay: same_block_backoff(failures),
+            exclude_failed: true,
+            failures,
+        }
+    }
 }
 
 /// Client frames held during a failover window, accounted in bytes.
@@ -212,11 +268,11 @@ async fn establish_upstream(
         // The guard decrements on drop, including when this attempt is cancelled
         // (for example because the client session is closing).
         let (cfg, guard) = {
-            let state = backend_servers.lock().await;
+            let mut state = backend_servers.lock().await;
             let selected = match if failover {
-                select_failover_server(&state, route, exclude)
+                select_failover_server(&mut state, route, exclude)
             } else {
-                select_backend_server(&state, route)
+                select_backend_server(&mut state, route)
             } {
                 Ok(ep) => ep,
                 Err(_) => continue,
@@ -423,8 +479,8 @@ pub async fn handle_client(
                         let start = parsed.start_block_num;
                         // Quarantine is opt-in. Skip the state lock on the common path.
                         let quarantined = quarantine.is_some() && {
-                            let db = backend_servers.lock().await;
-                            db.get(&endpoint)
+                            let mut db = backend_servers.lock().await;
+                            db.get_mut(&endpoint)
                                 .is_some_and(|state| state.quarantined_for(start, Instant::now()))
                         };
                         let reroute_finality = parsed.fetch_finality_data && {
@@ -625,57 +681,52 @@ pub async fn handle_client(
             let lr = last_request.lock().await;
             next_block_after(last_seen_block, lr.as_deref())
         };
-        // A strike is an unclean drop while a blocks request is in flight.
-        // Clean closes, idle timeouts, client disconnects, and finality
-        // reroutes do not count. Quarantine stays off unless configured.
-        if !rerouted && matches!(upstream_stop, Some(UpstreamStop::Unclean)) {
+        // Strikes and the per-block budget count only an unclean drop. An idle
+        // timeout or a clean close still fails over, but a session waiting at
+        // the chain tip must not be closed with 1011.
+        let budget = plan_same_block_failover(&mut stuck_at, upstream_stop, rerouted, next_block);
+        if budget.failures > 0 {
             if let Some(block) = next_block {
                 note_block_failure(&backend_servers, &failed_endpoint, block, quarantine).await;
             }
         }
-
-        let mut exclude: Option<&str> = None;
-        let mut retry_delay = Duration::from_millis(100);
-        if !rerouted {
+        if let Some(reason) = budget.close_reason {
             if let Some(block) = next_block {
-                let failures = match stuck_at {
-                    Some((stuck_block, seen)) if stuck_block == block => seen.saturating_add(1),
-                    _ => 1,
-                };
-                stuck_at = Some((block, failures));
-                if failures >= MAX_SAME_BLOCK_FAILURES {
-                    let reason = block_unavailable_reason(block);
-                    tracing::error!(
-                        upstream = %failed_endpoint,
-                        block,
-                        attempts = failures,
-                        "block {block} unavailable on all upstreams"
-                    );
-                    let _ = cw_guard
-                        .send(Message::Close(Some(CloseFrame {
-                            code: CloseCode::Error,
-                            reason: reason.into(),
-                        })))
-                        .await;
-                    break 'session;
-                }
-                retry_delay = same_block_backoff(failures);
-                exclude = Some(failed_endpoint.as_str());
+                tracing::error!(
+                    upstream = %failed_endpoint,
+                    block,
+                    attempts = budget.failures,
+                    "block {block} unavailable on all upstreams"
+                );
+            }
+            let _ = cw_guard
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Error,
+                    reason: reason.into(),
+                })))
+                .await;
+            break 'session;
+        }
+
+        let exclude = budget.exclude_failed.then_some(failed_endpoint.as_str());
+        let retry_delay = budget.delay;
+        if rerouted {
+            tracing::info!("selecting an upstream whose finality range covers the request");
+        } else if budget.failures > 0 {
+            if let Some(block) = next_block {
                 tracing::warn!(
                     upstream = %failed_endpoint,
                     block,
-                    attempt = failures,
+                    attempt = budget.failures,
                     max = MAX_SAME_BLOCK_FAILURES,
-                    "upstream stream ended; attempting failover"
-                );
-            } else {
-                tracing::warn!(
-                    upstream = %failed_endpoint,
                     "upstream stream ended; attempting failover"
                 );
             }
         } else {
-            tracing::info!("selecting an upstream whose finality range covers the request");
+            tracing::warn!(
+                upstream = %failed_endpoint,
+                "upstream stream ended; attempting failover"
+            );
         }
 
         let route = {
@@ -903,6 +954,52 @@ mod tests {
             block_unavailable_reason(115),
             "block 115 unavailable on all upstreams"
         );
+    }
+
+    #[test]
+    fn idle_and_clean_stops_at_the_tip_do_not_exhaust_the_block_budget() {
+        let tip = Some(115u32);
+        for stop in [UpstreamStop::Idle, UpstreamStop::Clean] {
+            let mut stuck_at = None;
+            for _ in 0..8 {
+                let plan = plan_same_block_failover(&mut stuck_at, Some(stop), false, tip);
+                assert!(
+                    plan.close_reason.is_none(),
+                    "{stop:?} must not close with 1011"
+                );
+                assert_eq!(plan.delay, Duration::from_millis(100));
+                assert!(!plan.exclude_failed);
+                assert_eq!(plan.failures, 0);
+            }
+            assert!(
+                stuck_at.is_none(),
+                "{stop:?} must not count toward the same-block budget"
+            );
+        }
+    }
+
+    #[test]
+    fn unclean_drops_at_the_same_block_still_close_after_five() {
+        let mut stuck_at = None;
+        for expected in 1..MAX_SAME_BLOCK_FAILURES {
+            let plan = plan_same_block_failover(
+                &mut stuck_at,
+                Some(UpstreamStop::Unclean),
+                false,
+                Some(115),
+            );
+            assert!(plan.close_reason.is_none());
+            assert!(plan.exclude_failed);
+            assert_eq!(plan.failures, expected);
+            assert_eq!(plan.delay, same_block_backoff(expected));
+        }
+        let plan =
+            plan_same_block_failover(&mut stuck_at, Some(UpstreamStop::Unclean), false, Some(115));
+        assert_eq!(
+            plan.close_reason.as_deref(),
+            Some("block 115 unavailable on all upstreams")
+        );
+        assert_eq!(plan.failures, MAX_SAME_BLOCK_FAILURES);
     }
 
     #[test]

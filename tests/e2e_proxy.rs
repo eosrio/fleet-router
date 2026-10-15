@@ -30,7 +30,7 @@ struct FleetRouterProcess {
 impl FleetRouterProcess {
     /// Start fleet-router with a generated config pointing to the given upstream endpoints.
     async fn start(upstream_endpoints: &[String], status_ms: u64) -> Self {
-        Self::launch(upstream_endpoints, status_ms, 1000, None, None).await
+        Self::launch(upstream_endpoints, status_ms, 1000, None, None, None).await
     }
 
     /// Start fleet-router and also bind the HTTP metrics endpoint.
@@ -48,6 +48,7 @@ impl FleetRouterProcess {
             status_ms,
             reconnect_ms,
             Some(metrics_port),
+            None,
             None,
         )
         .await;
@@ -70,9 +71,27 @@ impl FleetRouterProcess {
             500,
             Some(metrics_port),
             Some(quarantine),
+            None,
         )
         .await;
         (router, metrics_port)
+    }
+
+    /// Start fleet-router with an idle timeout on both directions.
+    async fn start_with_idle(
+        upstream_endpoints: &[String],
+        status_ms: u64,
+        idle_timeout_ms: u64,
+    ) -> Self {
+        Self::launch(
+            upstream_endpoints,
+            status_ms,
+            1000,
+            None,
+            None,
+            Some(idle_timeout_ms),
+        )
+        .await
     }
 
     async fn launch(
@@ -81,6 +100,7 @@ impl FleetRouterProcess {
         reconnect_ms: u64,
         metrics_port: Option<u16>,
         quarantine: Option<serde_json::Value>,
+        idle_timeout_ms: Option<u64>,
     ) -> Self {
         // Find a free port for fleet-router to listen on
         let listen_port = {
@@ -111,6 +131,9 @@ impl FleetRouterProcess {
         });
         if let Some(policy) = quarantine {
             config["block_failure_quarantine"] = policy;
+        }
+        if let Some(idle) = idle_timeout_ms {
+            config["idle_timeout_ms"] = serde_json::json!(idle);
         }
         if let Some(port) = metrics_port {
             config["metrics_address"] = serde_json::json!("127.0.0.1");
@@ -1667,6 +1690,81 @@ async fn e2e_proxy_corrupt_block_only_upstream_is_bounded() {
 
     drop(router);
     hb.shutdown().await;
+}
+
+/// A session waiting at the chain tip (head+1) with `idle_timeout_ms` set must
+/// keep failing over. Those idle timeouts are not unclean drops, so they must
+/// not exhaust the same-block budget or close the client with 1011.
+#[tokio::test]
+async fn e2e_proxy_idle_timeout_at_the_tip_does_not_close_1011() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mock = MockShipServer::new(MockShipConfig {
+        head_block: 1000,
+        lib_block: 990,
+        blocks_to_stream: 0,
+        hold_at_block: Some(115),
+        hold_hits: Some(hits.clone()),
+        ..Default::default()
+    })
+    .await;
+    let ep = mock.endpoint();
+    let handle = mock.start();
+    let router = FleetRouterProcess::start_with_idle(&[ep], 1000, 200).await;
+    sleep(Duration::from_secs(2)).await;
+
+    let (mut w, mut r) = ws_connect(&router.ws_url()).await;
+    let _ = read_one(&mut r).await;
+    w.send(Message::Binary(build_blocks_request(100, 200, 1000).into()))
+        .await
+        .unwrap();
+
+    // Binary acks keep the client side of the shared idle timer alive. A
+    // WebSocket ping would be answered by the mock and reset the upstream timer.
+    let writer = Arc::new(tokio::sync::Mutex::new(w));
+    let keepalive = {
+        let writer = writer.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_millis(40)).await;
+                let mut w = writer.lock().await;
+                if w.send(Message::Binary(build_ack_request(1).into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    };
+
+    let (blocks, closed) = read_this_blocks(&mut r, 100, Duration::from_secs(6)).await;
+    keepalive.abort();
+    let n = hits.load(std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "  delivered up to {:?}, closed={closed:?}, hold hits={n}",
+        blocks.last()
+    );
+    assert!(
+        blocks.contains(&114),
+        "session should reach the block before the tip, got {blocks:?}"
+    );
+    assert!(
+        !blocks.contains(&115),
+        "the upstream is holding at the tip, got {blocks:?}"
+    );
+    assert!(
+        closed.is_none(),
+        "idle waits at the tip must not close the client, closed={closed:?}, holds={n}"
+    );
+    assert!(
+        n > 5,
+        "expected more than five idle failovers at block 115, holds={n}"
+    );
+
+    drop(writer);
+    drop(r);
+    drop(router);
+    handle.shutdown().await;
 }
 
 /// With quarantine armed after one strike, a later session that asks for the

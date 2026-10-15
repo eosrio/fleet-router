@@ -257,8 +257,8 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
     let now = Instant::now();
     let mut snapshots = Vec::new();
     for l in listeners {
-        let db = l.state_db.lock().await;
-        for (endpoint, state) in db.iter() {
+        let mut db = l.state_db.lock().await;
+        for (endpoint, state) in db.iter_mut() {
             snapshots.push(MetricSnapshot {
                 labels: format_labels(l.name.as_deref(), endpoint, &state.name),
                 online: state.online,
@@ -806,6 +806,19 @@ mod tests {
             state_db: db,
         }];
         let metrics = render_metrics(&listeners).await;
+        {
+            let guard = listeners[0].state_db.lock().await;
+            let bad = guard.get("127.0.0.1:18080").unwrap();
+            assert_eq!(
+                bad.quarantines.len(),
+                2,
+                "rendering metrics must drop the expired exclusion"
+            );
+            assert!(bad
+                .quarantines
+                .iter()
+                .all(|quarantine| quarantine.block != 10));
+        }
         let bad = "listener=\"eos\",endpoint=\"127.0.0.1:18080\",server=\"bad\"";
         let good = "listener=\"eos\",endpoint=\"127.0.0.1:18081\",server=\"good\"";
         assert!(metrics.contains(&format!(

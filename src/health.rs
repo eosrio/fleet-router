@@ -243,6 +243,8 @@ struct MetricSnapshot {
     online: bool,
     stale: bool,
     connections: usize,
+    trace_begin_block: u32,
+    chain_state_begin_block: u32,
     chain_state_end_block: u32,
     finality_data_begin_block: u32,
     finality_data_end_block: u32,
@@ -258,6 +260,8 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
                 online: state.online,
                 stale: state.stale,
                 connections: state.connections.load(Ordering::Relaxed),
+                trace_begin_block: state.trace_begin_block,
+                chain_state_begin_block: state.chain_state_begin_block,
                 chain_state_end_block: state.chain_state_end_block,
                 finality_data_begin_block: state.finality_data_begin_block,
                 finality_data_end_block: state.finality_data_end_block,
@@ -304,6 +308,24 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
         ));
     }
 
+    out.push_str("# HELP fleet_router_upstream_trace_begin_block First block with trace data reported by an upstream (0 until a status result arrives).\n");
+    out.push_str("# TYPE fleet_router_upstream_trace_begin_block gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_trace_begin_block{{{}}} {}\n",
+            s.labels, s.trace_begin_block
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_chain_state_begin_block First block with chain-state data reported by an upstream (0 until a status result arrives).\n");
+    out.push_str("# TYPE fleet_router_upstream_chain_state_begin_block gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_chain_state_begin_block{{{}}} {}\n",
+            s.labels, s.chain_state_begin_block
+        ));
+    }
+
     out.push_str("# HELP fleet_router_upstream_chain_state_end_block Last chain-state block reported by an upstream.\n");
     out.push_str("# TYPE fleet_router_upstream_chain_state_end_block gauge\n");
     for s in &snapshots {
@@ -313,7 +335,7 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
         ));
     }
 
-    out.push_str("# HELP fleet_router_upstream_finality_data_begin_block First block with finality data reported by an upstream (0 if unknown).\n");
+    out.push_str("# HELP fleet_router_upstream_finality_data_begin_block First block with finality data reported by an upstream (0 if unknown, including pre-Savanna nodes that only report get_status_result_v0).\n");
     out.push_str("# TYPE fleet_router_upstream_finality_data_begin_block gauge\n");
     for s in &snapshots {
         out.push_str(&format!(
@@ -560,5 +582,144 @@ mod tests {
 
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {resp}");
         assert!(resp.contains("ready (eos): 1 upstream(s) online\n"));
+    }
+
+    fn assert_gauge(metrics: &str, name: &str, endpoint: &str, value: u32, listener: Option<&str>) {
+        let line = metrics
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!("{name}{{"))
+                    && line.contains(&format!("endpoint=\"{endpoint}\""))
+            })
+            .unwrap_or_else(|| panic!("missing {name} for endpoint {endpoint} in:\n{metrics}"));
+        assert!(
+            line.ends_with(&format!(" {value}")),
+            "{name} for {endpoint}: expected {value}, got {line}"
+        );
+        match listener {
+            Some(listener_name) => assert!(
+                line.contains(&format!("listener=\"{listener_name}\"")),
+                "missing listener label on {line}"
+            ),
+            None => assert!(
+                !line.contains("listener="),
+                "single-port series must not carry a listener label: {line}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_expose_ship_begin_blocks_including_zero() {
+        let legacy = build_state_db(vec![Server {
+            name: "s1".to_string(),
+            endpoint: "127.0.0.1:18080".to_string(),
+            enabled: true,
+        }]);
+        let named = build_state_db(vec![Server {
+            name: "wax-1".to_string(),
+            endpoint: "127.0.0.1:28080".to_string(),
+            enabled: true,
+        }]);
+        {
+            let mut db = legacy.lock().await;
+            let state = db.get_mut("127.0.0.1:18080").unwrap();
+            state.trace_begin_block = 100;
+            state.chain_state_begin_block = 50;
+            state.chain_state_end_block = 900;
+            state.finality_data_begin_block = 400;
+            state.finality_data_end_block = 900;
+        }
+
+        let listeners = vec![
+            ListenerHealthState {
+                name: None,
+                state_db: legacy,
+            },
+            ListenerHealthState {
+                name: Some("wax".to_string()),
+                state_db: named,
+            },
+        ];
+        let metrics = render_metrics(&listeners).await;
+
+        assert!(metrics.contains(
+            "# HELP fleet_router_upstream_trace_begin_block First block with trace data reported by an upstream (0 until a status result arrives).\n"
+        ));
+        assert!(metrics.contains("# TYPE fleet_router_upstream_trace_begin_block gauge\n"));
+        assert!(metrics.contains(
+            "# HELP fleet_router_upstream_chain_state_begin_block First block with chain-state data reported by an upstream (0 until a status result arrives).\n"
+        ));
+        assert!(metrics.contains("# TYPE fleet_router_upstream_chain_state_begin_block gauge\n"));
+        assert!(metrics.contains(
+            "# HELP fleet_router_upstream_finality_data_begin_block First block with finality data reported by an upstream (0 if unknown, including pre-Savanna nodes that only report get_status_result_v0).\n"
+        ));
+        assert!(metrics.contains("# TYPE fleet_router_upstream_finality_data_begin_block gauge\n"));
+
+        for name in [
+            "fleet_router_upstream_trace_begin_block",
+            "fleet_router_upstream_chain_state_begin_block",
+            "fleet_router_upstream_finality_data_begin_block",
+        ] {
+            assert_eq!(
+                metrics
+                    .lines()
+                    .filter(|line| line.starts_with(&format!("{name}{{")))
+                    .count(),
+                2,
+                "{name} must be emitted for every upstream, including 0"
+            );
+        }
+
+        assert_gauge(
+            &metrics,
+            "fleet_router_upstream_trace_begin_block",
+            "127.0.0.1:18080",
+            100,
+            None,
+        );
+        assert_gauge(
+            &metrics,
+            "fleet_router_upstream_chain_state_begin_block",
+            "127.0.0.1:18080",
+            50,
+            None,
+        );
+        assert_gauge(
+            &metrics,
+            "fleet_router_upstream_chain_state_end_block",
+            "127.0.0.1:18080",
+            900,
+            None,
+        );
+        assert_gauge(
+            &metrics,
+            "fleet_router_upstream_finality_data_begin_block",
+            "127.0.0.1:18080",
+            400,
+            None,
+        );
+        // Unreported ranges stay 0 and are still exported. Finality stays 0
+        // for pre-Savanna nodes that never send get_status_result_v1.
+        assert_gauge(
+            &metrics,
+            "fleet_router_upstream_trace_begin_block",
+            "127.0.0.1:28080",
+            0,
+            Some("wax"),
+        );
+        assert_gauge(
+            &metrics,
+            "fleet_router_upstream_chain_state_begin_block",
+            "127.0.0.1:28080",
+            0,
+            Some("wax"),
+        );
+        assert_gauge(
+            &metrics,
+            "fleet_router_upstream_finality_data_begin_block",
+            "127.0.0.1:28080",
+            0,
+            Some("wax"),
+        );
     }
 }

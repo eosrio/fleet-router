@@ -274,12 +274,16 @@ fleet_router_up
 fleet_router_upstream_up{endpoint,server}
 fleet_router_upstream_stale{endpoint,server}
 fleet_router_active_connections{endpoint,server}
+fleet_router_upstream_trace_begin_block{endpoint,server}
+fleet_router_upstream_chain_state_begin_block{endpoint,server}
 fleet_router_upstream_chain_state_end_block{endpoint,server}
 fleet_router_upstream_finality_data_begin_block{endpoint,server}
 fleet_router_upstream_finality_data_end_block{endpoint,server}
 ```
 
-`fleet_router_up` is a process gauge and has no labels. `endpoint` and `listener` are unchanged. Label values escape `\`, `"`, and newlines per the Prometheus text format.
+`fleet_router_up` is a process gauge and has no labels. Label values escape `\`, `"`, and newlines per the Prometheus text format.
+
+`trace_begin_block`, `chain_state_begin_block`, and `finality_data_begin_block` are the first block of each SHiP range on that upstream. The gauges are always emitted. `0` is the value before a status result arrives. `finality_data_begin_block` (and `finality_data_end_block`) stay `0` on pre-Savanna nodes that only answer `get_status_result_v0` and never report a finality range.
 
 ## Running in production
 

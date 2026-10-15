@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single-listener mode or on each listener. Set it to restore the previous
   reject-when-missing behaviour. It is rejected by config validation unless
   `chain_id` is set on that same scope.
+- `/metrics` exposes each upstream's SHiP range start as
+  `fleet_router_upstream_trace_begin_block` and
+  `fleet_router_upstream_chain_state_begin_block`, beside the existing
+  chain-state end and finality block gauges. `finality_data_begin_block` was
+  already exported. These gauges are always present. `0` means a status result
+  has not arrived yet; `finality_data_begin_block` also stays `0` on
+  pre-Savanna nodes that only report `get_status_result_v0`.
+  Requested by @eosusa (EOSUSA).
 
 ## [0.3.1] - 2026-10-14
 

@@ -9,7 +9,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -248,9 +248,13 @@ struct MetricSnapshot {
     chain_state_end_block: u32,
     finality_data_begin_block: u32,
     finality_data_end_block: u32,
+    block_failures: u64,
+    quarantined: bool,
+    quarantine_block: u32,
 }
 
 async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
+    let now = Instant::now();
     let mut snapshots = Vec::new();
     for l in listeners {
         let db = l.state_db.lock().await;
@@ -265,6 +269,9 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
                 chain_state_end_block: state.chain_state_end_block,
                 finality_data_begin_block: state.finality_data_begin_block,
                 finality_data_end_block: state.finality_data_end_block,
+                block_failures: state.block_failures,
+                quarantined: state.any_quarantine_active(now),
+                quarantine_block: state.active_quarantine_block(now).unwrap_or(0),
             });
         }
     }
@@ -350,6 +357,34 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
         out.push_str(&format!(
             "fleet_router_upstream_finality_data_end_block{{{}}} {}\n",
             s.labels, s.finality_data_end_block
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_block_failures_total Unclean mid-get_blocks drops observed for an upstream.\n");
+    out.push_str("# TYPE fleet_router_upstream_block_failures_total counter\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_block_failures_total{{{}}} {}\n",
+            s.labels, s.block_failures
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_quarantined Whether an upstream is excluded for a block range (1) or not (0). The upstream stays online.\n");
+    out.push_str("# TYPE fleet_router_upstream_quarantined gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_quarantined{{{}}} {}\n",
+            s.labels,
+            u8::from(s.quarantined)
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_quarantine_block Start block of an upstream's active quarantine (0 when none). When several ranges are active, this is the lowest start block.\n");
+    out.push_str("# TYPE fleet_router_upstream_quarantine_block gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_quarantine_block{{{}}} {}\n",
+            s.labels, s.quarantine_block
         ));
     }
 
@@ -721,5 +756,76 @@ mod tests {
             0,
             Some("wax"),
         );
+    }
+
+    #[tokio::test]
+    async fn block_failure_metrics_use_upstream_labels_without_a_block_label() {
+        use std::time::Duration;
+
+        use crate::models::BlockQuarantine;
+
+        let db = build_state_db(vec![
+            Server {
+                name: "bad".to_string(),
+                endpoint: "127.0.0.1:18080".to_string(),
+                enabled: true,
+            },
+            Server {
+                name: "good".to_string(),
+                endpoint: "127.0.0.1:18081".to_string(),
+                enabled: true,
+            },
+        ]);
+        {
+            let mut guard = db.lock().await;
+            let bad = guard.get_mut("127.0.0.1:18080").unwrap();
+            bad.online = true;
+            bad.block_failures = 3;
+            bad.quarantines.push(BlockQuarantine {
+                block: 200,
+                range: 1,
+                until: Instant::now() + Duration::from_secs(60),
+            });
+            bad.quarantines.push(BlockQuarantine {
+                block: 115,
+                range: 1,
+                until: Instant::now() + Duration::from_secs(60),
+            });
+            // Expired exclusion must not keep the gauge up or hide block 115.
+            bad.quarantines.push(BlockQuarantine {
+                block: 10,
+                range: 1,
+                until: Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now),
+            });
+            guard.get_mut("127.0.0.1:18081").unwrap().online = true;
+        }
+        let listeners = vec![ListenerHealthState {
+            name: Some("eos".to_string()),
+            state_db: db,
+        }];
+        let metrics = render_metrics(&listeners).await;
+        let bad = "listener=\"eos\",endpoint=\"127.0.0.1:18080\",server=\"bad\"";
+        let good = "listener=\"eos\",endpoint=\"127.0.0.1:18081\",server=\"good\"";
+        assert!(metrics.contains(&format!(
+            "fleet_router_upstream_block_failures_total{{{bad}}} 3\n"
+        )));
+        assert!(metrics.contains(&format!(
+            "fleet_router_upstream_block_failures_total{{{good}}} 0\n"
+        )));
+        assert!(
+            metrics.contains(&format!("fleet_router_upstream_quarantined{{{bad}}} 1\n")),
+            "quarantine gauge must not carry a block label:\n{metrics}"
+        );
+        assert!(metrics.contains(&format!("fleet_router_upstream_quarantined{{{good}}} 0\n")));
+        assert!(metrics.contains(&format!(
+            "fleet_router_upstream_quarantine_block{{{bad}}} 115\n"
+        )));
+        assert!(metrics.contains(&format!(
+            "fleet_router_upstream_quarantine_block{{{good}}} 0\n"
+        )));
+        assert!(!metrics.contains("block=\"115\""));
+        assert!(metrics.contains("fleet_router_upstream_up{"));
     }
 }

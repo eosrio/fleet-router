@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A mid-stream failover that keeps dying at the same next block is now bounded.
+  The session prefers a different suitable upstream, waits 100 ms and then
+  doubles that pause up to 3.2 s, and stops after five failures. The client
+  receives WebSocket close code 1011 with reason
+  `block K unavailable on all upstreams` instead of a silent stall, and one
+  error names the upstream and the block. Reported by @eosusa (EOSUSA).
+
+### Added
+
+- Opt-in `block_failure_quarantine` (`strikes`, `window_secs`, `ttl_secs`,
+  `range`), at the top level in single-listener mode or on each listener.
+  After the configured number of unclean mid-`get_blocks` drops at the same
+  block, within the window and from any session, that upstream is skipped for
+  `K..K+range` for the TTL. It is not marked offline. Defaults are 2 strikes,
+  a 300 s window, a 600 s TTL, and a range of 1 block.
+- `/metrics` exposes `fleet_router_upstream_block_failures_total`,
+  `fleet_router_upstream_quarantined`, and
+  `fleet_router_upstream_quarantine_block` (the quarantined block is the gauge
+  value, not a label). Requested by @eosusa (EOSUSA).
+
 ## [0.4.0] - 2026-10-14
 
 ### Security

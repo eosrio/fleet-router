@@ -220,6 +220,7 @@ async fn main() -> Result<()> {
                                     s_state_db,
                                     s_config_db,
                                     limits,
+                                    listener_cfg.block_failure_quarantine,
                                     shutdown_rx,
                                 )
                                 .await;

@@ -15,7 +15,8 @@ It is written in Rust on [tokio](https://tokio.rs/) and [tokio-tungstenite](http
 ## Features
 
 - **Range-aware, least-connections load balancing** — prefers an upstream whose trace range covers the requested block; otherwise routes to the least-loaded healthy upstream. A `get_blocks_request_v1` with `fetch_finality_data` is sent only to an upstream whose finality-data range covers that block (learned from `get_status_result_v1`). If no upstream reports a covering range, routing stays on the trace-range rules.
-- **Automatic failover with de-duplication** — on upstream loss, reconnects to another suitable node, resumes `get_blocks` at the next block, de-duplicates replayed blocks, and buffers/replays client frames sent during the swap.
+- **Automatic failover with de-duplication** — on upstream loss, reconnects to another suitable node, resumes `get_blocks` at the next block, de-duplicates replayed blocks, and buffers/replays client frames sent during the swap. A session that keeps dying at the same next block backs off and is closed with WebSocket code 1011 after five failures.
+- **Opt-in block quarantine** — `block_failure_quarantine` can skip an upstream for a short block range after repeated unclean drops at that block, without marking the node offline.
 - **Stale-upstream deprioritization** — upstreams that stop advancing their chain state are flagged stale and deprioritized (not hard-excluded) when routing.
 - **Multiple networks in one process** — `listeners` mode serves several chains, each on its own port with its own upstream pool, `chain_id`, connection cap, and `/ready/<name>` check.
 - **`chain_id` verification** — upstreams reporting a different `chain_id` from the pinned value or the rest of their pool are kept offline. Older nodes that omit `chain_id` (FIO and other EOSIO 2.0-based builds) stay usable unless `require_chain_id` is set.
@@ -126,6 +127,11 @@ Configuration is a single JSON file (`config.json` by default). The three `*_ms`
 - **`servers`** *(array, required in single-port mode, `≥ 1` enabled)* — List of upstream SHiP nodes (see below). Mutually exclusive with `listeners`.
 - **`chain_id`** *(string, optional)* — 64-character hex `chain_id` in single-port mode; upstreams reporting a different `chain_id` are rejected and kept offline. A status that omits `chain_id` stays online unless `require_chain_id` is set: on `get_status_result_v0` that field is an optional extension, and older nodeos builds (FIO mainnet/testnet and other EOSIO 2.0-based nodes) never send it. Even when unset, any upstream whose reported `chain_id` mismatches the rest of its pool is automatically rejected.
 - **`require_chain_id`** *(bool, optional, default `false`)* — Reject and keep offline any upstream whose status omits `chain_id`. Requires `chain_id`. The default accepts that status and logs one warning per upstream that `chain_id` cannot be verified (the warning is cleared if a later status reports a `chain_id`, then logged again on the next omission). Cannot be combined with `listeners`; set it on each listener instead.
+- **`block_failure_quarantine`** *(object, optional, off when omitted)* — After repeated unclean mid-`get_blocks` drops at the same block, skip that upstream for a short range. It stays online for every other block. Cannot be combined with `listeners`; set it on each listener instead. See [Corrupted SHiP logs](#corrupted-ship-logs).
+  - **`strikes`** *(u32, default `2`, `> 0`)* — Unclean drops at one block, from any session, before the exclusion.
+  - **`window_secs`** *(u64, default `300`, `> 0`)* — How long a strike counts toward `strikes`.
+  - **`ttl_secs`** *(u64, default `600`, `> 0`)* — How long the exclusion lasts.
+  - **`range`** *(u32, default `1`, `> 0`)* — Blocks skipped starting at the failed block K (`K..K+range`). `1` skips only K.
 - **`listeners`** *(array, required in multi-listener mode, `≥ 1` entry)* — Named ingress listeners mapping distinct ports to isolated SHiP pools (see [Multi-network / multi-port routing](#multi-network--multi-port-routing)).
 - **`max_connections`** *(usize, optional, default `10000`)* — Max concurrent client connections; excess are rejected (backpressure). Acts as the default per-listener cap when `listeners` is used.
 - **`handshake_timeout_ms`** *(u64, optional, default `10000`)* — Client WebSocket handshake timeout; `0` disables it. The upstream monitor and `config test` use this same bound for connect and the first read, falling back to 10s when it is `0`.
@@ -182,6 +188,7 @@ To expose multiple ingress ports for different chains (each backed by its own re
    - **`max_connections`** *(usize, optional)* — Per-listener concurrent client cap; defaults to top-level `max_connections`.
    - **`chain_id`** *(string, optional, recommended)* — 64-character hex `chain_id` for this network; upstreams reporting a different `chain_id` are rejected and kept offline. A status that omits `chain_id` stays online unless `require_chain_id` is true, because older nodeos builds never send that optional `get_status_result_v0` extension. When `chain_id` is omitted from the config, `fleet-router` logs a startup warning and trusts the first currently-online upstream in the pool as the reference `chain_id` (if a misconfigured wrong-chain node answers first, the remaining nodes will be rejected until it goes offline). Always pin `chain_id` in multi-network setups.
    - **`require_chain_id`** *(bool, optional, default `false`)* — When `true`, a status that omits `chain_id` is rejected and the upstream stays offline. Requires this listener's `chain_id`. The default keeps older SHiP nodes (FIO and other EOSIO 2.0-based builds) online and logs a one-time warning that `chain_id` cannot be verified for that upstream.
+   - **`block_failure_quarantine`** *(object, optional)* — Same fields as the top-level object (`strikes`, `window_secs`, `ttl_secs`, `range`). Applies only to this listener's pool.
    - **`servers`** *(array, required, `≥ 1` enabled)* — Redundant SHiP nodes belonging to this network. Referencing the same `endpoint` across two different listeners is allowed (e.g. a dedicated VIP vs. a public port) and spawns an independent upstream monitor per listener.
 
    ```json
@@ -281,11 +288,16 @@ fleet_router_upstream_chain_state_begin_block{endpoint,server}
 fleet_router_upstream_chain_state_end_block{endpoint,server}
 fleet_router_upstream_finality_data_begin_block{endpoint,server}
 fleet_router_upstream_finality_data_end_block{endpoint,server}
+fleet_router_upstream_block_failures_total{endpoint,server}
+fleet_router_upstream_quarantined{endpoint,server}
+fleet_router_upstream_quarantine_block{endpoint,server}
 ```
 
 `fleet_router_up` is a process gauge and has no labels. Label values escape `\`, `"`, and newlines per the Prometheus text format.
 
 `trace_begin_block`, `chain_state_begin_block`, and `finality_data_begin_block` are the first block of each SHiP range on that upstream. The gauges are always emitted. `0` is the value before a status result arrives. `finality_data_begin_block` (and `finality_data_end_block`) stay `0` on pre-Savanna nodes that only answer `get_status_result_v0` and never report a finality range.
+
+`fleet_router_upstream_block_failures_total` counts unclean mid-`get_blocks` drops (the socket died with no WebSocket close frame) while a blocks request was in flight. `fleet_router_upstream_quarantined` is `1` while that upstream is excluded for any block range. `fleet_router_upstream_quarantine_block` is the start block of that exclusion, or `0` when none is active; if several ranges are active it is the lowest start block. The block number is the gauge value, not a label.
 
 ## Running in production
 
@@ -327,6 +339,16 @@ docker run -p 17000:17000 \
 ```
 
 The image runs as a non-root user. Its `HEALTHCHECK` runs `fleet-router check`, which dials `127.0.0.1:17000`. For multi-container deployments (one container per network), see [`deploy/docker-compose.multi-network.yml`](deploy/docker-compose.multi-network.yml).
+
+### Corrupted SHiP logs
+
+A damaged `trace_history.log` or `chain_state_history.log` makes nodeos drop the SHiP socket with no WebSocket close frame when a client reaches that block (`zlib error: iostream error`). Indexers then reconnect and request the same block forever. fleet-router treats that drop as a mid-stream failure:
+
+- The session tries another suitable upstream first. Retries at the same next block wait 100 ms, then double, up to 3.2 s, and stop after five failures. The client is closed with WebSocket code 1011 and reason `block <K> unavailable on all upstreams`. One error line names the upstream and the block.
+- Each unclean drop increments `fleet_router_upstream_block_failures_total` for that upstream. The node stays online, so other block ranges are unaffected.
+- Optional `block_failure_quarantine` remembers the block. After `strikes` drops at the same K inside `window_secs`, from any session, that upstream is skipped for requests starting in `K..K+range` for `ttl_secs`. Later sessions are routed to a healthy node and do not pay a failover on that range. When the TTL ends the upstream is eligible again. Repair or resync the log; the gauge `fleet_router_upstream_quarantine_block` shows which block to look at.
+
+This bound is always on. Quarantine is off until `block_failure_quarantine` is set, at the top level or on a listener.
 
 ### Tuning notes
 

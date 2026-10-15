@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -22,7 +22,7 @@ use crate::functions::{
     parse_blocks_route, select_backend_server, select_failover_server, should_reroute_for_finality,
     RouteRequest,
 };
-use crate::models::{ProxyLimits, ServerConfigDb, ServerStateDb};
+use crate::models::{BlockFailureQuarantine, ProxyLimits, ServerConfigDb, ServerStateDb};
 
 type UpstreamStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -31,6 +31,42 @@ type UpstreamStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// cannot grow the queue without bound. Exceeding the cap closes the session
 /// (close code 1008) instead of dropping frames or pinning unbounded memory.
 const MAX_PENDING_CLIENT_BYTES: usize = 64 * 1024;
+
+/// Per session, how many times the upstream stream may die with the same next
+/// block before the client is closed. The drop that starts the loop counts, so
+/// one bad block cannot be re-dialed without a limit.
+const MAX_SAME_BLOCK_FAILURES: u32 = 5;
+
+/// First retry waits 100 ms (the historical failover pause). Each further retry
+/// at that same block doubles the wait, up to 3.2 s.
+fn same_block_backoff(failures: u32) -> Duration {
+    // 100, 200, 400, ... capped at 3.2 s. Shift is capped so `100 << shift` fits.
+    let shift = failures.saturating_sub(1).min(5);
+    Duration::from_millis((100u64 << shift).min(3_200))
+}
+
+fn block_unavailable_reason(block: u32) -> String {
+    format!("block {block} unavailable on all upstreams")
+}
+
+/// Next block a replay should request: the block after the last one delivered,
+/// or the in-flight request's start when nothing has been delivered yet.
+fn next_block_after(last_seen: Option<u32>, request: Option<&[u8]>) -> Option<u32> {
+    if let Some(seen) = last_seen {
+        return Some(seen.saturating_add(1));
+    }
+    request
+        .and_then(parse_blocks_route)
+        .map(|parsed| parsed.start_block_num)
+}
+
+enum UpstreamStop {
+    Idle,
+    /// TCP dropped, or the websocket ended without a Close frame.
+    Unclean,
+    /// Upstream sent a WebSocket Close frame.
+    Clean,
+}
 
 /// Client frames held during a failover window, accounted in bytes.
 struct PendingClientFrames {
@@ -108,6 +144,28 @@ async fn mark_offline(backend_servers: &ServerStateDb, endpoint: &str) {
     }
 }
 
+/// Record an unclean mid-`get_blocks` drop. Does not mark the upstream offline.
+async fn note_block_failure(
+    backend_servers: &ServerStateDb,
+    endpoint: &str,
+    block: u32,
+    policy: Option<BlockFailureQuarantine>,
+) {
+    let mut db = backend_servers.lock().await;
+    let Some(state) = db.get_mut(endpoint) else {
+        return;
+    };
+    if state.record_block_failure(block, Instant::now(), policy) {
+        let range = policy.map(|item| item.range).unwrap_or(1);
+        tracing::warn!(
+            upstream = %endpoint,
+            block,
+            range,
+            "upstream quarantined after repeated mid-stream block failures"
+        );
+    }
+}
+
 /// Read the upstream's first meaningful frame, which must be the Text ABI.
 /// Leading Ping/Pong control frames are skipped. Returns `None` (so the caller
 /// can try another upstream) on timeout, Close, Binary-first, or error.
@@ -147,6 +205,7 @@ async fn establish_upstream(
     route: RouteRequest,
     limits: ProxyLimits,
     failover: bool,
+    exclude: Option<&str>,
 ) -> Option<(ConnectionGuard, UpstreamStream, String, String)> {
     for _ in 0..max_attempts {
         // Select a backend and optimistically increment its counter under the lock.
@@ -155,7 +214,7 @@ async fn establish_upstream(
         let (cfg, guard) = {
             let state = backend_servers.lock().await;
             let selected = match if failover {
-                select_failover_server(&state, route)
+                select_failover_server(&state, route, exclude)
             } else {
                 select_backend_server(&state, route)
             } {
@@ -228,6 +287,7 @@ pub async fn handle_client(
     backend_servers: ServerStateDb,
     server_config_db: ServerConfigDb,
     limits: ProxyLimits,
+    quarantine: Option<BlockFailureQuarantine>,
     mut shutdown: broadcast::Receiver<()>,
 ) {
     // 1. Complete the client WebSocket handshake (bounded in time and message size).
@@ -276,6 +336,7 @@ pub async fn handle_client(
         RouteRequest::default(),
         limits,
         false,
+        None,
     )
     .await
     else {
@@ -359,16 +420,31 @@ pub async fn handle_client(
                     if let Some(parsed) = parse_blocks_route(bin) {
                         *last_request.lock().await = Some(bin.to_vec());
                         let endpoint = current_endpoint.lock().await.clone();
-                        let reroute = parsed.fetch_finality_data && {
+                        let start = parsed.start_block_num;
+                        // Quarantine is opt-in. Skip the state lock on the common path.
+                        let quarantined = quarantine.is_some() && {
                             let db = backend_servers.lock().await;
-                            should_reroute_for_finality(&db, &endpoint, parsed.start_block_num)
+                            db.get(&endpoint)
+                                .is_some_and(|state| state.quarantined_for(start, Instant::now()))
                         };
-                        if reroute {
-                            tracing::info!(
-                                upstream = %endpoint,
-                                block = parsed.start_block_num,
-                                "upstream finality range does not cover request; rerouting"
-                            );
+                        let reroute_finality = parsed.fetch_finality_data && {
+                            let db = backend_servers.lock().await;
+                            should_reroute_for_finality(&db, &endpoint, start)
+                        };
+                        if quarantined || reroute_finality {
+                            if quarantined {
+                                tracing::info!(
+                                    upstream = %endpoint,
+                                    block = start,
+                                    "upstream quarantined for requested block; rerouting"
+                                );
+                            } else {
+                                tracing::info!(
+                                    upstream = %endpoint,
+                                    block = start,
+                                    "upstream finality range does not cover request; rerouting"
+                                );
+                            }
                             reroute_notify.notify_one();
                             continue;
                         }
@@ -419,11 +495,16 @@ pub async fn handle_client(
 
     let mut restarting = false;
     let mut last_seen_block: Option<u32> = None;
+    // (next block, failures observed at that block). Cleared once a block at
+    // or past it is delivered.
+    let mut stuck_at: Option<(u32, u32)> = None;
     let mut close_for_pending_limit = false;
 
     'session: loop {
         let mut client_down = false;
         let mut rerouted = false;
+        let mut upstream_stop: Option<UpstreamStop> = None;
+        let mut upstream_sent_close = false;
         // Kept across iterations so a permit is not lost when another branch wins.
         let reroute_fut = reroute_notify.notified();
         tokio::pin!(reroute_fut);
@@ -446,8 +527,19 @@ pub async fn handle_client(
                     _ = &mut reroute_fut => { rerouted = true; break; }
                     r = timeout(Duration::from_millis(idle_ms), sr_guard.next()) => match r {
                         Ok(Some(Ok(m))) => Some(m),
-                        Ok(_) => None,
-                        Err(_) => { tracing::debug!("upstream idle timeout; failing over"); None }
+                        Ok(_) => {
+                            upstream_stop = Some(if upstream_sent_close {
+                                UpstreamStop::Clean
+                            } else {
+                                UpstreamStop::Unclean
+                            });
+                            None
+                        }
+                        Err(_) => {
+                            tracing::debug!("upstream idle timeout; failing over");
+                            upstream_stop = Some(UpstreamStop::Idle);
+                            None
+                        }
                     }
                 }
             } else {
@@ -463,12 +555,23 @@ pub async fn handle_client(
                     _ = &mut reroute_fut => { rerouted = true; break; }
                     r = sr_guard.next() => match r {
                         Some(Ok(m)) => Some(m),
-                        _ => None,
+                        _ => {
+                            upstream_stop = Some(if upstream_sent_close {
+                                UpstreamStop::Clean
+                            } else {
+                                UpstreamStop::Unclean
+                            });
+                            None
+                        }
                     }
                 }
             };
 
             let Some(msg) = next_msg else { break };
+
+            if matches!(msg, Message::Close(_)) {
+                upstream_sent_close = true;
+            }
 
             let current_block = extract_block_num(&msg);
 
@@ -485,6 +588,9 @@ pub async fn handle_client(
             }
 
             if let Some(b_num) = current_block {
+                if stuck_at.is_some_and(|(block, _)| b_num >= block) {
+                    stuck_at = None;
+                }
                 last_seen_block = Some(b_num);
             }
 
@@ -514,10 +620,62 @@ pub async fn handle_client(
                 }
             }
         }
-        if rerouted {
-            tracing::info!("selecting an upstream whose finality range covers the request");
+        let failed_endpoint = current_endpoint.lock().await.clone();
+        let next_block = {
+            let lr = last_request.lock().await;
+            next_block_after(last_seen_block, lr.as_deref())
+        };
+        // A strike is an unclean drop while a blocks request is in flight.
+        // Clean closes, idle timeouts, client disconnects, and finality
+        // reroutes do not count. Quarantine stays off unless configured.
+        if !rerouted && matches!(upstream_stop, Some(UpstreamStop::Unclean)) {
+            if let Some(block) = next_block {
+                note_block_failure(&backend_servers, &failed_endpoint, block, quarantine).await;
+            }
+        }
+
+        let mut exclude: Option<&str> = None;
+        let mut retry_delay = Duration::from_millis(100);
+        if !rerouted {
+            if let Some(block) = next_block {
+                let failures = match stuck_at {
+                    Some((stuck_block, seen)) if stuck_block == block => seen.saturating_add(1),
+                    _ => 1,
+                };
+                stuck_at = Some((block, failures));
+                if failures >= MAX_SAME_BLOCK_FAILURES {
+                    let reason = block_unavailable_reason(block);
+                    tracing::error!(
+                        upstream = %failed_endpoint,
+                        block,
+                        attempts = failures,
+                        "block {block} unavailable on all upstreams"
+                    );
+                    let _ = cw_guard
+                        .send(Message::Close(Some(CloseFrame {
+                            code: CloseCode::Error,
+                            reason: reason.into(),
+                        })))
+                        .await;
+                    break 'session;
+                }
+                retry_delay = same_block_backoff(failures);
+                exclude = Some(failed_endpoint.as_str());
+                tracing::warn!(
+                    upstream = %failed_endpoint,
+                    block,
+                    attempt = failures,
+                    max = MAX_SAME_BLOCK_FAILURES,
+                    "upstream stream ended; attempting failover"
+                );
+            } else {
+                tracing::warn!(
+                    upstream = %failed_endpoint,
+                    "upstream stream ended; attempting failover"
+                );
+            }
         } else {
-            tracing::warn!("upstream stream ended; attempting failover");
+            tracing::info!("selecting an upstream whose finality range covers the request");
         }
 
         let route = {
@@ -536,6 +694,36 @@ pub async fn handle_client(
             break 'session;
         }
 
+        // Pause before dialing. The first retry at a block waits 100 ms; further
+        // retries at that same block back off. Shutdown and client disconnect
+        // interrupt the wait. A reroute keeps the historical 100 ms pause.
+        enum Pause {
+            Shutdown,
+            ClientEnded,
+            Elapsed,
+        }
+        let paused = tokio::select! {
+            _ = shutdown.recv() => Pause::Shutdown,
+            _ = client_disconnect_notify.notified() => Pause::ClientEnded,
+            _ = sleep(retry_delay) => Pause::Elapsed,
+        };
+        match paused {
+            Pause::Shutdown => {
+                let _ = cw_guard
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Away,
+                        reason: "server shutting down".into(),
+                    })))
+                    .await;
+                return;
+            }
+            Pause::ClientEnded => {
+                close_for_pending_limit = pending_limit_hit.load(Ordering::Acquire);
+                break 'session;
+            }
+            Pause::Elapsed => {}
+        }
+
         // Failover can block in the upstream handshake. Race it against client
         // disconnect and shutdown so a pending-buffer close is not stuck behind
         // a hung connect. `establish_upstream` drops its connection guard if
@@ -550,6 +738,7 @@ pub async fn handle_client(
                 route,
                 limits,
                 true,
+                exclude,
             ) => match result {
                 Some(established) => FailoverAttempt::Ready(Box::new(established)),
                 None => FailoverAttempt::Unavailable,
@@ -596,8 +785,9 @@ pub async fn handle_client(
             *server_writer.lock().await = writer;
         }
 
-        // Brief pause, then replay the request and flush any buffered client frames.
-        sleep(Duration::from_millis(100)).await;
+        // Replay the request and flush any buffered client frames. The backoff
+        // already ran before the dial, so a healthy failover still waits 100 ms
+        // and does not pause twice.
         {
             let mut sw = server_writer.lock().await;
             let lr = last_request.lock().await;
@@ -693,5 +883,38 @@ mod tests {
         let first = pending.pop_front().unwrap();
         assert_eq!(first.len(), 4);
         assert_eq!(pending.bytes, 3);
+    }
+
+    #[test]
+    fn same_block_backoff_doubles_from_100ms_and_caps_at_3_2s() {
+        assert_eq!(same_block_backoff(1), Duration::from_millis(100));
+        assert_eq!(same_block_backoff(2), Duration::from_millis(200));
+        assert_eq!(same_block_backoff(3), Duration::from_millis(400));
+        assert_eq!(same_block_backoff(4), Duration::from_millis(800));
+        assert_eq!(same_block_backoff(5), Duration::from_millis(1_600));
+        assert_eq!(same_block_backoff(6), Duration::from_millis(3_200));
+        assert_eq!(same_block_backoff(7), Duration::from_millis(3_200));
+        assert_eq!(same_block_backoff(30), Duration::from_millis(3_200));
+    }
+
+    #[test]
+    fn block_unavailable_reason_names_the_block() {
+        assert_eq!(
+            block_unavailable_reason(115),
+            "block 115 unavailable on all upstreams"
+        );
+    }
+
+    #[test]
+    fn next_block_follows_the_last_delivered_block() {
+        let request = {
+            let mut buf = vec![1u8];
+            buf.extend_from_slice(&100u32.to_le_bytes());
+            buf.extend_from_slice(&200u32.to_le_bytes());
+            buf
+        };
+        assert_eq!(next_block_after(Some(114), Some(&request)), Some(115));
+        assert_eq!(next_block_after(None, Some(&request)), Some(100));
+        assert_eq!(next_block_after(None, None), None);
     }
 }

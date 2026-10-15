@@ -1520,3 +1520,116 @@ async fn e2e_proxy_multi_listener_network_isolation() {
     h_eos_2.shutdown().await;
     h_wax_1.shutdown().await;
 }
+
+// ===========================================================================
+// Corrupted SHiP log entry (nodeos zlib error) — see /workspace/shipcorrupt
+// ===========================================================================
+
+/// Read `this_block.block_num` from up to `n` block frames until timeout/close.
+/// Returns (block numbers, whether the stream ended with a Close/EOF).
+async fn read_this_blocks(reader: &mut WsReader, n: usize, wait: Duration) -> (Vec<u32>, bool) {
+    let mut blocks = Vec::new();
+    while blocks.len() < n {
+        match tokio::time::timeout(wait, reader.next()).await {
+            Ok(Some(Ok(Message::Binary(d)))) if d.len() >= 78 && d[0] == 1 && d[73] == 1 => {
+                blocks.push(u32::from_le_bytes(d[74..78].try_into().unwrap()));
+            }
+            Ok(Some(Ok(Message::Binary(_)))) | Ok(Some(Ok(Message::Text(_)))) => continue,
+            Ok(Some(Ok(Message::Ping(_)))) | Ok(Some(Ok(Message::Pong(_)))) => continue,
+            Ok(_) => return (blocks, true), // Close frame, EOF or error
+            Err(_) => return (blocks, false), // silent stall
+        }
+    }
+    (blocks, false)
+}
+
+fn corrupt_mock(block: u32, hits: Arc<std::sync::atomic::AtomicUsize>) -> MockShipConfig {
+    MockShipConfig {
+        head_block: 1000,
+        lib_block: 990,
+        blocks_to_stream: 0,
+        corrupt_block: Some(block),
+        corrupt_hits: Some(hits),
+        ..Default::default()
+    }
+}
+
+/// A healthy backup exists: the session must fail over and resume exactly at
+/// the corrupted block with no gap or duplicate. Passes on v0.4.0.
+#[tokio::test]
+async fn e2e_proxy_corrupt_block_fails_over_to_healthy_upstream() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bad = MockShipServer::new(corrupt_mock(115, hits.clone())).await;
+    let good = MockShipServer::new(MockShipConfig {
+        head_block: 1000,
+        lib_block: 990,
+        blocks_to_stream: 0,
+        ..Default::default()
+    })
+    .await;
+    let (ep_bad, ep_good) = (bad.endpoint(), good.endpoint());
+    // Only the corrupt node is up when the client connects, so the session
+    // starts there; the healthy backup comes online before the request.
+    let hb = bad.start();
+    let router = FleetRouterProcess::start(&[ep_bad, ep_good], 500).await;
+    sleep(Duration::from_secs(2)).await;
+    let (mut w, mut r) = ws_connect(&router.ws_url()).await;
+    let _ = read_one(&mut r).await; // ABI
+    let hg = good.start();
+    sleep(Duration::from_secs(3)).await;
+
+    w.send(Message::Binary(build_blocks_request(100, 200, 1000).into()))
+        .await
+        .unwrap();
+    let (blocks, _) = read_this_blocks(&mut r, 100, Duration::from_secs(5)).await;
+    let n = hits.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(n, 1, "session should hit the corrupt block exactly once");
+    assert_eq!(
+        blocks,
+        (100..200).collect::<Vec<_>>(),
+        "gap/dup across the corrupt block after failover"
+    );
+
+    drop(router);
+    hb.shutdown().await;
+    hg.shutdown().await;
+}
+
+/// Only the corrupted upstream exists. Today fleet-router re-dials it every
+/// ~100 ms forever while the client sees a silent stall (observed: 588
+/// failovers in 60 s against real nodeos). Desired: bounded retries with
+/// backoff, then a Close frame to the client.
+#[tokio::test]
+#[ignore = "documents current hot-loop behaviour; enable once block-failure quarantine lands"]
+async fn e2e_proxy_corrupt_block_only_upstream_is_bounded() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bad = MockShipServer::new(corrupt_mock(115, hits.clone())).await;
+    let ep = bad.endpoint();
+    let hb = bad.start();
+    let router = FleetRouterProcess::start(&[ep], 1000).await;
+    sleep(Duration::from_secs(2)).await;
+
+    let (mut w, mut r) = ws_connect(&router.ws_url()).await;
+    let _ = read_one(&mut r).await;
+    w.send(Message::Binary(build_blocks_request(100, 200, 1000).into()))
+        .await
+        .unwrap();
+    let (blocks, closed) = read_this_blocks(&mut r, 100, Duration::from_secs(5)).await;
+    let n = hits.load(std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "  delivered up to {:?}, closed={closed}, corrupt hits={n}",
+        blocks.last()
+    );
+    assert_eq!(blocks.last(), Some(&114));
+    assert!(
+        closed,
+        "client should get a Close instead of a silent stall"
+    );
+    assert!(
+        n <= 5,
+        "upstream re-dialed {n} times for the same bad block"
+    );
+
+    drop(router);
+    hb.shutdown().await;
+}

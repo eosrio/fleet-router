@@ -52,6 +52,13 @@ pub struct MockShipConfig {
     pub finality_data_begin_block: u32,
     /// One past the last block with finality data. Used when `emit_status_v1` is set.
     pub finality_data_end_block: u32,
+    /// Simulate a corrupted SHiP log entry: when this block is about to be sent,
+    /// drop the TCP connection without a Close frame. This is what Spring/Leap
+    /// nodeos does when zlib decompression of a damaged trace_history.log entry
+    /// fails ("state history connection ... failed: zlib error: iostream error").
+    pub corrupt_block: Option<u32>,
+    /// Counts how many times `corrupt_block` was hit (one per aborted session).
+    pub corrupt_hits: Option<Arc<AtomicUsize>>,
 }
 
 /// How the mock treats `get_status` requests. Used to exercise monitor limits.
@@ -87,6 +94,8 @@ impl Default for MockShipConfig {
             emit_status_v1: false,
             finality_data_begin_block: 0,
             finality_data_end_block: 0,
+            corrupt_block: None,
+            corrupt_hits: None,
         }
     }
 }
@@ -289,6 +298,13 @@ impl MockShipServer {
                             if blocks_sent >= limit {
                                 return; // Simulate upstream failure
                             }
+                        }
+
+                        if config.corrupt_block == Some(block_num) {
+                            if let Some(hits) = &config.corrupt_hits {
+                                hits.fetch_add(1, Ordering::Relaxed);
+                            }
+                            return; // abrupt drop, no Close frame (nodeos zlib error)
                         }
 
                         // Optional delay

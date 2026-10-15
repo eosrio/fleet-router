@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `/metrics` labels every per-upstream series with `server="<name>"` from the
+  configured server name, in both single-port and multi-listener mode.
+  `endpoint` and `listener` labels are unchanged. Label values escape
+  backslash, double quote, and newline for the Prometheus text format.
+  Requested by @eosusa (EOSUSA).
 - Optional `require_chain_id` (`false` by default), at the top level in
   single-listener mode or on each listener. Set it to restore the previous
   reject-when-missing behaviour. It is rejected by config validation unless

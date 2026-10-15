@@ -225,14 +225,15 @@ async fn count_online(state_db: &ServerStateDb) -> usize {
     state_db.lock().await.values().filter(|s| s.online).count()
 }
 
-fn format_labels(listener_name: Option<&str>, endpoint: &str) -> String {
+fn format_labels(listener_name: Option<&str>, endpoint: &str, server_name: &str) -> String {
+    let endpoint_label = format!("endpoint=\"{}\"", escape(endpoint));
+    let server_label = format!("server=\"{}\"", escape(server_name));
     match listener_name {
         Some(name) => format!(
-            "listener=\"{}\",endpoint=\"{}\"",
-            escape(name),
-            escape(endpoint)
+            "listener=\"{}\",{endpoint_label},{server_label}",
+            escape(name)
         ),
-        None => format!("endpoint=\"{}\"", escape(endpoint)),
+        None => format!("{endpoint_label},{server_label}"),
     }
 }
 
@@ -253,7 +254,7 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
         let db = l.state_db.lock().await;
         for (endpoint, state) in db.iter() {
             snapshots.push(MetricSnapshot {
-                labels: format_labels(l.name.as_deref(), endpoint),
+                labels: format_labels(l.name.as_deref(), endpoint, &state.name),
                 online: state.online,
                 stale: state.stale,
                 connections: state.connections.load(Ordering::Relaxed),
@@ -333,12 +334,18 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
     out
 }
 
+/// Prometheus text-format label value. Backslash is replaced first so the
+/// escapes inserted for `"` and newline are not doubled.
 fn escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
     use crate::models::{build_state_db, Server};
 
@@ -365,7 +372,16 @@ mod tests {
         assert_eq!(body, "ready: 1 upstream(s) online\n");
 
         let metrics = render_metrics(&listeners).await;
-        assert!(metrics.contains("fleet_router_upstream_up{endpoint=\"127.0.0.1:18080\"} 1\n"));
+        assert!(metrics
+            .contains("fleet_router_upstream_up{endpoint=\"127.0.0.1:18080\",server=\"s1\"} 1\n"));
+        assert!(
+            metrics.contains("fleet_router_up 1\n"),
+            "process gauge must stay unlabeled"
+        );
+        assert!(
+            !metrics.contains("fleet_router_up{"),
+            "process gauge must not gain a server label"
+        );
     }
 
     #[tokio::test]
@@ -425,11 +441,85 @@ mod tests {
 
         let metrics = render_metrics(&listeners).await;
         assert!(metrics.contains(
-            "fleet_router_upstream_up{listener=\"eos\",endpoint=\"127.0.0.1:18080\"} 1\n"
+            "fleet_router_upstream_up{listener=\"eos\",endpoint=\"127.0.0.1:18080\",server=\"eos-1\"} 1\n"
         ));
         assert!(metrics.contains(
-            "fleet_router_upstream_up{listener=\"wax\",endpoint=\"127.0.0.1:28080\"} 1\n"
+            "fleet_router_upstream_up{listener=\"wax\",endpoint=\"127.0.0.1:28080\",server=\"wax-1\"} 1\n"
         ));
+    }
+
+    #[test]
+    fn prometheus_escape_covers_backslash_quote_and_newline() {
+        assert_eq!(escape("plain"), "plain");
+        assert_eq!(escape(r#"a\b"c"#), r#"a\\b\"c"#);
+        assert_eq!(escape("line1\nline2"), r"line1\nline2");
+        assert_eq!(escape("EOS \"SHiP\"\n1\\west"), r#"EOS \"SHiP\"\n1\\west"#);
+    }
+
+    #[tokio::test]
+    async fn server_label_is_on_every_upstream_series_and_escaped() {
+        let nasty = "EOS \"SHiP\"\n1\\west";
+        let legacy = build_state_db(vec![Server {
+            name: nasty.to_string(),
+            endpoint: "127.0.0.1:18080".to_string(),
+            enabled: true,
+        }]);
+        let named = build_state_db(vec![Server {
+            name: "wax node".to_string(),
+            endpoint: "10.0.0.2:8080".to_string(),
+            enabled: true,
+        }]);
+        {
+            let mut db = legacy.lock().await;
+            let state = db.get_mut("127.0.0.1:18080").unwrap();
+            state.online = true;
+            state.stale = true;
+            state.connections.store(3, Ordering::Relaxed);
+            state.chain_state_end_block = 42;
+            state.finality_data_begin_block = 7;
+            state.finality_data_end_block = 99;
+        }
+        {
+            let mut db = named.lock().await;
+            let state = db.get_mut("10.0.0.2:8080").unwrap();
+            state.online = false;
+            state.chain_state_end_block = 5;
+        }
+
+        let listeners = vec![
+            ListenerHealthState {
+                name: None,
+                state_db: legacy,
+            },
+            ListenerHealthState {
+                name: Some("wax\"main".to_string()),
+                state_db: named,
+            },
+        ];
+        let metrics = render_metrics(&listeners).await;
+
+        let legacy_labels = r#"endpoint="127.0.0.1:18080",server="EOS \"SHiP\"\n1\\west""#;
+        let named_labels = r#"listener="wax\"main",endpoint="10.0.0.2:8080",server="wax node""#;
+        let series = [
+            ("fleet_router_upstream_up", "1", "0"),
+            ("fleet_router_upstream_stale", "1", "0"),
+            ("fleet_router_active_connections", "3", "0"),
+            ("fleet_router_upstream_chain_state_end_block", "42", "5"),
+            ("fleet_router_upstream_finality_data_begin_block", "7", "0"),
+            ("fleet_router_upstream_finality_data_end_block", "99", "0"),
+        ];
+        for (name, legacy_value, named_value) in series {
+            let legacy_line = format!("{name}{{{legacy_labels}}} {legacy_value}\n");
+            let named_line = format!("{name}{{{named_labels}}} {named_value}\n");
+            assert!(
+                metrics.contains(&legacy_line),
+                "missing legacy series {legacy_line} in:\n{metrics}"
+            );
+            assert!(
+                metrics.contains(&named_line),
+                "missing listener series {named_line} in:\n{metrics}"
+            );
+        }
     }
 
     #[tokio::test]

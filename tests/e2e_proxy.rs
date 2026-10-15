@@ -1185,8 +1185,10 @@ async fn e2e_proxy_failover_to_range_valid() {
     hc.shutdown().await;
 }
 
-fn finality_end_metric(endpoint: &str, end: u32) -> String {
-    format!("fleet_router_upstream_finality_data_end_block{{endpoint=\"{endpoint}\"}} {end}")
+fn finality_end_metric(endpoint: &str, server: &str, end: u32) -> String {
+    format!(
+        "fleet_router_upstream_finality_data_end_block{{endpoint=\"{endpoint}\",server=\"{server}\"}} {end}"
+    )
 }
 
 /// Read up to `n` block-result heads, skipping ABI text frames.
@@ -1256,14 +1258,22 @@ async fn e2e_proxy_routes_finality_requests_by_v1_range() {
     let (router, metrics_port) =
         FleetRouterProcess::start_with_metrics(&[ep_b.clone(), ep_a.clone()], 100, 200).await;
 
-    wait_for_metric(metrics_port, &finality_end_metric(&ep_b, 20_001)).await;
+    wait_for_metric(
+        metrics_port,
+        &finality_end_metric(&ep_b, "mock-upstream-1", 20_001),
+    )
+    .await;
 
     let (mut writer, mut reader) = ws_connect(&router.ws_url()).await;
     let _abi = read_one(&mut reader).await;
 
     // A accepts the monitor handshake that has been waiting, then reports v1.
     let ha = mock_a.start();
-    wait_for_metric(metrics_port, &finality_end_metric(&ep_a, 10_001)).await;
+    wait_for_metric(
+        metrics_port,
+        &finality_end_metric(&ep_a, "mock-upstream-2", 10_001),
+    )
+    .await;
 
     writer
         .send(Message::Binary(
@@ -1423,17 +1433,23 @@ async fn e2e_proxy_multi_listener_network_isolation() {
     // Wait for all three upstreams across both listeners to report online in /metrics
     wait_for_metric(
         metrics_port,
-        &format!("fleet_router_upstream_up{{listener=\"eos\",endpoint=\"{eos_ep_1}\"}} 1"),
+        &format!(
+            "fleet_router_upstream_up{{listener=\"eos\",endpoint=\"{eos_ep_1}\",server=\"eos-1\"}} 1"
+        ),
     )
     .await;
     wait_for_metric(
         metrics_port,
-        &format!("fleet_router_upstream_up{{listener=\"eos\",endpoint=\"{eos_ep_2}\"}} 1"),
+        &format!(
+            "fleet_router_upstream_up{{listener=\"eos\",endpoint=\"{eos_ep_2}\",server=\"eos-2\"}} 1"
+        ),
     )
     .await;
     wait_for_metric(
         metrics_port,
-        &format!("fleet_router_upstream_up{{listener=\"wax\",endpoint=\"{wax_ep_1}\"}} 1"),
+        &format!(
+            "fleet_router_upstream_up{{listener=\"wax\",endpoint=\"{wax_ep_1}\",server=\"wax-1\"}} 1"
+        ),
     )
     .await;
 

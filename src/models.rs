@@ -40,7 +40,7 @@ const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS: u64 = 10_000;
 /// A single upstream SHiP node, as declared in `config.json`.
 #[derive(Debug, Deserialize, Serialize, Hash, Eq, PartialEq, Clone)]
 pub struct Server {
-    /// Human-readable name used in logs.
+    /// Human-readable name used in logs and as the `server` label on `/metrics`.
     pub name: String,
     /// Upstream WebSocket address.
     ///
@@ -592,6 +592,9 @@ impl ServerConfig {
 /// Live state tracked per upstream by the monitoring loop and the proxy.
 #[derive(Debug)]
 pub struct ServerState {
+    /// Configured [`Server::name`], copied when the state map is built so
+    /// `/metrics` can emit a `server` label.
+    pub name: String,
     /// Active client connections currently routed to this upstream.
     /// `Arc<AtomicUsize>` so [`crate::connection_handler::ConnectionGuard`] can
     /// decrement synchronously on drop without locking the whole map.
@@ -638,6 +641,7 @@ impl ServerState {
         require_chain_id: bool,
     ) -> ServerState {
         ServerState {
+            name: String::new(),
             connections: Arc::new(AtomicUsize::new(0)),
             enabled: true,
             online: false,
@@ -701,10 +705,9 @@ pub fn build_state_db_with_chain_id(
             .iter()
             .filter(|s| s.enabled)
             .map(|s| {
-                (
-                    s.endpoint.clone(),
-                    ServerState::with_chain_policy(expected_chain_id, require_chain_id),
-                )
+                let mut state = ServerState::with_chain_policy(expected_chain_id, require_chain_id);
+                state.name = s.name.clone();
+                (s.endpoint.clone(), state)
             })
             .collect::<HashMap<String, ServerState>>(),
     ))

@@ -256,7 +256,7 @@ async fn monitor_and_proxy_dial_a_wss_upstream() {
     let _child = KillChild(child);
 
     let needle = format!(
-        "fleet_router_upstream_up{{endpoint=\"{}\"}} 1",
+        "fleet_router_upstream_up{{endpoint=\"{}\",server=\"tls-mock\"}} 1",
         ship.endpoint
     );
     let mut online = false;

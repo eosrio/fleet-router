@@ -174,6 +174,10 @@ async fn metrics_endpoint_serves_health_ready_and_metrics() {
         body.contains(&mock_endpoint),
         "metrics should label the configured upstream endpoint"
     );
+    assert!(
+        body.contains("server=\"mock\""),
+        "metrics should label the configured server name: {body}"
+    );
 
     // /ready should become 200 once the upstream is observed online.
     let mut ready = false;

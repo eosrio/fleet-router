@@ -136,7 +136,7 @@ Configuration is a single JSON file (`config.json` by default). The three `*_ms`
 
 Each entry in `servers` is an object:
 
-- **`name`** *(string, required)* — Human-readable name used in logs.
+- **`name`** *(string, required)* — Human-readable name used in logs and as the `server` label on each `/metrics` series for this upstream.
 - **`endpoint`** *(string, required)* — Upstream as `host:port`, `ws://host:port`, or `wss://host:port`. A bare `host:port` is dialed as `ws://`. Endpoints must be unique within a listener's pool (see below).
 - **`enabled`** *(bool, required)* — Whether the router may use this upstream. At least one enabled server is required.
 
@@ -267,17 +267,19 @@ Set `metrics_port` (and optionally `metrics_address`) to enable an HTTP endpoint
 - **`/ready/<listener>`**, **`/readyz/<listener>`** — `200` if the named listener has at least one online upstream, `503` if none are online, or `404` if the listener name is unknown.
 - **`/metrics`** — Prometheus text exposition of router and upstream state.
 
-Exposed metrics include (in multi-listener mode, each upstream series also carries `listener="<name>"`):
+Exposed metrics include (each per-upstream series carries `server="<name>"` from the configured server name; in multi-listener mode, each upstream series also carries `listener="<name>"`):
 
 ```text
 fleet_router_up
-fleet_router_upstream_up{endpoint}
-fleet_router_upstream_stale{endpoint}
-fleet_router_active_connections{endpoint}
-fleet_router_upstream_chain_state_end_block{endpoint}
-fleet_router_upstream_finality_data_begin_block{endpoint}
-fleet_router_upstream_finality_data_end_block{endpoint}
+fleet_router_upstream_up{endpoint,server}
+fleet_router_upstream_stale{endpoint,server}
+fleet_router_active_connections{endpoint,server}
+fleet_router_upstream_chain_state_end_block{endpoint,server}
+fleet_router_upstream_finality_data_begin_block{endpoint,server}
+fleet_router_upstream_finality_data_end_block{endpoint,server}
 ```
+
+`fleet_router_up` is a process gauge and has no labels. `endpoint` and `listener` are unchanged. Label values escape `\`, `"`, and newlines per the Prometheus text format.
 
 ## Running in production
 

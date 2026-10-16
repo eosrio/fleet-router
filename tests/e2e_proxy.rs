@@ -30,7 +30,7 @@ struct FleetRouterProcess {
 impl FleetRouterProcess {
     /// Start fleet-router with a generated config pointing to the given upstream endpoints.
     async fn start(upstream_endpoints: &[String], status_ms: u64) -> Self {
-        Self::launch(upstream_endpoints, status_ms, 1000, None).await
+        Self::launch(upstream_endpoints, status_ms, 1000, None, None, None).await
     }
 
     /// Start fleet-router and also bind the HTTP metrics endpoint.
@@ -48,9 +48,50 @@ impl FleetRouterProcess {
             status_ms,
             reconnect_ms,
             Some(metrics_port),
+            None,
+            None,
         )
         .await;
         (router, metrics_port)
+    }
+
+    /// Start fleet-router with shared block-failure quarantine and metrics.
+    async fn start_with_quarantine(
+        upstream_endpoints: &[String],
+        status_ms: u64,
+        quarantine: serde_json::Value,
+    ) -> (Self, u16) {
+        let metrics_port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let router = Self::launch(
+            upstream_endpoints,
+            status_ms,
+            500,
+            Some(metrics_port),
+            Some(quarantine),
+            None,
+        )
+        .await;
+        (router, metrics_port)
+    }
+
+    /// Start fleet-router with an idle timeout on both directions.
+    async fn start_with_idle(
+        upstream_endpoints: &[String],
+        status_ms: u64,
+        idle_timeout_ms: u64,
+    ) -> Self {
+        Self::launch(
+            upstream_endpoints,
+            status_ms,
+            1000,
+            None,
+            None,
+            Some(idle_timeout_ms),
+        )
+        .await
     }
 
     async fn launch(
@@ -58,6 +99,8 @@ impl FleetRouterProcess {
         status_ms: u64,
         reconnect_ms: u64,
         metrics_port: Option<u16>,
+        quarantine: Option<serde_json::Value>,
+        idle_timeout_ms: Option<u64>,
     ) -> Self {
         // Find a free port for fleet-router to listen on
         let listen_port = {
@@ -86,6 +129,12 @@ impl FleetRouterProcess {
             "upstream_status_ms": status_ms,
             "servers": servers
         });
+        if let Some(policy) = quarantine {
+            config["block_failure_quarantine"] = policy;
+        }
+        if let Some(idle) = idle_timeout_ms {
+            config["idle_timeout_ms"] = serde_json::json!(idle);
+        }
         if let Some(port) = metrics_port {
             config["metrics_address"] = serde_json::json!("127.0.0.1");
             config["metrics_port"] = serde_json::json!(port);
@@ -1519,4 +1568,340 @@ async fn e2e_proxy_multi_listener_network_isolation() {
     h_eos_1.shutdown().await;
     h_eos_2.shutdown().await;
     h_wax_1.shutdown().await;
+}
+
+// ===========================================================================
+// Corrupted SHiP log entry (nodeos zlib error) — see /workspace/shipcorrupt
+// ===========================================================================
+
+/// Read `this_block.block_num` from up to `n` block frames until timeout/close.
+///
+/// The second value is `None` on a silent stall. A close frame yields
+/// `(code, reason)`; any other end yields `(None, "")`.
+async fn read_this_blocks(
+    reader: &mut WsReader,
+    n: usize,
+    wait: Duration,
+) -> (Vec<u32>, Option<(Option<u16>, String)>) {
+    let mut blocks = Vec::new();
+    while blocks.len() < n {
+        match tokio::time::timeout(wait, reader.next()).await {
+            Ok(Some(Ok(Message::Binary(d)))) if d.len() >= 78 && d[0] == 1 && d[73] == 1 => {
+                blocks.push(u32::from_le_bytes(d[74..78].try_into().unwrap()));
+            }
+            Ok(Some(Ok(Message::Binary(_)))) | Ok(Some(Ok(Message::Text(_)))) => continue,
+            Ok(Some(Ok(Message::Ping(_)))) | Ok(Some(Ok(Message::Pong(_)))) => continue,
+            Ok(Some(Ok(Message::Close(frame)))) => {
+                let closed = frame
+                    .map(|frame| (Some(u16::from(frame.code)), frame.reason.to_string()))
+                    .unwrap_or((None, String::new()));
+                return (blocks, Some(closed));
+            }
+            Ok(_) => return (blocks, Some((None, String::new()))),
+            Err(_) => return (blocks, None),
+        }
+    }
+    (blocks, None)
+}
+
+fn corrupt_mock(block: u32, hits: Arc<std::sync::atomic::AtomicUsize>) -> MockShipConfig {
+    MockShipConfig {
+        head_block: 1000,
+        lib_block: 990,
+        blocks_to_stream: 0,
+        corrupt_block: Some(block),
+        corrupt_hits: Some(hits),
+        ..Default::default()
+    }
+}
+
+/// A healthy backup exists: the session must fail over and resume exactly at
+/// the corrupted block with no gap or duplicate. Passes on v0.4.0.
+#[tokio::test]
+async fn e2e_proxy_corrupt_block_fails_over_to_healthy_upstream() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bad = MockShipServer::new(corrupt_mock(115, hits.clone())).await;
+    let good = MockShipServer::new(MockShipConfig {
+        head_block: 1000,
+        lib_block: 990,
+        blocks_to_stream: 0,
+        ..Default::default()
+    })
+    .await;
+    let (ep_bad, ep_good) = (bad.endpoint(), good.endpoint());
+    // Only the corrupt node is up when the client connects, so the session
+    // starts there; the healthy backup comes online before the request.
+    let hb = bad.start();
+    let router = FleetRouterProcess::start(&[ep_bad, ep_good], 500).await;
+    sleep(Duration::from_secs(2)).await;
+    let (mut w, mut r) = ws_connect(&router.ws_url()).await;
+    let _ = read_one(&mut r).await; // ABI
+    let hg = good.start();
+    sleep(Duration::from_secs(3)).await;
+
+    w.send(Message::Binary(build_blocks_request(100, 200, 1000).into()))
+        .await
+        .unwrap();
+    let (blocks, _) = read_this_blocks(&mut r, 100, Duration::from_secs(5)).await;
+    let n = hits.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(n, 1, "session should hit the corrupt block exactly once");
+    assert_eq!(
+        blocks,
+        (100..200).collect::<Vec<_>>(),
+        "gap/dup across the corrupt block after failover"
+    );
+
+    drop(router);
+    hb.shutdown().await;
+    hg.shutdown().await;
+}
+
+/// Only the corrupted upstream exists. The session must stop re-dialing that
+/// block, then close the client with 1011 instead of stalling.
+#[tokio::test]
+async fn e2e_proxy_corrupt_block_only_upstream_is_bounded() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bad = MockShipServer::new(corrupt_mock(115, hits.clone())).await;
+    let ep = bad.endpoint();
+    let hb = bad.start();
+    let router = FleetRouterProcess::start(&[ep], 1000).await;
+    sleep(Duration::from_secs(2)).await;
+
+    let (mut w, mut r) = ws_connect(&router.ws_url()).await;
+    let _ = read_one(&mut r).await;
+    w.send(Message::Binary(build_blocks_request(100, 200, 1000).into()))
+        .await
+        .unwrap();
+    let (blocks, closed) = read_this_blocks(&mut r, 100, Duration::from_secs(8)).await;
+    let n = hits.load(std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "  delivered up to {:?}, closed={closed:?}, corrupt hits={n}",
+        blocks.last()
+    );
+    assert_eq!(blocks.last(), Some(&114));
+    let (code, reason) = closed.expect("client should get a Close instead of a silent stall");
+    assert_eq!(code, Some(1011), "close code, reason={reason}");
+    assert_eq!(reason, "block 115 unavailable on all upstreams");
+    assert!(
+        n <= 5,
+        "upstream re-dialed {n} times for the same bad block"
+    );
+    assert!(n >= 1, "the corrupt block should be observed at least once");
+
+    drop(router);
+    hb.shutdown().await;
+}
+
+/// A session waiting at the chain tip (head+1) with `idle_timeout_ms` set must
+/// keep failing over. Those idle timeouts are not unclean drops, so they must
+/// not exhaust the same-block budget or close the client with 1011.
+#[tokio::test]
+async fn e2e_proxy_idle_timeout_at_the_tip_does_not_close_1011() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mock = MockShipServer::new(MockShipConfig {
+        head_block: 1000,
+        lib_block: 990,
+        blocks_to_stream: 0,
+        hold_at_block: Some(115),
+        hold_hits: Some(hits.clone()),
+        ..Default::default()
+    })
+    .await;
+    let ep = mock.endpoint();
+    let handle = mock.start();
+    let router = FleetRouterProcess::start_with_idle(&[ep], 1000, 200).await;
+    sleep(Duration::from_secs(2)).await;
+
+    let (mut w, mut r) = ws_connect(&router.ws_url()).await;
+    let _ = read_one(&mut r).await;
+    w.send(Message::Binary(build_blocks_request(100, 200, 1000).into()))
+        .await
+        .unwrap();
+
+    // Binary acks keep the client side of the shared idle timer alive. A
+    // WebSocket ping would be answered by the mock and reset the upstream timer.
+    let writer = Arc::new(tokio::sync::Mutex::new(w));
+    let keepalive = {
+        let writer = writer.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_millis(40)).await;
+                let mut w = writer.lock().await;
+                if w.send(Message::Binary(build_ack_request(1).into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    };
+
+    let (blocks, closed) = read_this_blocks(&mut r, 100, Duration::from_secs(6)).await;
+    keepalive.abort();
+    let n = hits.load(std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "  delivered up to {:?}, closed={closed:?}, hold hits={n}",
+        blocks.last()
+    );
+    assert!(
+        blocks.contains(&114),
+        "session should reach the block before the tip, got {blocks:?}"
+    );
+    assert!(
+        !blocks.contains(&115),
+        "the upstream is holding at the tip, got {blocks:?}"
+    );
+    assert!(
+        closed.is_none(),
+        "idle waits at the tip must not close the client, closed={closed:?}, holds={n}"
+    );
+    assert!(
+        n > 5,
+        "expected more than five idle failovers at block 115, holds={n}"
+    );
+
+    drop(writer);
+    drop(r);
+    drop(router);
+    handle.shutdown().await;
+}
+
+/// With quarantine armed after one strike, a later session that asks for the
+/// bad block is served by the healthy upstream and does not touch the corrupt
+/// log entry. After the TTL, that upstream is eligible again.
+#[tokio::test]
+async fn e2e_proxy_quarantine_skips_corrupt_upstream_until_ttl() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bad = MockShipServer::new(corrupt_mock(115, hits.clone())).await;
+    let good = MockShipServer::new(MockShipConfig {
+        head_block: 1000,
+        lib_block: 990,
+        blocks_to_stream: 0,
+        ..Default::default()
+    })
+    .await;
+    let (ep_bad, ep_good) = (bad.endpoint(), good.endpoint());
+    let hb = bad.start();
+    let (router, metrics_port) = FleetRouterProcess::start_with_quarantine(
+        &[ep_bad.clone(), ep_good.clone()],
+        500,
+        serde_json::json!({
+            "strikes": 1,
+            "window_secs": 300,
+            "ttl_secs": 8,
+            "range": 1
+        }),
+    )
+    .await;
+    let bad_labels = format!("endpoint=\"{ep_bad}\",server=\"mock-upstream-1\"");
+    let good_up =
+        format!("fleet_router_upstream_up{{endpoint=\"{ep_good}\",server=\"mock-upstream-2\"}} 1");
+    wait_for_metric(
+        metrics_port,
+        &format!("fleet_router_upstream_up{{{bad_labels}}} 1"),
+    )
+    .await;
+
+    // Only the corrupt node is online, so the first session starts there.
+    let (mut w1, mut r1) = ws_connect(&router.ws_url()).await;
+    let _ = read_one(&mut r1).await;
+    let hg = good.start();
+    wait_for_metric(metrics_port, &good_up).await;
+
+    w1.send(Message::Binary(build_blocks_request(100, 130, 1000).into()))
+        .await
+        .unwrap();
+    let (blocks, _) = read_this_blocks(&mut r1, 20, Duration::from_secs(5)).await;
+    assert!(
+        blocks.contains(&114) && blocks.contains(&115),
+        "first session should fail over past the corrupt block, got {blocks:?}"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "first session should strike the corrupt upstream once"
+    );
+    wait_for_metric(
+        metrics_port,
+        &format!("fleet_router_upstream_block_failures_total{{{bad_labels}}} 1"),
+    )
+    .await;
+    wait_for_metric(
+        metrics_port,
+        &format!("fleet_router_upstream_quarantined{{{bad_labels}}} 1"),
+    )
+    .await;
+    wait_for_metric(
+        metrics_port,
+        &format!("fleet_router_upstream_quarantine_block{{{bad_labels}}} 115"),
+    )
+    .await;
+    // Still online: quarantine is not an offline mark.
+    let body = fetch_metrics(metrics_port).await;
+    assert!(
+        body.contains(&format!("fleet_router_upstream_up{{{bad_labels}}} 1")),
+        "quarantine must leave the upstream online:\n{body}"
+    );
+
+    // Second session asks for the quarantined block and must not pay a failover.
+    let (mut w2, mut r2) = ws_connect(&router.ws_url()).await;
+    let _ = read_one(&mut r2).await;
+    w2.send(Message::Binary(build_blocks_request(115, 125, 100).into()))
+        .await
+        .unwrap();
+    let (blocks2, _) = read_this_blocks(&mut r2, 5, Duration::from_secs(5)).await;
+    assert_eq!(
+        blocks2,
+        (115..120).collect::<Vec<_>>(),
+        "second session should stream the quarantined block from the healthy upstream"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "second session must not hit the corrupt upstream"
+    );
+
+    // TTL is 2s from the strike. Wait until the gauge drops, then a new session
+    // with the healthy node still busy should land on the corrupt upstream again.
+    wait_for_metric(
+        metrics_port,
+        &format!("fleet_router_upstream_quarantined{{{bad_labels}}} 0"),
+    )
+    .await;
+    let (mut w3, mut r3) = ws_connect(&router.ws_url()).await;
+    let _ = read_one(&mut r3).await;
+    w3.send(Message::Binary(build_blocks_request(115, 125, 100).into()))
+        .await
+        .unwrap();
+    let _ = read_this_blocks(&mut r3, 3, Duration::from_secs(5)).await;
+    let n = hits.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        n >= 2,
+        "after the quarantine TTL the corrupt upstream should be selected again, hits={n}"
+    );
+
+    drop(w1);
+    drop(r1);
+    drop(w2);
+    drop(r2);
+    drop(w3);
+    drop(r3);
+    drop(router);
+    hb.shutdown().await;
+    hg.shutdown().await;
+}
+
+async fn fetch_metrics(port: u16) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("metrics connect");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
 }

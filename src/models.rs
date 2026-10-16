@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,69 @@ fn default_max_client_message_bytes() -> usize {
 }
 fn default_shutdown_grace_ms() -> u64 {
     5_000
+}
+fn default_quarantine_strikes() -> u32 {
+    2
+}
+fn default_quarantine_window_secs() -> u64 {
+    300
+}
+fn default_quarantine_ttl_secs() -> u64 {
+    600
+}
+fn default_quarantine_range() -> u32 {
+    1
+}
+
+/// Opt-in shared exclusion of one upstream for a short block range.
+///
+/// After `strikes` unclean mid-`get_blocks` drops at the same block K inside
+/// `window_secs`, from any session on this listener, that upstream is skipped
+/// for requests starting in `K..K+range` for `ttl_secs`. It stays online for
+/// every other range. Omit the object to disable this; per-session retry
+/// bounding still applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockFailureQuarantine {
+    /// Drops at one block required before exclusion. Default 2.
+    #[serde(default = "default_quarantine_strikes")]
+    pub strikes: u32,
+    /// Seconds a strike stays in the window. Default 300.
+    #[serde(default = "default_quarantine_window_secs")]
+    pub window_secs: u64,
+    /// Seconds the exclusion lasts once armed. Default 600.
+    #[serde(default = "default_quarantine_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Blocks excluded starting at K (`K..K+range`). Default 1 (only K).
+    #[serde(default = "default_quarantine_range")]
+    pub range: u32,
+}
+
+/// One upstream skipped for `[block, block + range)` until `until`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockQuarantine {
+    pub block: u32,
+    pub range: u32,
+    pub until: Instant,
+}
+
+impl BlockQuarantine {
+    /// Whether a request starting at `block` falls in this exclusion.
+    pub fn covers(&self, block: u32) -> bool {
+        match self.block.checked_add(self.range) {
+            Some(end) => self.block <= block && block < end,
+            None => block >= self.block,
+        }
+    }
+
+    pub fn active(&self, now: Instant) -> bool {
+        now < self.until
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockStrike {
+    block: u32,
+    at: Instant,
 }
 
 /// Connect / first-read bound used by the upstream monitor and `config test`
@@ -168,6 +232,10 @@ pub struct ListenerConfig {
     /// (which never send that optional extension) online.
     #[serde(default)]
     pub require_chain_id: bool,
+    /// Opt-in per-range exclusion after repeated unclean drops at one block.
+    /// See [`BlockFailureQuarantine`].
+    #[serde(default)]
+    pub block_failure_quarantine: Option<BlockFailureQuarantine>,
 }
 
 /// A validated, normalized listener ready to be bound and monitored at runtime.
@@ -181,6 +249,8 @@ pub struct ResolvedListener {
     pub expected_chain_id: Option<[u8; 32]>,
     /// See [`ListenerConfig::require_chain_id`].
     pub require_chain_id: bool,
+    /// See [`BlockFailureQuarantine`]. `None` disables shared quarantine.
+    pub block_failure_quarantine: Option<BlockFailureQuarantine>,
     pub servers: Vec<Server>,
 }
 
@@ -222,6 +292,11 @@ pub struct ServerConfig {
     /// Cannot be combined with [`Self::listeners`]; set it on each listener.
     #[serde(default)]
     pub require_chain_id: bool,
+    /// Opt-in shared quarantine for unclean mid-`get_blocks` drops at one block.
+    /// Single-listener mode only. With `listeners`, set it on each listener.
+    /// See [`BlockFailureQuarantine`].
+    #[serde(default)]
+    pub block_failure_quarantine: Option<BlockFailureQuarantine>,
     /// Named ingress listeners for multi-port / multi-network deployments.
     #[serde(default)]
     pub listeners: Vec<ListenerConfig>,
@@ -354,6 +429,29 @@ fn validate_servers(servers: &[Server], listener_ctx: Option<&str>) -> Result<()
     Ok(())
 }
 
+fn validate_block_failure_quarantine(
+    policy: &BlockFailureQuarantine,
+    listener_ctx: Option<&str>,
+) -> Result<()> {
+    let prefix = match listener_ctx {
+        Some(name) => format!("listener '{name}': "),
+        None => String::new(),
+    };
+    if policy.strikes == 0 {
+        bail!("{prefix}block_failure_quarantine.strikes must be greater than 0");
+    }
+    if policy.window_secs == 0 {
+        bail!("{prefix}block_failure_quarantine.window_secs must be greater than 0");
+    }
+    if policy.ttl_secs == 0 {
+        bail!("{prefix}block_failure_quarantine.ttl_secs must be greater than 0");
+    }
+    if policy.range == 0 {
+        bail!("{prefix}block_failure_quarantine.range must be greater than 0");
+    }
+    Ok(())
+}
+
 impl ServerConfig {
     /// Validate the configuration, returning a clear error for any invalid field.
     pub fn validate(&self) -> Result<()> {
@@ -398,6 +496,9 @@ impl ServerConfig {
             if self.require_chain_id && self.chain_id.is_none() {
                 bail!("require_chain_id requires chain_id to be set");
             }
+            if let Some(policy) = &self.block_failure_quarantine {
+                validate_block_failure_quarantine(policy, None)?;
+            }
             validate_servers(&self.servers, None)?;
         } else {
             if self.listen_port != 0 {
@@ -413,6 +514,11 @@ impl ServerConfig {
             if self.require_chain_id {
                 bail!(
                     "top-level 'require_chain_id' cannot be combined with 'listeners'; set 'require_chain_id' on each listener"
+                );
+            }
+            if self.block_failure_quarantine.is_some() {
+                bail!(
+                    "top-level 'block_failure_quarantine' cannot be combined with 'listeners'; set 'block_failure_quarantine' on each listener"
                 );
             }
             let mut seen_names = HashMap::<String, usize>::new();
@@ -458,6 +564,9 @@ impl ServerConfig {
                 }
                 if listener.require_chain_id && listener.chain_id.is_none() {
                     bail!("listener '{name}': require_chain_id requires chain_id to be set");
+                }
+                if let Some(policy) = &listener.block_failure_quarantine {
+                    validate_block_failure_quarantine(policy, Some(name))?;
                 }
 
                 for (prev_name, prev_addr, prev_port) in &bound_listeners {
@@ -507,6 +616,7 @@ impl ServerConfig {
                     .as_deref()
                     .and_then(|c| parse_chain_id(c, None).ok()),
                 require_chain_id: self.require_chain_id,
+                block_failure_quarantine: self.block_failure_quarantine,
                 servers: self.servers.clone(),
             }]
         } else {
@@ -535,6 +645,7 @@ impl ServerConfig {
                         .as_deref()
                         .and_then(|c| parse_chain_id(c, Some(&l.name)).ok()),
                     require_chain_id: l.require_chain_id,
+                    block_failure_quarantine: l.block_failure_quarantine,
                     servers: l.servers.clone(),
                 })
                 .collect()
@@ -625,6 +736,14 @@ pub struct ServerState {
     /// One past the last block with finality data. Zero means the range is unknown
     /// (the upstream has only reported `get_status_result_v0`, or reported an empty range).
     pub finality_data_end_block: u32,
+    /// Unclean mid-`get_blocks` drops observed for this upstream. Rendered as
+    /// `fleet_router_upstream_block_failures_total`.
+    pub block_failures: u64,
+    /// Strikes still inside the configured window. Not consulted when quarantine
+    /// is disabled; the failure counter above is still incremented.
+    block_strikes: Vec<BlockStrike>,
+    /// Block-range exclusions. Expired entries are ignored by selection and metrics.
+    pub quarantines: Vec<BlockQuarantine>,
 }
 
 impl ServerState {
@@ -656,8 +775,95 @@ impl ServerState {
             chain_state_end_block: 0,
             finality_data_begin_block: 0,
             finality_data_end_block: 0,
+            block_failures: 0,
+            block_strikes: Vec::new(),
+            quarantines: Vec::new(),
         }
     }
+
+    /// Count an unclean mid-`get_blocks` drop whose next block is `block`.
+    ///
+    /// Always increments [`Self::block_failures`]. When `policy` is set and
+    /// this upstream reaches `strikes` at `block` inside the window, it is
+    /// excluded for `K..K+range` for the TTL. [`Self::online`] is left unchanged.
+    /// Further drops at that block while the exclusion is active do not extend it.
+    ///
+    /// Returns `true` when this call arms a new exclusion.
+    pub fn record_block_failure(
+        &mut self,
+        block: u32,
+        now: Instant,
+        policy: Option<BlockFailureQuarantine>,
+    ) -> bool {
+        self.block_failures = self.block_failures.saturating_add(1);
+        self.prune_expired_quarantines(now);
+        let Some(policy) = policy else {
+            return false;
+        };
+        if self.quarantined_for(block, now) {
+            return false;
+        }
+        let window = Duration::from_secs(policy.window_secs);
+        self.block_strikes.push(BlockStrike { block, at: now });
+        self.block_strikes
+            .retain(|strike| now.saturating_duration_since(strike.at) <= window);
+        let count = self
+            .block_strikes
+            .iter()
+            .filter(|strike| strike.block == block)
+            .count();
+        if count < usize::try_from(policy.strikes).unwrap_or(usize::MAX) {
+            return false;
+        }
+        self.block_strikes.retain(|strike| strike.block != block);
+        self.quarantines
+            .retain(|quarantine| quarantine.block != block);
+        self.quarantines.push(BlockQuarantine {
+            block,
+            range: policy.range,
+            until: quarantine_deadline(now, policy.ttl_secs),
+        });
+        true
+    }
+
+    /// Drop exclusions whose TTL has passed so the list cannot grow without bound.
+    pub fn prune_expired_quarantines(&mut self, now: Instant) {
+        self.quarantines.retain(|quarantine| quarantine.active(now));
+    }
+
+    /// Whether a request starting at `block` must skip this upstream.
+    ///
+    /// Expired exclusions are removed as part of the check.
+    pub fn quarantined_for(&mut self, block: u32, now: Instant) -> bool {
+        self.prune_expired_quarantines(now);
+        self.quarantines
+            .iter()
+            .any(|quarantine| quarantine.covers(block))
+    }
+
+    pub fn any_quarantine_active(&mut self, now: Instant) -> bool {
+        self.prune_expired_quarantines(now);
+        !self.quarantines.is_empty()
+    }
+
+    /// Lowest start block among active exclusions, if any.
+    ///
+    /// Expired exclusions are removed as part of the check.
+    pub fn active_quarantine_block(&mut self, now: Instant) -> Option<u32> {
+        self.prune_expired_quarantines(now);
+        self.quarantines
+            .iter()
+            .map(|quarantine| quarantine.block)
+            .min()
+    }
+}
+
+fn quarantine_deadline(now: Instant, ttl_secs: u64) -> Instant {
+    now.checked_add(Duration::from_secs(ttl_secs))
+        .unwrap_or_else(|| {
+            now.checked_add(Duration::from_secs(86_400 * 365))
+                .unwrap_or(now)
+        })
 }
 
 impl Default for ServerState {
@@ -1202,6 +1408,269 @@ mod tests {
         assert!(
             err.contains("top-level 'require_chain_id' cannot be combined with 'listeners'"),
             "unexpected error: {err}"
+        );
+    }
+
+    fn quarantine_policy() -> BlockFailureQuarantine {
+        BlockFailureQuarantine {
+            strikes: 2,
+            window_secs: 10,
+            ttl_secs: 30,
+            range: 1,
+        }
+    }
+
+    #[test]
+    fn block_failure_quarantine_defaults_and_rejects_zero() {
+        let cfg: ServerConfig = serde_json::from_value(minimal_config()).unwrap();
+        assert!(cfg.block_failure_quarantine.is_none());
+        cfg.validate().unwrap();
+        assert!(cfg.resolved_listeners()[0]
+            .block_failure_quarantine
+            .is_none());
+
+        let mut value = minimal_config();
+        value["block_failure_quarantine"] = serde_json::json!({});
+        let cfg: ServerConfig = serde_json::from_value(value).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.resolved_listeners()[0].block_failure_quarantine,
+            Some(BlockFailureQuarantine {
+                strikes: 2,
+                window_secs: 300,
+                ttl_secs: 600,
+                range: 1,
+            })
+        );
+
+        let mut partial = minimal_config();
+        partial["block_failure_quarantine"] = serde_json::json!({"strikes": 1, "range": 3});
+        let cfg: ServerConfig = serde_json::from_value(partial).unwrap();
+        cfg.validate().unwrap();
+        let policy = cfg.resolved_listeners()[0]
+            .block_failure_quarantine
+            .unwrap();
+        assert_eq!(policy.strikes, 1);
+        assert_eq!(policy.window_secs, 300);
+        assert_eq!(policy.ttl_secs, 600);
+        assert_eq!(policy.range, 3);
+
+        for (field, value) in [
+            ("strikes", 0),
+            ("window_secs", 0),
+            ("ttl_secs", 0),
+            ("range", 0),
+        ] {
+            let mut bad = minimal_config();
+            bad["block_failure_quarantine"] = serde_json::json!({ field: value });
+            let cfg: ServerConfig = serde_json::from_value(bad).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(&format!(
+                    "block_failure_quarantine.{field} must be greater than 0"
+                )),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_failure_quarantine_is_per_listener() {
+        let listener_ok: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "listeners": [
+                {
+                    "name": "eos",
+                    "listen_port": 17000,
+                    "block_failure_quarantine": { "strikes": 4 },
+                    "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+                }
+            ]
+        }))
+        .unwrap();
+        listener_ok.validate().unwrap();
+        let policy = listener_ok.resolved_listeners()[0]
+            .block_failure_quarantine
+            .unwrap();
+        assert_eq!(policy.strikes, 4);
+        assert_eq!(policy.ttl_secs, 600);
+
+        let bad: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "listeners": [
+                {
+                    "name": "eos",
+                    "listen_port": 17000,
+                    "block_failure_quarantine": { "window_secs": 0 },
+                    "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+                }
+            ]
+        }))
+        .unwrap();
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "listener 'eos': block_failure_quarantine.window_secs must be greater than 0"
+            ),
+            "unexpected error: {err}"
+        );
+
+        let top_level: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "block_failure_quarantine": {},
+            "listeners": [
+                {
+                    "name": "eos",
+                    "listen_port": 17000,
+                    "servers": [{ "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true }]
+                }
+            ]
+        }))
+        .unwrap();
+        let err = top_level.validate().unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "top-level 'block_failure_quarantine' cannot be combined with 'listeners'"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn block_failure_strikes_quarantine_one_block_then_expire() {
+        let mut state = ServerState::new();
+        state.online = true;
+        let t0 = Instant::now();
+        let policy = quarantine_policy();
+
+        assert!(!state.record_block_failure(115, t0, None));
+        assert_eq!(state.block_failures, 1);
+        assert!(state.quarantines.is_empty());
+        assert!(state.online);
+
+        assert!(!state.record_block_failure(115, t0, Some(policy)));
+        assert!(!state.record_block_failure(116, t0 + Duration::from_secs(1), Some(policy)));
+        assert!(
+            !state.any_quarantine_active(t0 + Duration::from_secs(1)),
+            "strikes at different blocks must not combine"
+        );
+
+        assert!(state.record_block_failure(115, t0 + Duration::from_secs(2), Some(policy)));
+        assert!(
+            state.online,
+            "quarantine must not mark the upstream offline"
+        );
+        assert!(state.quarantined_for(115, t0 + Duration::from_secs(2)));
+        assert!(!state.quarantined_for(116, t0 + Duration::from_secs(2)));
+        assert_eq!(
+            state.active_quarantine_block(t0 + Duration::from_secs(2)),
+            Some(115)
+        );
+
+        let armed_at = t0 + Duration::from_secs(2);
+        assert!(
+            !state.record_block_failure(115, armed_at + Duration::from_secs(1), Some(policy)),
+            "drops during the TTL must not extend it"
+        );
+        let expired_at = armed_at + Duration::from_secs(policy.ttl_secs);
+        assert!(!state.quarantined_for(115, expired_at));
+        assert!(!state.any_quarantine_active(expired_at));
+        assert_eq!(state.active_quarantine_block(expired_at), None);
+    }
+
+    #[test]
+    fn block_failure_strikes_outside_the_window_do_not_quarantine() {
+        let mut state = ServerState::new();
+        let t0 = Instant::now();
+        let policy = quarantine_policy();
+        assert!(!state.record_block_failure(50, t0, Some(policy)));
+        assert!(!state.record_block_failure(
+            50,
+            t0 + Duration::from_secs(policy.window_secs + 1),
+            Some(policy)
+        ));
+        assert!(!state.any_quarantine_active(t0 + Duration::from_secs(policy.window_secs + 1)));
+        assert!(state.record_block_failure(
+            50,
+            t0 + Duration::from_secs(policy.window_secs + 2),
+            Some(policy)
+        ));
+    }
+
+    #[test]
+    fn block_failure_quarantine_range_covers_only_the_configured_span() {
+        let mut state = ServerState::new();
+        let t0 = Instant::now();
+        let policy = BlockFailureQuarantine {
+            range: 3,
+            ..quarantine_policy()
+        };
+        assert!(state.record_block_failure(
+            115,
+            t0,
+            Some(BlockFailureQuarantine {
+                strikes: 1,
+                ..policy
+            })
+        ));
+        assert!(state.quarantined_for(115, t0));
+        assert!(state.quarantined_for(117, t0));
+        assert!(!state.quarantined_for(118, t0));
+        assert!(!state.quarantined_for(114, t0));
+    }
+
+    #[test]
+    fn expired_quarantines_are_pruned_when_read() {
+        let now = Instant::now();
+        let expired_at = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+        let mut state = ServerState::new();
+        for block in 1..=49 {
+            state.quarantines.push(BlockQuarantine {
+                block,
+                range: 1,
+                until: expired_at,
+            });
+        }
+        state.quarantines.push(BlockQuarantine {
+            block: 115,
+            range: 1,
+            until: now + Duration::from_secs(60),
+        });
+        assert_eq!(state.quarantines.len(), 50);
+
+        assert!(state.quarantined_for(115, now));
+        assert!(!state.quarantined_for(1, now));
+        assert_eq!(
+            state.quarantines.len(),
+            1,
+            "a block check must drop expired exclusions without arming a new one"
+        );
+        assert_eq!(state.quarantines[0].block, 115);
+
+        let after_ttl = now + Duration::from_secs(60);
+        assert!(!state.any_quarantine_active(after_ttl));
+        assert!(
+            state.quarantines.is_empty(),
+            "an activity check must drop an exclusion once its TTL has passed"
+        );
+        assert_eq!(state.active_quarantine_block(after_ttl), None);
+
+        let mut only_expired = ServerState::new();
+        only_expired.quarantines.push(BlockQuarantine {
+            block: 10,
+            range: 1,
+            until: expired_at,
+        });
+        assert_eq!(only_expired.active_quarantine_block(now), None);
+        assert!(
+            only_expired.quarantines.is_empty(),
+            "the metrics snapshot must drop expired exclusions"
         );
     }
 }

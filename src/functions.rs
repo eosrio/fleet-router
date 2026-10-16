@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use crate::errors;
 use crate::models::ServerState;
@@ -132,10 +133,10 @@ pub fn should_reroute_for_finality(
 /// Otherwise selection is unchanged (v0 trace-range behaviour), including when
 /// no upstream has reported a covering finality range.
 pub fn select_backend_server(
-    servers: &HashMap<String, ServerState>,
+    servers: &mut HashMap<String, ServerState>,
     route: RouteRequest,
 ) -> Result<String, &'static str> {
-    select_ranked(servers, route, true)
+    select_ranked(servers, route, true, None)
 }
 
 /// Select an upstream for a session whose socket just died.
@@ -146,21 +147,29 @@ pub fn select_backend_server(
 /// fails, and that is often the same drop the proxy just saw. Refusing the
 /// only server would close the client before the handshake and the
 /// pending-byte cap can run. New sessions keep the online requirement.
+///
+/// `exclude` is the upstream that just failed at this block. Another upstream
+/// at the same or better rank is preferred. The excluded upstream is still
+/// returned when it is the only one that covers the block, or the only
+/// candidate at all.
 pub fn select_failover_server(
-    servers: &HashMap<String, ServerState>,
+    servers: &mut HashMap<String, ServerState>,
     route: RouteRequest,
+    exclude: Option<&str>,
 ) -> Result<String, &'static str> {
-    if let Ok(server) = select_backend_server(servers, route) {
+    if let Ok(server) = select_ranked(servers, route, true, exclude) {
         return Ok(server);
     }
-    select_ranked(servers, route, false)
+    select_ranked(servers, route, false, exclude)
 }
 
 fn select_ranked(
-    servers: &HashMap<String, ServerState>,
+    servers: &mut HashMap<String, ServerState>,
     route: RouteRequest,
     require_online: bool,
+    exclude: Option<&str>,
 ) -> Result<String, &'static str> {
+    let now = Instant::now();
     let restrict_finality = route.fetch_finality_data
         && route.block.is_some_and(|block| {
             servers
@@ -170,12 +179,17 @@ fn select_ranked(
 
     // Lower (rank, connections) is better.
     let mut best: Option<(u8, usize, String)> = None;
+    let mut best_other: Option<(u8, usize, String)> = None;
 
-    for (server, state) in servers.iter() {
+    for (server, state) in servers.iter_mut() {
+        state.prune_expired_quarantines(now);
         if !state.enabled || (require_online && !state.online) {
             continue;
         }
         if let Some(block) = route.block {
+            if state.quarantined_for(block, now) {
+                continue;
+            }
             if restrict_finality && !finality_covers(state, block) {
                 continue;
             }
@@ -192,29 +206,51 @@ fn select_ranked(
             (false, true) => 3,
         };
 
-        let better = match &best {
-            None => true,
-            Some((best_rank, best_conns, _)) => (rank, conns) < (*best_rank, *best_conns),
-        };
-        if better {
+        if best
+            .as_ref()
+            .is_none_or(|(best_rank, best_conns, _)| (rank, conns) < (*best_rank, *best_conns))
+        {
             best = Some((rank, conns, server.clone()));
+        }
+        if exclude != Some(server.as_str())
+            && best_other
+                .as_ref()
+                .is_none_or(|(best_rank, best_conns, _)| (rank, conns) < (*best_rank, *best_conns))
+        {
+            best_other = Some((rank, conns, server.clone()));
         }
     }
 
-    match best {
-        Some((rank, _, server)) => {
-            if let Some(block) = route.block {
-                if rank >= 2 && !restrict_finality {
-                    tracing::warn!(
-                        block,
-                        "no upstream covers the requested block; falling back to least-connections"
-                    );
-                }
-            }
-            Ok(server)
+    // Prefer a different upstream only when it is as suitable as the best
+    // candidate. A peer that does not cover the block must not replace the
+    // only upstream that does.
+    let chosen = match (exclude, best, best_other) {
+        (Some(_), Some((best_rank, _, _)), Some((other_rank, _, other)))
+            if other_rank <= best_rank =>
+        {
+            other
         }
-        None => Err(errors::NO_SERVERS_AVAILABLE),
+        (_, Some((_, _, server)), _) => server,
+        _ => return Err(errors::NO_SERVERS_AVAILABLE),
+    };
+    let rank = servers.get(&chosen).map_or(0, |state| {
+        let covers_range = route.block.is_some_and(|block| trace_covers(state, block));
+        match (covers_range, state.stale) {
+            (true, false) => 0,
+            (true, true) => 1,
+            (false, false) => 2,
+            (false, true) => 3,
+        }
+    });
+    if let Some(block) = route.block {
+        if rank >= 2 && !restrict_finality {
+            tracing::warn!(
+                block,
+                "no upstream covers the requested block; falling back to least-connections"
+            );
+        }
     }
+    Ok(chosen)
 }
 
 pub fn buffer_to_hex(buffer: Vec<u8>) -> String {
@@ -244,9 +280,9 @@ mod tests {
     fn new_sessions_skip_offline_upstreams() {
         let mut servers = HashMap::new();
         servers.insert("dead".into(), state(true, false, 0));
-        assert!(select_backend_server(&servers, RouteRequest::default()).is_err());
+        assert!(select_backend_server(&mut servers, RouteRequest::default()).is_err());
         assert_eq!(
-            select_failover_server(&servers, RouteRequest::default()).unwrap(),
+            select_failover_server(&mut servers, RouteRequest::default(), None).unwrap(),
             "dead"
         );
     }
@@ -257,11 +293,11 @@ mod tests {
         servers.insert("dead".into(), state(true, false, 0));
         servers.insert("live".into(), state(true, true, 5));
         assert_eq!(
-            select_backend_server(&servers, RouteRequest::default()).unwrap(),
+            select_backend_server(&mut servers, RouteRequest::default()).unwrap(),
             "live"
         );
         assert_eq!(
-            select_failover_server(&servers, RouteRequest::default()).unwrap(),
+            select_failover_server(&mut servers, RouteRequest::default(), None).unwrap(),
             "live"
         );
     }
@@ -271,8 +307,8 @@ mod tests {
         let mut servers = HashMap::new();
         servers.insert("off".into(), state(false, false, 0));
         servers.insert("also".into(), state(false, true, 0));
-        assert!(select_failover_server(&servers, RouteRequest::default()).is_err());
-        assert!(select_backend_server(&servers, RouteRequest::default()).is_err());
+        assert!(select_failover_server(&mut servers, RouteRequest::default(), None).is_err());
+        assert!(select_backend_server(&mut servers, RouteRequest::default()).is_err());
     }
 
     fn server(conns: usize, trace: (u32, u32), finality: (u32, u32)) -> ServerState {
@@ -341,8 +377,9 @@ mod tests {
 
     #[test]
     fn finality_request_skips_upstream_that_does_not_cover() {
+        let mut servers = fleet();
         let picked = select_backend_server(
-            &fleet(),
+            &mut servers,
             RouteRequest {
                 block: Some(100),
                 fetch_finality_data: true,
@@ -354,8 +391,9 @@ mod tests {
 
     #[test]
     fn non_finality_request_keeps_least_connections() {
+        let mut servers = fleet();
         let picked = select_backend_server(
-            &fleet(),
+            &mut servers,
             RouteRequest {
                 block: Some(100),
                 fetch_finality_data: false,
@@ -370,7 +408,7 @@ mod tests {
         let mut servers = fleet();
         servers.get_mut("a").unwrap().finality_data_end_block = 50; // does not cover 100
         let picked = select_backend_server(
-            &servers,
+            &mut servers,
             RouteRequest {
                 block: Some(100),
                 fetch_finality_data: true,
@@ -386,7 +424,7 @@ mod tests {
         servers.insert("busy".to_string(), server(4, (1, 500), (0, 0)));
         servers.insert("idle".to_string(), server(0, (1, 500), (0, 0)));
         let picked = select_backend_server(
-            &servers,
+            &mut servers,
             RouteRequest {
                 block: Some(10),
                 fetch_finality_data: true,
@@ -413,7 +451,7 @@ mod tests {
         servers.get_mut("a").unwrap().online = false;
         assert!(!should_reroute_for_finality(&servers, "b", 100));
         let err = select_backend_server(
-            &servers,
+            &mut servers,
             RouteRequest {
                 block: Some(100),
                 fetch_finality_data: true,
@@ -421,5 +459,118 @@ mod tests {
         )
         .unwrap();
         assert_eq!(err, "b");
+    }
+
+    fn route_at(block: u32) -> RouteRequest {
+        RouteRequest {
+            block: Some(block),
+            fetch_finality_data: false,
+        }
+    }
+
+    #[test]
+    fn retry_prefers_another_upstream_that_covers_the_block() {
+        let mut servers = HashMap::new();
+        // The upstream that just failed has fewer connections, so plain
+        // least-connections would pick it again.
+        servers.insert("failed".to_string(), server(0, (1, 500), (0, 0)));
+        servers.insert("other".to_string(), server(4, (1, 500), (0, 0)));
+        let picked = select_failover_server(&mut servers, route_at(100), Some("failed")).unwrap();
+        assert_eq!(picked, "other");
+    }
+
+    #[test]
+    fn retry_keeps_the_only_upstream_that_covers_the_block() {
+        let mut servers = HashMap::new();
+        servers.insert("failed".to_string(), server(1, (1, 500), (0, 0)));
+        servers.insert("short".to_string(), server(0, (1, 50), (0, 0)));
+        let picked = select_failover_server(&mut servers, route_at(100), Some("failed")).unwrap();
+        assert_eq!(picked, "failed");
+    }
+
+    #[test]
+    fn retry_of_the_only_upstream_still_selects_it() {
+        let mut servers = HashMap::new();
+        servers.insert("only".to_string(), server(1, (1, 500), (0, 0)));
+        let picked = select_failover_server(&mut servers, route_at(100), Some("only")).unwrap();
+        assert_eq!(picked, "only");
+    }
+
+    #[test]
+    fn quarantined_upstream_is_skipped_only_inside_its_range() {
+        use std::time::Duration;
+
+        use crate::models::BlockQuarantine;
+
+        let mut servers = HashMap::new();
+        let mut bad = server(0, (1, 500), (0, 0));
+        bad.quarantines.push(BlockQuarantine {
+            block: 115,
+            range: 1,
+            until: Instant::now() + Duration::from_secs(60),
+        });
+        bad.online = true;
+        servers.insert("bad".to_string(), bad);
+        servers.insert("good".to_string(), server(5, (1, 500), (0, 0)));
+
+        assert_eq!(
+            select_backend_server(&mut servers, route_at(115)).unwrap(),
+            "good"
+        );
+        assert_eq!(
+            select_backend_server(&mut servers, route_at(100)).unwrap(),
+            "bad",
+            "a quarantine at 115 must not affect a request starting at 100"
+        );
+        assert_eq!(
+            select_backend_server(&mut servers, RouteRequest::default()).unwrap(),
+            "bad",
+            "initial connect has no block and must ignore range quarantine"
+        );
+    }
+
+    #[test]
+    fn expired_quarantine_does_not_exclude() {
+        use std::time::Duration;
+
+        use crate::models::BlockQuarantine;
+
+        let mut servers = HashMap::new();
+        let mut bad = server(0, (1, 500), (0, 0));
+        bad.quarantines.push(BlockQuarantine {
+            block: 115,
+            range: 1,
+            until: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+        });
+        servers.insert("bad".to_string(), bad);
+        servers.insert("good".to_string(), server(3, (1, 500), (0, 0)));
+        assert_eq!(
+            select_backend_server(&mut servers, route_at(115)).unwrap(),
+            "bad"
+        );
+    }
+
+    #[test]
+    fn quarantine_does_not_fall_back_to_the_excluded_upstream() {
+        use std::time::Duration;
+
+        use crate::models::BlockQuarantine;
+
+        let mut servers = HashMap::new();
+        let mut only = server(0, (1, 500), (0, 0));
+        only.quarantines.push(BlockQuarantine {
+            block: 115,
+            range: 2,
+            until: Instant::now() + Duration::from_secs(60),
+        });
+        servers.insert("only".to_string(), only);
+        assert!(select_backend_server(&mut servers, route_at(116)).is_err());
+        assert!(select_failover_server(&mut servers, route_at(116), Some("only")).is_err());
+        assert_eq!(
+            select_backend_server(&mut servers, route_at(117)).unwrap(),
+            "only"
+        );
     }
 }

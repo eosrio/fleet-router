@@ -307,6 +307,42 @@ html {
   min-height: var(--mast);
 }
 
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.brand-name {
+  font-size: 1.1875rem;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  line-height: 1;
+}
+
+.brand-mark {
+  display: block;
+}
+
+.brand-mark-field {
+  fill: var(--field);
+  stroke: var(--rule-strong);
+}
+
+.brand-mark-dim {
+  stroke: var(--track-dim);
+}
+
+.brand-mark-set {
+  stroke: var(--accent);
+}
+
+.brand-mark-lamp {
+  fill: var(--warn);
+}
+
 .brands,
 .footer-brands {
   display: inline-flex;
@@ -314,6 +350,26 @@ html {
   gap: 0.9rem;
   color: var(--ink);
   text-decoration: none;
+}
+
+.brands-by {
+  gap: 0.75rem;
+  margin-left: -0.6rem;
+  color: var(--ink-2);
+}
+
+.brands-by .logo-eosrio {
+  width: 92px;
+  height: 17px;
+}
+
+.brands-by .logo-rioblocks {
+  width: 68px;
+  height: 18px;
+}
+
+.footer-brands .brand-name {
+  font-size: 1rem;
 }
 
 .logo {
@@ -1321,6 +1377,10 @@ pre code {
   }
 
   .mast-github span {
+    display: none;
+  }
+
+  .brands-by {
     display: none;
   }
 

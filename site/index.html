@@ -33,11 +33,20 @@
 
   <header class="masthead">
     <div class="wrap masthead-row">
-      <a class="brands" href="#top" aria-label="fleet-router, by EOS Rio and Rio Blocks">
-        <span class="logo logo-eosrio" role="img" aria-label="EOS Rio"></span>
-        <span class="logo-sep" aria-hidden="true"></span>
-        <span class="logo logo-rioblocks" role="img" aria-label="Rio Blocks"></span>
+      <a class="brand" href="#top">
+        <svg class="brand-mark" width="24" height="24" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+          <rect x="0.5" y="0.5" width="31" height="31" rx="4" class="brand-mark-field"/>
+          <path d="M4 11h8l5 5h11M4 21h8l5-5" fill="none" stroke-width="2" stroke-linejoin="round" class="brand-mark-dim"/>
+          <path d="M4 11h8l5 5h11" fill="none" stroke-width="2.5" stroke-linejoin="round" class="brand-mark-set"/>
+          <circle cx="26" cy="21" r="2.2" class="brand-mark-lamp"/>
+        </svg>
+        <span class="brand-name">fleet-router</span>
       </a>
+      <span class="brands brands-by" aria-label="by EOS Rio and Rio Blocks">
+        <span class="logo-sep" aria-hidden="true"></span>
+        <span class="logo logo-eosrio" role="img" aria-label="EOS Rio"></span>
+        <span class="logo logo-rioblocks" role="img" aria-label="Rio Blocks"></span>
+      </span>
       <nav class="nav" aria-label="Sections">
         <a href="#how">Failover</a>
         <a href="#features">Features</a>
@@ -340,6 +349,8 @@ fleet_router_upstream_quarantine_block{endpoint,server}</code></pre>
   <footer class="footer">
     <div class="wrap footer-row">
       <div class="footer-brands">
+        <span class="brand-name">fleet-router</span>
+        <span class="logo-sep" aria-hidden="true"></span>
         <span class="logo logo-eosrio" role="img" aria-label="EOS Rio"></span>
         <span class="logo-sep" aria-hidden="true"></span>
         <span class="logo logo-rioblocks" role="img" aria-label="Rio Blocks"></span>

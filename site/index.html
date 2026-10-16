@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>fleet-router — Antelope SHiP reverse proxy and load balancer</title>
+  <meta name="description" content="Rust reverse proxy and load balancer for Antelope SHiP websockets by EOS Rio. One endpoint for Hyperion, Atomic, and indexers, with failover and multi-network listeners.">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#07090d">
+  <link rel="canonical" href="https://eosrio.github.io/fleet-router/">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2032%2032%27%3E%3Crect%20width%3D%2732%27%20height%3D%2732%27%20rx%3D%277%27%20fill%3D%27%2310151c%27%2F%3E%3Ccircle%20cx%3D%2716%27%20cy%3D%2716%27%20r%3D%273.2%27%20fill%3D%27%233ee0c2%27%2F%3E%3Ccircle%20cx%3D%278%27%20cy%3D%278.5%27%20r%3D%272.1%27%20fill%3D%27%23e8eef6%27%2F%3E%3Ccircle%20cx%3D%2724%27%20cy%3D%278.5%27%20r%3D%272.1%27%20fill%3D%27%23e8eef6%27%2F%3E%3Ccircle%20cx%3D%2716%27%20cy%3D%2724.5%27%20r%3D%272.1%27%20fill%3D%27%23e8eef6%27%2F%3E%3Cpath%20d%3D%27M14.1%2014.2%209.5%2010.2M17.9%2014.2%2022.5%2010.2M16%2019.3v3.1%27%20stroke%3D%27%233ee0c2%27%20stroke-width%3D%271.5%27%20fill%3D%27none%27%20stroke-linecap%3D%27round%27%2F%3E%3C%2Fsvg%3E" type="image/svg+xml">
+  <meta property="og:title" content="fleet-router — Antelope SHiP load balancer">
+  <meta property="og:description" content="Rust reverse proxy and load balancer for Antelope SHiP websockets by EOS Rio. One endpoint for Hyperion, Atomic, and indexers, with failover and multi-network listeners.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://eosrio.github.io/fleet-router/">
+  <meta property="og:site_name" content="fleet-router">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="fleet-router — Antelope SHiP load balancer">
+  <meta name="twitter:description" content="Rust reverse proxy and load balancer for Antelope SHiP websockets by EOS Rio. One endpoint for Hyperion, Atomic, and indexers, with failover and multi-network listeners.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body id="top">
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="wrap bar">
+      <a class="brand" href="#top">
+        <svg width="28" height="28" viewBox="0 0 32 32" aria-hidden="true">
+          <rect width="32" height="32" rx="7" fill="#10151c" stroke="#2a3544"/>
+          <circle cx="16" cy="16" r="3.2" fill="#3ee0c2"/>
+          <circle cx="8" cy="8.5" r="2.1" fill="#e8eef6"/>
+          <circle cx="24" cy="8.5" r="2.1" fill="#e8eef6"/>
+          <circle cx="16" cy="24.5" r="2.1" fill="#e8eef6"/>
+          <path d="M14.1 14.2 9.5 10.2M17.9 14.2 22.5 10.2M16 19.3v3.1" stroke="#3ee0c2" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+        </svg>
+        <span>fleet-router</span>
+      </a>
+      <nav class="nav" aria-label="On this page">
+        <a href="#features">Features</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#install">Install</a>
+        <a href="#config">Config</a>
+        <a href="#metrics">Metrics</a>
+      </nav>
+      <a class="button button-ghost header-link" href="https://github.com/eosrio/fleet-router">GitHub</a>
+    </div>
+  </header>
+
+  <main id="main">
+    <div class="wrap">
+      <section class="hero" aria-labelledby="hero-title">
+        <div>
+          <p class="kicker"><span class="pill">v0.5.0</span> EOS Rio · Antelope SHiP</p>
+          <h1 id="hero-title">One WebSocket for the whole SHiP fleet.</h1>
+          <p class="lede">fleet-router is a Rust reverse proxy and load balancer for Antelope State History nodes. Hyperion, Atomic, and other indexers open a single connection. The router picks a healthy upstream and keeps that connection up when a node drops.</p>
+          <div class="actions">
+            <a class="button button-primary" href="#install">Install</a>
+            <a class="button button-ghost" href="https://github.com/eosrio/fleet-router">View source</a>
+          </div>
+          <ul class="text-links">
+            <li><a href="https://crates.io/crates/fleet-router">crates.io</a></li>
+            <li><a href="https://github.com/eosrio/fleet-router#readme">Docs</a></li>
+            <li><a href="https://github.com/eosrio/fleet-router/releases">Releases</a></li>
+            <li><a href="https://github.com/eosrio/fleet-router/blob/main/CHANGELOG.md">Changelog</a></li>
+          </ul>
+        </div>
+        <aside class="panel stats" aria-labelledby="footprint-title">
+          <p class="panel-label" id="footprint-title">Operator footprint</p>
+          <ul class="stat-list">
+            <li>
+              <strong>~13 MB</strong>
+              <span>RSS idle, 27 upstreams across 13 networks</span>
+            </li>
+            <li>
+              <strong>~39 MB</strong>
+              <span>RSS with 12 active clients</span>
+            </li>
+            <li>
+              <strong>&lt;1% CPU</strong>
+              <span>same deployment</span>
+            </li>
+          </ul>
+        </aside>
+      </section>
+
+      <section class="section" id="features" aria-labelledby="features-title">
+        <div class="section-head">
+          <h2 id="features-title">What it does</h2>
+          <p class="index">01 — Features</p>
+        </div>
+        <div class="feature-grid">
+          <article class="panel feature">
+            <h3>Single resilient endpoint</h3>
+            <p>Hyperion, Atomic, and other indexers share one WebSocket instead of pinning each consumer to a single SHiP node.</p>
+          </article>
+          <article class="panel feature">
+            <h3>Range-aware least-connections</h3>
+            <p>Prefer an upstream whose trace range covers the requested block, then the least-loaded healthy node. A <code>get_blocks_request_v1</code> with <code>fetch_finality_data</code> is sent only to an upstream whose finality range covers that block.</p>
+          </article>
+          <article class="panel feature">
+            <h3>Transparent failover</h3>
+            <p>If the active upstream drops, the client socket stays open. fleet-router resumes <code>get_blocks</code> at the next block, de-duplicates blocks already delivered, and replays client frames buffered during the swap.</p>
+          </article>
+          <article class="panel feature">
+            <h3>Many networks, one process</h3>
+            <p><code>listeners</code> serves each chain on its own port, with its own upstream pool, <code>chain_id</code>, connection cap, and <code>/ready/&lt;name&gt;</code> check.</p>
+          </article>
+          <article class="panel feature">
+            <h3><code>chain_id</code> verification</h3>
+            <p>An upstream whose reported <code>chain_id</code> disagrees with the pin or the rest of its pool stays offline. Nodes that omit <code>chain_id</code> — FIO and other EOSIO 2.0 builds — stay usable unless <code>require_chain_id</code> is set.</p>
+          </article>
+          <article class="panel feature">
+            <h3>Bounded failover and quarantine</h3>
+            <p>Repeated unclean drops at the same next block are bounded: the session closes with WebSocket code 1011 after five. Opt-in <code>block_failure_quarantine</code> skips a corrupted SHiP log range without marking the node offline.</p>
+          </article>
+          <article class="panel feature">
+            <h3>Prometheus metrics</h3>
+            <p>Per-upstream series carry <code>server</code> and <code>endpoint</code> labels, plus <code>listener</code> in multi-listener mode, including SHiP range gauges for trace, chain state, and finality.</p>
+          </article>
+          <article class="panel feature">
+            <h3>Upstream <code>wss://</code></h3>
+            <p>Optional TLS to SHiP nodes. Certificates are verified with rustls against the OS trust store. A bare <code>host:port</code> stays <code>ws://</code>. The client listener remains plaintext.</p>
+          </article>
+          <article class="panel feature">
+            <h3>Graceful shutdown</h3>
+            <p>Handles <code>SIGINT</code> and <code>SIGTERM</code> with a bounded drain and WebSocket close frames. Written in Rust on tokio and tokio-tungstenite. ABI checks use pure-Rust <code>rs_abieos</code>, so <code>libclang</code> is not required.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="architecture" aria-labelledby="architecture-title">
+        <div class="section-head">
+          <h2 id="architecture-title">How a request moves</h2>
+          <p class="index">02 — Architecture</p>
+        </div>
+        <figure class="panel schematic">
+          <figcaption id="schematic-caption">Multi-listener routing in one process</figcaption>
+          <div class="schematic-flow">
+            <ul class="client-row">
+              <li class="node">Hyperion</li>
+              <li class="node">Atomic</li>
+              <li class="node">Indexers</li>
+            </ul>
+            <svg class="join" viewBox="0 0 600 28" aria-hidden="true" focusable="false">
+              <path d="M100 0 V12 H300 V28 M300 0 V28 M500 0 V12 H300" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            </svg>
+            <div class="router-node">
+              <strong>fleet-router</strong>
+              <p>range-aware least-connections · health monitoring · one process</p>
+            </div>
+            <svg class="join" viewBox="0 0 600 28" aria-hidden="true" focusable="false">
+              <path d="M300 0 V12 H150 V28 M300 12 H450 V28" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            </svg>
+            <ul class="listener-row">
+              <li class="listener">
+                <header>
+                  <h3>eos</h3>
+                  <p>port 17000 · <code>/ready/eos</code></p>
+                </header>
+                <ul class="upstreams">
+                  <li class="upstream"><span>EOS SHiP 1</span><code>10.0.1.10:8080</code></li>
+                  <li class="upstream"><span>EOS SHiP 2</span><code>10.0.1.11:8080</code></li>
+                </ul>
+              </li>
+              <li class="listener">
+                <header>
+                  <h3>wax</h3>
+                  <p>port 17001 · <code>/ready/wax</code></p>
+                </header>
+                <ul class="upstreams">
+                  <li class="upstream"><span>WAX SHiP 1</span><code>10.0.2.10:8080</code></li>
+                  <li class="upstream"><span>WAX SHiP 2</span><code>10.0.2.11:8080</code></li>
+                </ul>
+              </li>
+            </ul>
+          </div>
+        </figure>
+        <ol class="steps">
+          <li>Client connects over WebSocket. The router forwards the selected upstream's ABI.</li>
+          <li>Selection prefers a trace range that covers the block, then the least-loaded healthy upstream.</li>
+          <li>On loss, <code>get_blocks</code> resumes at the next block on another suitable node.</li>
+          <li>Replayed blocks the client already has are dropped. The client does not reconnect.</li>
+        </ol>
+        <p class="note">Unclean drops at the same next block back off and stop after five, closing the client with code 1011. Quarantine is off until <code>block_failure_quarantine</code> is set. The bound itself is always on.</p>
+      </section>
+
+      <section class="section" id="install" aria-labelledby="install-title">
+        <div class="section-head">
+          <h2 id="install-title">Install</h2>
+          <p class="index">03 — Run it</p>
+        </div>
+        <div class="install-grid">
+          <article class="panel install-card">
+            <h3>crates.io</h3>
+            <p>Requires Rust 1.99 or newer. Building <code>wss://</code> support needs a C compiler and CMake; they are not required at runtime.</p>
+            <div class="codeblock">
+              <header>
+                <span>shell</span>
+                <button type="button" class="copy" data-copy-target="cmd-cargo" data-copy-name="the cargo install command" data-label="Copy">Copy</button>
+              </header>
+              <pre tabindex="0"><code id="cmd-cargo">cargo install fleet-router</code></pre>
+            </div>
+          </article>
+          <article class="panel install-card">
+            <h3>Docker</h3>
+            <p>Image <code>ghcr.io/eosrio/fleet-router</code> on GHCR, published on tagged releases. It runs as a non-root user.</p>
+            <div class="codeblock">
+              <header>
+                <span>shell</span>
+                <button type="button" class="copy" data-copy-target="cmd-docker" data-copy-name="the docker pull command" data-label="Copy">Copy</button>
+              </header>
+              <pre tabindex="0"><code id="cmd-docker">docker pull ghcr.io/eosrio/fleet-router</code></pre>
+            </div>
+          </article>
+        <article class="panel install-card span-all">
+          <h3>Prebuilt binaries</h3>
+          <p>GitHub Releases ships archives for these targets. <a href="https://github.com/eosrio/fleet-router/releases">Download a release</a>.</p>
+          <ul class="platforms">
+            <li>Linux x86_64</li>
+            <li>macOS arm64</li>
+            <li>macOS x86_64</li>
+            <li>Windows x86_64</li>
+          </ul>
+        </article>
+        </div>
+        <h3>Quick start</h3>
+        <ol class="quickstart">
+          <li>
+            <div class="codeblock">
+              <header>
+                <span>shell</span>
+                <button type="button" class="copy" data-copy-target="cmd-init" data-copy-name="the config init command" data-label="Copy">Copy</button>
+              </header>
+              <pre tabindex="0"><code id="cmd-init">fleet-router config init ./config.json</code></pre>
+            </div>
+          </li>
+          <li>
+            <div class="codeblock">
+              <header>
+                <span>shell</span>
+                <button type="button" class="copy" data-copy-target="cmd-test" data-copy-name="the config test command" data-label="Copy">Copy</button>
+              </header>
+              <pre tabindex="0"><code id="cmd-test">fleet-router config test ./config.json</code></pre>
+            </div>
+          </li>
+          <li>
+            <div class="codeblock">
+              <header>
+                <span>shell</span>
+                <button type="button" class="copy" data-copy-target="cmd-run" data-copy-name="the run command" data-label="Copy">Copy</button>
+              </header>
+              <pre tabindex="0"><code id="cmd-run">fleet-router run --config ./config.json</code></pre>
+            </div>
+          </li>
+        </ol>
+        <p class="security"><strong>Do not expose fleet-router directly to the public internet.</strong> The client listener is plaintext <code>ws://</code> and unauthenticated. Terminate TLS and add access control on a reverse proxy in front of it.</p>
+      </section>
+
+      <section class="section" id="config" aria-labelledby="config-title">
+        <div class="section-head">
+          <h2 id="config-title">Multi-listener config</h2>
+          <p class="index">04 — Example</p>
+        </div>
+        <p class="lede">One process, two chains. A bare <code>host:port</code> is dialed as <code>ws://</code>; use <code>wss://host:port</code> when the node serves TLS. Pin <code>chain_id</code> on every listener.</p>
+        <div class="codeblock">
+          <header>
+            <span>config.json</span>
+            <button type="button" class="copy" data-copy-target="config-json" data-copy-name="the sample config" data-label="Copy">Copy</button>
+          </header>
+          <pre tabindex="0"><code id="config-json">{
+  "listen_address": "0.0.0.0",
+  "upstream_reconnect_ms": 3000,
+  "upstream_monitoring_ms": 5000,
+  "upstream_status_ms": 5000,
+  "metrics_port": 9090,
+  "listeners": [
+    {
+      "name": "eos",
+      "listen_port": 17000,
+      "chain_id": "aca376f206b8fc25a6ed44dbdc66547c36c6c33e3a119ffbeaef943642f0e906",
+      "servers": [
+        {
+          "name": "EOS SHiP 1",
+          "endpoint": "10.0.1.10:8080",
+          "enabled": true
+        },
+        {
+          "name": "EOS SHiP 2",
+          "endpoint": "10.0.1.11:8080",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "name": "wax",
+      "listen_port": 17001,
+      "chain_id": "1064487b3cd1a897ce03ae5b6a865651747e2e152090f99c1d19d44e01aea5a4",
+      "servers": [
+        {
+          "name": "WAX SHiP 1",
+          "endpoint": "10.0.2.10:8080",
+          "enabled": true
+        },
+        {
+          "name": "WAX SHiP 2",
+          "endpoint": "10.0.2.11:8080",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}</code></pre>
+        </div>
+      </section>
+
+      <section class="section" id="metrics" aria-labelledby="metrics-title">
+        <div class="section-head">
+          <h2 id="metrics-title">Health and metrics</h2>
+          <p class="index">05 — Observe</p>
+        </div>
+        <div class="metrics">
+          <div class="panel metric-list">
+            <dl>
+              <div>
+                <dt>/health</dt>
+                <dd>200 while the process is running.</dd>
+              </div>
+              <div>
+                <dt>/ready</dt>
+                <dd>200 when every listener has an online upstream. In single-port mode, when at least one upstream is online. Otherwise 503.</dd>
+              </div>
+              <div>
+                <dt>/ready/&lt;name&gt;</dt>
+                <dd>200 or 503 for that listener, or 404 if the name is unknown.</dd>
+              </div>
+              <div>
+                <dt>/metrics</dt>
+                <dd>Prometheus text. Set <code>metrics_port</code> to enable the HTTP endpoint.</dd>
+              </div>
+            </dl>
+          </div>
+          <div class="panel feature">
+            <h3>Labels and range gauges</h3>
+            <p>Each per-upstream series carries <code>server</code> and <code>endpoint</code>. Multi-listener mode adds <code>listener</code>. Range gauges report the start and end block of each SHiP range: trace, chain state, and finality. v0.5.0 also exports block-failure and quarantine gauges. <code>fleet_router_up</code> is a process gauge with no labels.</p>
+            <p>Logging is <code>tracing</code>, controlled with <code>RUST_LOG</code> (default <code>info</code>).</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="links-title">
+        <div class="section-head">
+          <h2 id="links-title">Project</h2>
+          <p class="index">06 — Links</p>
+        </div>
+        <div class="link-grid">
+          <a class="panel link-card" href="https://github.com/eosrio/fleet-router">
+            <strong>GitHub</strong>
+            <span>Source and issues</span>
+          </a>
+          <a class="panel link-card" href="https://crates.io/crates/fleet-router">
+            <strong>crates.io</strong>
+            <span>cargo install fleet-router</span>
+          </a>
+          <a class="panel link-card" href="https://github.com/eosrio/fleet-router#readme">
+            <strong>Docs</strong>
+            <span>README</span>
+          </a>
+          <a class="panel link-card" href="https://github.com/eosrio/fleet-router/releases">
+            <strong>Releases</strong>
+            <span>Binaries and notes</span>
+          </a>
+          <a class="panel link-card" href="https://github.com/eosrio/fleet-router/blob/main/CHANGELOG.md">
+            <strong>Changelog</strong>
+            <span>Latest is v0.5.0</span>
+          </a>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <p>MIT License · <a href="https://github.com/eosrio">EOS Rio</a></p>
+    </div>
+  </footer>
+  <p id="copy-status" class="sr-only" aria-live="polite"></p>
+  <script src="copy.js" defer></script>
+</body>
+</html>

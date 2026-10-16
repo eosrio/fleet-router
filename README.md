@@ -1,5 +1,7 @@
 # fleet-router
 
+[Homepage](https://eosrio.github.io/fleet-router/)
+
 A reverse proxy and load balancer for the Antelope **SHiP** (State History Plugin) WebSocket protocol.
 
 [![CI](https://github.com/eosrio/fleet-router/actions/workflows/ci.yml/badge.svg)](https://github.com/eosrio/fleet-router/actions/workflows/ci.yml)

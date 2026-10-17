@@ -314,7 +314,11 @@ fn quarantine_bounds(u: &UpstreamView, now: Instant) -> impl Iterator<Item = u32
 /// An archive known to have no block log, serving a `fetch_block` request,
 /// also ends its run where another upstream that holds blocks becomes
 /// eligible (its range begins, or its quarantine ends), so the stream is
-/// handed off to it there.
+/// handed off to it there. Only an upstream that could take the stream now
+/// counts: online and below `max_sessions`. The next leg would not go to an
+/// offline or full one, so the run would end only to go on from the same
+/// archive. A session on such an archive moves to a holder that comes back
+/// or frees a slot anyway (`Session::forward_without_block`).
 pub fn run_end(v: &FleetView, u: &UpstreamView, need: Need, from: u32, now: Instant) -> u32 {
     let cap = match u.role {
         Role::Frozen => u.max_end(),
@@ -338,7 +342,11 @@ pub fn run_end(v: &FleetView, u: &UpstreamView, need: Need, from: u32, now: Inst
             return b;
         }
         let holder = |w: &UpstreamView| {
-            w.index != u.index && !w.no_block_log && eligible(v, w, need, b, Union::Sticky, now)
+            w.index != u.index
+                && !w.no_block_log
+                && w.online
+                && !w.at_capacity()
+                && eligible(v, w, need, b, Union::Sticky, now)
         };
         if yields && v.upstreams.iter().any(holder) {
             return b;
@@ -1041,6 +1049,37 @@ mod tests {
         };
         assert_eq!(run_end(&v, b, traces, 15, now), 1001);
         assert_eq!(run_end(&v, b, all(), 15, now + NOW_TTL * 2), 1001);
+    }
+
+    /// A twin that holds blocks but is offline or full could not take the
+    /// stream: a leg on the archive without a block log does not end where
+    /// the twin's finality data begins, only to go on from the same archive.
+    #[test]
+    fn a_leg_without_blocks_ends_only_where_a_holder_can_take_the_stream() {
+        let now = now();
+        let bare = || {
+            let mut s = with_finality(frozen(0, 2, 1501), 991, 1501);
+            s.no_block_log = true;
+            s
+        };
+        let holder = || with_finality(frozen(1, 2, 1501), 991, 1501);
+
+        let mut offline = holder();
+        offline.online = false;
+        let v = view(vec![bare(), offline]);
+        assert_eq!(run_end(&v, &v.upstreams[0], all(), 777, now), 1501);
+        assert_eq!(served_by(&plan(&v, all(), 777)), (0, 777, 1501));
+
+        let mut full = holder();
+        full.max_sessions = Some(1);
+        full.connections.store(1, Ordering::Relaxed);
+        let v = view(vec![bare(), full]);
+        assert_eq!(run_end(&v, &v.upstreams[0], all(), 777, now), 1501);
+        assert_eq!(served_by(&plan(&v, all(), 777)), (0, 777, 1501));
+
+        // A holder that can take the stream ends the leg at the breakpoint.
+        let v = view(vec![bare(), holder()]);
+        assert_eq!(run_end(&v, &v.upstreams[0], all(), 777, now), 991);
     }
 
     #[test]

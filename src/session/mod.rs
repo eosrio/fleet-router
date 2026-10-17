@@ -2670,15 +2670,31 @@ impl Session {
     }
 
     /// The client's cursor reached the clamped end of the leg: plan the next
-    /// leg from the cursor with the outstanding credit. A frozen link at its
-    /// end is quiescent, so the same upstream reuses its socket. A handoff is
-    /// never a failure: no strike, no budget, no backoff, no exclusion.
+    /// leg from the cursor with the outstanding credit. A handoff is never a
+    /// failure: no strike, no budget, no backoff, no exclusion.
+    ///
+    /// When the next leg is on the link's own upstream, the stream goes on
+    /// there with the same request version and flags, on the same socket
+    /// (a frozen link at its end takes a new request): that is no handoff,
+    /// and it is neither counted nor logged as one.
     async fn handoff(&mut self) -> Flow {
+        let started = Instant::now();
+        let step = self.plan(self.c.cursor, false);
+        if let (Step::Serve(st), Some(link)) = (&step, self.link.as_ref()) {
+            if st.up == link.st.up {
+                tracing::debug!(
+                    upstream = %link.endpoint,
+                    block = self.c.cursor,
+                    end = st.req_end,
+                    "the next leg stays on the same upstream"
+                );
+                return self.apply_step(step, Purpose::Handoff, self.c.credit).await;
+            }
+        }
         self.ctx.hub.stats.handoffs.fetch_add(1, Ordering::Relaxed);
         self.counts.handoffs += 1;
-        self.handoff_started = Some(Instant::now());
+        self.handoff_started = Some(started);
         let from = self.link.as_ref().map(|l| l.name.clone());
-        let step = self.plan(self.c.cursor, false);
         if let Step::Serve(st) = &step {
             tracing::info!(
                 from = %from.as_deref().unwrap_or(""),
@@ -4989,6 +5005,58 @@ mod tests {
             1
         );
         assert_eq!(blocks_requests(&full_mock)[0].1, last, "resumed there");
+    }
+
+    /// Stitched: a leg ends at the fleet head + 1, and by then the head has
+    /// moved on, so the next leg is on the same archive. The stream goes on
+    /// over the same socket with a new request, and that is no handoff.
+    #[tokio::test]
+    async fn a_next_leg_on_the_same_upstream_is_no_handoff() {
+        let (archive, mock) = start_mock(MockShipConfig::frozen(1, 1001)).await;
+        let harness = start_stitched(&[(&archive, 1, 1001)]).await;
+        let set_head = |num: u32| {
+            let hub = harness.hub.clone();
+            let archive = archive.clone();
+            async move {
+                let mut db = hub.state.lock().await;
+                let pos = BlockPos {
+                    num,
+                    id: mock_ship::fake_block_id(num),
+                };
+                let state = db.get_mut(&archive).unwrap();
+                state.head = Some(pos);
+                state.lib = Some(pos);
+                hub.rebuild(&db);
+            }
+        };
+        set_head(300).await;
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(1, 1001, 100)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 100).await,
+            (1..=100).collect::<Vec<_>>()
+        );
+        // The client's credit is used up below the leg's end (301).
+        set_head(1000).await;
+        client
+            .send(Message::binary(mock_ship::client::ack(900)))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 900).await,
+            (101..=1000).collect::<Vec<_>>()
+        );
+        let requests = blocks_requests(&mock);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|&(_, start, end, _)| (start, end))
+                .collect::<Vec<_>>(),
+            [(1, 301), (301, 1001)]
+        );
+        assert_eq!(requests[0].0, requests[1].0, "the same socket");
+        assert_eq!(mock.sessions_accepted(), 1);
+        assert_eq!(harness.hub.stats.handoffs.load(Ordering::Relaxed), 0);
     }
 
     /// Stitched: the archive that holds blocks breaks the contract at 15 and

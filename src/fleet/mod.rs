@@ -8,10 +8,6 @@
 //! the head and LIB of every live frame into an [`ObservedTip`], which keeps
 //! the fleet tip fresher than the monitor's status interval.
 
-// Sessions consume the planner, the observed tips and most of the counters;
-// until they do, only the tests and the metrics endpoint use them.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};

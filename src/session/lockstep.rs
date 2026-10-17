@@ -593,7 +593,7 @@ impl Sim {
                     self.stats.handoffs += 1;
                     self.link = None;
                     let (kind, end) = self.plan(self.c.cursor, false);
-                    self.open(kind, end, Purpose::Failover, step);
+                    self.open(kind, end, Purpose::Handoff, step);
                 }
             }
         }

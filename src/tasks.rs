@@ -611,7 +611,7 @@ async fn handle_monitoring_msg(
 /// upstream stays online and a warning is logged once until a later status
 /// reports a `chain_id`. `require_chain_id` restores the reject-when-missing
 /// behaviour for a pinned pool.
-async fn apply_status_update(
+pub(crate) async fn apply_status_update(
     bin_msg: &[u8],
     server_state_db: &ServerStateDb,
     server: &Server,

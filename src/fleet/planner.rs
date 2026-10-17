@@ -277,7 +277,7 @@ pub fn run_end(v: &FleetView, u: &UpstreamView, need: Need, from: u32, now: Inst
 
 /// True when every upstream that could serve `from` is live (the tip
 /// region): holds there are unbounded.
-fn tip_region(v: &FleetView, from: u32) -> bool {
+pub fn tip_region(v: &FleetView, from: u32) -> bool {
     let mut any = false;
     for u in v
         .upstreams

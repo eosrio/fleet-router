@@ -28,6 +28,23 @@
 //! - client frames that are not a known SHiP request are forwarded (or held
 //!   in a byte-capped buffer while no link is up); malformed known requests
 //!   close the client with 1007.
+//!
+//! In stitched topology (frozen range servers plus live nodes), the session
+//! presents the fleet as one SHiP node:
+//! - the client gets the listener's canonical ABI without a dial, and status
+//!   is always answered by the router; a status-only client opens no link;
+//! - each `get_blocks` is planned by [`next_step`]: the upstream that serves
+//!   the cursor, and the end of its run (clamped to the fleet head, or LIB for
+//!   `irreversible_only`, for a frozen upstream). When the client's cursor
+//!   reaches a clamped end, the stream is handed off to the next upstream with
+//!   the outstanding credit; a handoff is never a failure. The next leg's
+//!   upstream is dialed ahead of time (`predial_blocks`), and a frozen link at
+//!   the end of its leg is reused for a following request;
+//! - a block no upstream can serve now is held (bounded by `gap_wait_ms` in
+//!   archived history, unbounded at the tip), a block above the fleet gate is
+//!   waited for, and a configured hole closes the client with 1011;
+//! - frozen results are checked against the archive contract, and their head
+//!   and LIB are replaced by the fleet tip.
 
 mod client;
 mod failover;
@@ -36,9 +53,10 @@ mod link;
 mod lockstep;
 mod status;
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -54,13 +72,17 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 
 use crate::abi::abi_fingerprint;
-use crate::fleet::planner::{eligible, pool_pick, Need, Union};
+use crate::fleet::planner::{
+    eligible, next_step, pool_pick, tip_region, Excludes, Need, ServeStep, Shape, Step, Union,
+};
 use crate::fleet::view::UpstreamView;
 use crate::fleet::{
-    FleetHub, FleetView, LinkPurpose, Log, MetricLabel, ProtocolError, SessionGauge,
+    FleetHub, FleetView, HoldWhy, LinkPurpose, Log, MetricLabel, PredialResult, ProtocolError,
+    SessionGauge,
 };
 use crate::models::{
-    BlockFailureQuarantine, ProxyLimits, ResolvedListener, ResolvedTopology, Role, StitchingPolicy,
+    AbiMismatch, BlockFailureQuarantine, ProxyLimits, ResolvedListener, ResolvedTopology, Role,
+    StitchingPolicy,
 };
 use crate::ship::wire::{self, BlocksRequest, ClientMsg, DecodeError, ResultHead, UpstreamMsg};
 use crate::ship::BlockPos;
@@ -70,8 +92,9 @@ use client::{
     PendingClientFrames, ResultKind, MAX_PENDING_CLIENT_BYTES,
 };
 use failover::{
-    classify, jitter, note_block_failure, plan_same_block_failover, EndAction, EndFacts, Exclusion,
-    UpEnd, ViolationKind, DIAL_EXCLUSION,
+    block_unavailable_reason, classify, hold_backoff, hold_close_reason, jitter,
+    note_block_failure, plan_same_block_failover, EndAction, EndFacts, Exclusion, UpEnd,
+    ViolationKind, ABI_EXCLUSION, DIAL_EXCLUSION,
 };
 pub use link::ConnectionGuard;
 use link::{
@@ -94,6 +117,18 @@ const DEFAULT_STATUS_WAIT: Duration = Duration::from_secs(10);
 /// rest are logged at debug.
 const JUMP_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Stitched: a link kept open with nothing to send is closed after this,
+/// unless a following request reuses its socket first.
+const LINGER: Duration = Duration::from_secs(30);
+
+/// Stitched: a pre-dialed standby link that no handoff used is dropped
+/// after this.
+const STANDBY_LINGER: Duration = Duration::from_secs(60);
+
+/// Stitched: a waiting session re-plans at least this often, besides every
+/// fleet view change.
+const WAIT_RECHECK: Duration = Duration::from_secs(5);
+
 /// What every session of one listener shares.
 pub struct ListenerCtx {
     /// `None` in single-listener mode.
@@ -107,6 +142,9 @@ pub struct ListenerCtx {
     pub next_session_id: AtomicU64,
     /// Set once a status v1 reply went out with a zeroed `chain_id`.
     zero_chain_id_warned: AtomicBool,
+    /// Stitched: (upstream index, ABI fingerprint) pairs already warned as
+    /// differing from the ABI clients were sent.
+    abi_warned: Mutex<HashSet<(usize, u64)>>,
 }
 
 impl ListenerCtx {
@@ -126,7 +164,12 @@ impl ListenerCtx {
             hub,
             next_session_id: AtomicU64::new(1),
             zero_chain_id_warned: AtomicBool::new(false),
+            abi_warned: Mutex::new(HashSet::new()),
         })
+    }
+
+    fn stitched(&self) -> bool {
+        self.topology == ResolvedTopology::Stitched
     }
 }
 
@@ -137,33 +180,77 @@ enum Flow {
     Stop,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Phase {
-    /// A link is up with no request, or with its request satisfied.
+    /// No request, or the request is satisfied (a link may be up).
     Idle,
     /// A link is serving the client's request.
     Streaming,
-    /// A dial task is running in `Session::dial`.
-    Dialing { purpose: Purpose },
+    /// A dial task is running in `Session::dial`. Stitched: `step` is the
+    /// leg the new link is sent once it is up.
+    Dialing {
+        purpose: Purpose,
+        step: Option<ServeStep>,
+    },
     /// The link ended; the next dial starts at `until`.
     Backoff { until: Instant, purpose: Purpose },
+    /// Stitched: no upstream can serve the cursor now (see
+    /// [`Session::hold`]). The next attempt is at `next_retry`; a view change
+    /// re-plans earlier.
+    Holding {
+        next_retry: Instant,
+        purpose: Purpose,
+    },
+    /// Stitched: the cursor is above the fleet head (LIB for
+    /// `irreversible_only`) for its frozen upstream, or past the top of an
+    /// archive-only fleet. Re-planned on every view change and at `recheck`.
+    Waiting {
+        block: u32,
+        recheck: Instant,
+        purpose: Purpose,
+    },
 }
 
 impl Phase {
-    fn gauge(self) -> SessionGauge {
+    fn gauge(&self) -> SessionGauge {
         match self {
             Phase::Idle => SessionGauge::Idle,
             Phase::Streaming => SessionGauge::Streaming,
             Phase::Dialing { .. } => SessionGauge::Dialing,
             Phase::Backoff { .. } => SessionGauge::Backoff,
+            Phase::Holding { .. } => SessionGauge::Holding,
+            Phase::Waiting { .. } => SessionGauge::Waiting,
         }
     }
+}
+
+/// Stitched: a session holding at `block` because no upstream can serve it
+/// now. It survives the retry dials, so `deadline` (the end of `gap_wait_ms`;
+/// none in the tip region) is kept until a request is sent or the plan
+/// changes.
+#[derive(Clone, Copy, Debug)]
+struct HoldInfo {
+    block: u32,
+    why: HoldWhy,
+    since: Instant,
+    deadline: Option<Instant>,
+    /// Retries made so far at this block.
+    attempt: u32,
+}
+
+/// Stitched: a link to the next leg's upstream, connected (ABI read) ahead of
+/// the handoff and not read until it is activated.
+struct Standby {
+    link: Link,
+    /// Dropped unused at this instant.
+    until: Instant,
 }
 
 /// Per-session totals for the summary line logged when the session ends.
 #[derive(Debug, Default)]
 struct Counts {
     results: u64,
+    handoffs: u64,
     failovers: u64,
     dups: u64,
     keepalives: u64,
@@ -183,8 +270,14 @@ pub async fn handle_client(
     tracing::info!("client connected");
 
     let (client_tx, client_rx) = client_websocket.split();
+    let stitched = ctx.stitched();
     let mut session = Session::new(ctx, client_tx, client_rx, shutdown);
-    if let Flow::Continue = session.connect_first().await {
+    let started = if stitched {
+        session.send_canonical_abi().await
+    } else {
+        session.connect_first().await
+    };
+    if let Flow::Continue = started {
         session.run().await;
     }
     session.finish();
@@ -294,11 +387,29 @@ struct Session {
     /// (next block, unclean failures at that block). Cleared once a block at
     /// or past it is delivered.
     stuck_at: Option<(u32, u32)>,
-    ex: crate::fleet::planner::Excludes,
+    ex: Excludes,
+    /// Upstreams that answered this session's dial with HTTP 503, and until
+    /// when that counts. A hold caused by other exclusions is reported as
+    /// offline, not busy.
+    busy: Vec<(Arc<str>, std::time::Instant)>,
     status: StatusFlow,
     /// Pool: client frames that are not a known request, held while no link
     /// is up and flushed after the next link's request.
     pending: PendingClientFrames,
+    /// Stitched: the pre-dialed link to the next leg's upstream, and the dial
+    /// that is opening one.
+    standby: Option<Standby>,
+    standby_dial: Option<DialTask>,
+    /// Stitched: `dial` is a pre-dial that a handoff took over before it
+    /// finished (its link counts as a pre-dial link).
+    dial_was_predial: bool,
+    /// Stitched: the leg end a pre-dial was last considered for.
+    predial_for: Option<u32>,
+    /// Stitched: the current hold, kept across its retry dials.
+    hold: Option<HoldInfo>,
+    /// Stitched: when the last handoff started (the old link's last frame),
+    /// until the new link's first frame.
+    handoff_started: Option<Instant>,
     last_jump_warn: Option<Instant>,
     counts: Counts,
     end_reason: &'static str,
@@ -333,9 +444,16 @@ impl Session {
             phase: Phase::Idle,
             gauge: None,
             stuck_at: None,
-            ex: Default::default(),
+            ex: Excludes::default(),
+            busy: Vec::new(),
             status: StatusFlow::default(),
             pending: PendingClientFrames::new(),
+            standby: None,
+            standby_dial: None,
+            dial_was_predial: false,
+            predial_for: None,
+            hold: None,
+            handoff_started: None,
             last_jump_warn: None,
             counts: Counts::default(),
             end_reason: "client closed",
@@ -384,6 +502,7 @@ impl Session {
     async fn connect_first(&mut self) -> Flow {
         self.set_phase(Phase::Dialing {
             purpose: Purpose::Initial,
+            step: None,
         });
         self.dial_attempts = 0;
         let mut established = None;
@@ -439,6 +558,45 @@ impl Session {
         Flow::Continue
     }
 
+    /// Stitched: send the listener's canonical ABI without dialing. It waits
+    /// (up to the handshake timeout, 10 s when 0) until the fleet view has an
+    /// ABI and at least one upstream is online.
+    async fn send_canonical_abi(&mut self) -> Flow {
+        let deadline = Instant::now() + self.status_wait();
+        loop {
+            self.view = self.view_rx.borrow_and_update().clone();
+            if self.view.online > 0 {
+                if let Some(abi) = self.view.abi.clone() {
+                    self.c.abi_fp = abi.fp;
+                    let text = Message::Text(abi.text.as_ref().into());
+                    if let Err(e) = self.client_tx.send(text).await {
+                        tracing::warn!(error = %e, "error sending ABI to client");
+                        self.end_reason = "client write failed";
+                        return Flow::Stop;
+                    }
+                    tracing::debug!(fingerprint = %abi.fp_hex(), "sent the canonical ABI to client");
+                    self.set_phase(Phase::Idle);
+                    return Flow::Continue;
+                }
+            }
+            tokio::select! {
+                biased;
+                _ = self.shutdown.recv() => return self.on_shutdown().await,
+                changed = self.view_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                () = sleep_until(deadline) => break,
+            }
+        }
+        tracing::error!("no upstream ABI available; closing client");
+        self.close_client(CloseCode::Error, "No upstream server available")
+            .await;
+        self.end_reason = "no upstream";
+        Flow::Stop
+    }
+
     async fn run(&mut self) {
         // The idle timer starts once the ABI has been forwarded.
         self.client_seen = Instant::now();
@@ -456,12 +614,17 @@ impl Session {
             // owes blocks: the fleet head may have moved past what a silent
             // upstream sent (stall), or the monitor may have marked the
             // upstream offline. Nothing else wakes a session whose link sits
-            // silent at its own tip.
+            // silent at its own tip. A stitched session that waits or holds
+            // re-plans on every view, and a standby link is dropped when its
+            // upstream goes away.
             let waits_on_view = self.status.waiting()
                 || self
                     .link
                     .as_ref()
-                    .is_some_and(|l| l.st.req.is_some() && self.c.credit > 0);
+                    .is_some_and(|l| l.st.req.is_some() && self.c.credit > 0)
+                || matches!(self.phase, Phase::Waiting { .. } | Phase::Holding { .. })
+                || self.standby.is_some()
+                || self.standby_dial.is_some();
             // Biased: shutdown first, then the client, so its acks, status
             // requests and new requests are applied before more upstream
             // results are forwarded.
@@ -471,6 +634,9 @@ impl Session {
                 next = self.client_rx.next() => self.on_client(next).await,
                 outcome = dial_outcome(&mut self.dial), if self.dial.is_some() => {
                     self.on_dial(outcome).await
+                }
+                outcome = dial_outcome(&mut self.standby_dial), if self.standby_dial.is_some() => {
+                    self.on_standby(outcome)
                 }
                 next = next_frame(&mut self.link), if self.link.is_some() => {
                     self.on_upstream(next).await
@@ -491,16 +657,21 @@ impl Session {
         }
     }
 
-    /// Close links quietly, abort a running dial and log the summary line.
+    /// Close links quietly, abort running dials and log the summary line.
     fn finish(&mut self) {
         if let Some(link) = self.link.take() {
             drop(link.close_quietly());
         }
+        if let Some(standby) = self.standby.take() {
+            drop(standby.link.close_quietly());
+        }
         self.retired = None;
         self.dial = None;
+        self.standby_dial = None;
         self.ctx.hub.stats.session_moved(self.gauge.take(), None);
         let Counts {
             results,
+            handoffs,
             failovers,
             dups,
             keepalives,
@@ -509,6 +680,7 @@ impl Session {
         } = self.counts;
         tracing::info!(
             results,
+            handoffs,
             failovers,
             dups,
             keepalives,
@@ -521,7 +693,27 @@ impl Session {
     }
 
     async fn on_view_change(&mut self) -> Flow {
-        self.drive_status().await
+        if let Flow::Stop = self.drive_status().await {
+            return Flow::Stop;
+        }
+        if !self.ctx.stitched() {
+            return Flow::Continue;
+        }
+        self.check_standby();
+        match self.phase.clone() {
+            Phase::Waiting { purpose, .. } => self.replan(purpose).await,
+            // A hold re-plans early only when the new view lets it go on;
+            // otherwise its retries keep their backoff.
+            Phase::Holding { purpose, .. } => {
+                let step = self.plan(self.c.cursor, false);
+                if matches!(step, Step::Hold { .. }) {
+                    Flow::Continue
+                } else {
+                    self.apply_step(step, purpose, self.c.credit).await
+                }
+            }
+            _ => Flow::Continue,
+        }
     }
 
     async fn on_shutdown(&mut self) -> Flow {
@@ -672,6 +864,9 @@ impl Session {
             link.st.resume_floor = None;
         }
         self.sync_view();
+        if self.ctx.stitched() {
+            return self.on_stitched_request(r, pre).await;
+        }
 
         if request_is_empty(&r) {
             // Spring sends nothing for it; stop the link's old request.
@@ -685,7 +880,7 @@ impl Session {
                     let up = self.link.as_ref().map(|l| l.st.up);
                     self.retire_link(false);
                     if let Some(up) = up {
-                        if !self.start_dial(up, Purpose::Initial) {
+                        if !self.start_dial(up, Purpose::Initial, None) {
                             return self.failover_unavailable().await;
                         }
                     }
@@ -772,7 +967,7 @@ impl Session {
             }
             // Drop what the old request may still send, and dial afresh.
             self.retire_link(false);
-            if !self.start_dial(target, purpose) {
+            if !self.start_dial(target, purpose, None) {
                 return self.failover_unavailable().await;
             }
             return Flow::Continue;
@@ -781,7 +976,10 @@ impl Session {
             Phase::Dialing { .. } if !rerouted => {
                 // The dial in progress serves it; its request is built when it
                 // is established.
-                self.phase = Phase::Dialing { purpose };
+                self.phase = Phase::Dialing {
+                    purpose,
+                    step: None,
+                };
             }
             Phase::Backoff { until, .. } => {
                 self.phase = Phase::Backoff {
@@ -790,7 +988,7 @@ impl Session {
                 };
             }
             _ => {
-                if !self.start_dial(target, purpose) {
+                if !self.start_dial(target, purpose, None) {
                     return self.failover_unavailable().await;
                 }
             }
@@ -980,7 +1178,6 @@ impl Session {
             };
             match (self.c.req.as_ref(), link.st.req.as_ref()) {
                 (Some(creq), Some(lr)) => {
-                    let need = Need::of(creq);
                     let u = self.view.up(link.st.up);
                     let endpoint = &link.endpoint;
                     Some(judge(
@@ -990,7 +1187,7 @@ impl Session {
                         lr,
                         &h,
                         |n| missing_field(u, creq, &frame, &h, n),
-                        |k| self.alternative_for(k, need, endpoint),
+                        |k| self.alternative_for(k, creq, endpoint),
                     ))
                 }
                 _ => None,
@@ -1018,8 +1215,28 @@ impl Session {
 
     /// Whether another upstream than `endpoint` could serve block `k` of the
     /// current request now (online, not excluded, under capacity, eligible).
-    fn alternative_for(&self, k: u32, need: Need, endpoint: &str) -> bool {
+    /// Stitched: the planner would serve `k` from another upstream.
+    fn alternative_for(&self, k: u32, creq: &BlocksRequest, endpoint: &str) -> bool {
         let now = std_now();
+        if self.ctx.stitched() {
+            let mut ex = self.ex.clone();
+            ex.add_hard(Arc::from(endpoint), Duration::from_secs(60), now);
+            let tip = self.ctx.hub.fresh_tip(&self.view);
+            let step = next_step(
+                &self.view,
+                tip,
+                &Shape::of(creq),
+                k,
+                &ex,
+                self.id,
+                &self.ctx.stitching,
+                self.ctx.live_lag_blocks,
+                false,
+                now,
+            );
+            return matches!(step, Step::Serve(_));
+        }
+        let need = Need::of(creq);
         self.view.upstreams.iter().any(|u| {
             &*u.endpoint != endpoint
                 && u.enabled
@@ -1102,6 +1319,8 @@ impl Session {
         let Some(link) = self.link.as_mut() else {
             return Flow::Continue;
         };
+        let first = link.st.first_result_pending;
+        let leg = link.st.req.as_ref().map(|r| (r.end, r.clamped));
         commit(&mut self.c, &mut link.st, &h, &fw);
         link.st.became_owed_at = Instant::now();
         if fw.cls.kind == ResultKind::KeepAlive {
@@ -1113,6 +1332,14 @@ impl Session {
             if n >= stuck {
                 self.stuck_at = None;
             }
+        }
+        if first {
+            if let Some(started) = self.handoff_started.take() {
+                stats.handoff_latency.observe(started.elapsed());
+            }
+        }
+        if self.ctx.stitched() {
+            return self.after_stitched_result(leg, role).await;
         }
         if !self.c.in_progress() && matches!(self.phase, Phase::Streaming) {
             self.set_phase(Phase::Idle);
@@ -1220,6 +1447,7 @@ impl Session {
         let bytes = wire::encode_blocks_request(&req);
         match timeout(write_timeout, link.tx.send(Message::Binary(bytes.into()))).await {
             Ok(Ok(())) => {
+                self.hold = None;
                 let phase = if self.c.in_progress() {
                     Phase::Streaming
                 } else {
@@ -1264,6 +1492,29 @@ impl Session {
             role: link.st.role,
             unknown_forwarded_at: link.st.unknown_forwarded_at,
         };
+        // Stitched: a link that owes nothing (the client's request is
+        // satisfied, or a frozen leg is done and kept for reuse) is simply
+        // dropped. Nothing is lost, so there is nothing to fail over or to
+        // strike; the next plan dials again when it needs to.
+        let finished =
+            !self.c.in_progress() || (link.st.role == Role::Frozen && link.st.leg_done());
+        let quiet = matches!(
+            end,
+            UpEnd::Unclean
+                | UpEnd::Clean(_)
+                | UpEnd::Idle
+                | UpEnd::Stall
+                | UpEnd::MonitorOffline
+                | UpEnd::SendFailed
+        );
+        if self.ctx.stitched() && finished && quiet {
+            tracing::debug!(upstream = %endpoint, ?end, "idle upstream link ended");
+            self.retire_link(false);
+            if matches!(self.phase, Phase::Streaming) {
+                self.set_phase(Phase::Idle);
+            }
+            return Flow::Continue;
+        }
         self.retire_link(true);
 
         let stats = self.ctx.hub.stats.clone();
@@ -1377,9 +1628,12 @@ impl Session {
 
     async fn on_backoff_expired(&mut self, purpose: Purpose) -> Flow {
         self.sync_view();
+        if self.ctx.stitched() {
+            return self.replan(purpose).await;
+        }
         let route = self.c.req.as_ref().map(|r| (Need::of(r), self.c.cursor));
         match self.pick_for_failover(route) {
-            Some(up) if self.start_dial(up, purpose) => Flow::Continue,
+            Some(up) if self.start_dial(up, purpose, None) => Flow::Continue,
             _ => self.failover_unavailable().await,
         }
     }
@@ -1418,12 +1672,15 @@ impl Session {
         ))
     }
 
-    fn start_dial(&mut self, up: usize, purpose: Purpose) -> bool {
+    /// Dial upstream `up`. Stitched: `step` is the leg sent once the link is
+    /// up.
+    fn start_dial(&mut self, up: usize, purpose: Purpose, step: Option<ServeStep>) -> bool {
         let Some(task) = self.spawn_dial(up) else {
             return false;
         };
         self.dial = Some(task);
-        self.set_phase(Phase::Dialing { purpose });
+        self.dial_was_predial = false;
+        self.set_phase(Phase::Dialing { purpose, step });
         true
     }
 
@@ -1483,10 +1740,13 @@ impl Session {
         };
         let target = task.target().clone();
         drop(task);
-        let purpose = match self.phase {
-            Phase::Dialing { purpose } => purpose,
-            _ => Purpose::Failover,
+        let (purpose, step) = match &self.phase {
+            Phase::Dialing { purpose, step } => (*purpose, step.clone()),
+            _ => (Purpose::Failover, None),
         };
+        if self.ctx.stitched() {
+            return self.on_stitched_dial(target, outcome, purpose, step).await;
+        }
         match outcome {
             Ok(est) => {
                 self.adopt_link(&target, est, purpose.label());
@@ -1535,7 +1795,7 @@ impl Session {
                         std_now(),
                     );
                     if let Some(up) = next {
-                        if self.start_dial(up, purpose) {
+                        if self.start_dial(up, purpose, None) {
                             return Flow::Continue;
                         }
                     }
@@ -1569,6 +1829,531 @@ impl Session {
         self.close_client(CloseCode::Error, "no upstream available")
             .await;
         self.end_reason = "no upstream";
+        Flow::Stop
+    }
+
+    // ------------------------------------------------------------------
+    // Stitched topology: planning, handoff, pre-dial, holds and waits
+    // ------------------------------------------------------------------
+
+    /// A new client `get_blocks` in a stitched listener: plan it from its
+    /// start block. Nothing was dialed for the client before.
+    async fn on_stitched_request(&mut self, r: BlocksRequest, pre: u32) -> Flow {
+        self.hold = None;
+        self.handoff_started = None;
+        self.dial_attempts = 0;
+        if request_is_empty(&r) {
+            // Spring sends nothing for it; stop the link's old request.
+            self.dial = None;
+            self.discard_standby();
+            if let Some(link) = self.link.as_ref() {
+                if link.st.req.is_some() {
+                    if self.link_quiescent(link, pre) {
+                        return self.send_request(r.end, Purpose::Initial).await;
+                    }
+                    self.retire_link(false);
+                }
+            }
+            self.set_phase(Phase::Idle);
+            return Flow::Continue;
+        }
+        let step = self.plan(r.start, false);
+        self.apply_step(step, Purpose::Initial, pre).await
+    }
+
+    /// The planner's next step for the client's request at block `from`.
+    ///
+    /// A hold at capacity that only the slot of the link that just ended
+    /// causes is planned again without that slot. A hold blamed on
+    /// exclusions is reported as busy only while an upstream that answered
+    /// 503 is among them; otherwise its upstreams are unreachable (offline).
+    fn plan(&mut self, from: u32, allow_offline: bool) -> Step {
+        let Some(shape) = self.c.req.as_ref().map(Shape::of) else {
+            return Step::Done;
+        };
+        let mut step = self.next_step_for(&shape, from, allow_offline);
+        if matches!(
+            step,
+            Step::Hold {
+                why: HoldWhy::AtCapacity,
+                ..
+            }
+        ) && self.retired.take().is_some()
+        {
+            step = self.next_step_for(&shape, from, allow_offline);
+        }
+        if let Step::Hold {
+            block,
+            why: HoldWhy::Busy,
+            bounded,
+        } = step
+        {
+            let now = std_now();
+            self.busy.retain(|(_, until)| now < *until);
+            if self.busy.is_empty() {
+                step = Step::Hold {
+                    block,
+                    why: HoldWhy::Offline,
+                    bounded,
+                };
+            }
+        }
+        step
+    }
+
+    fn next_step_for(&self, shape: &Shape, from: u32, allow_offline: bool) -> Step {
+        let tip = self.ctx.hub.fresh_tip(&self.view);
+        next_step(
+            &self.view,
+            tip,
+            shape,
+            from,
+            &self.ex,
+            self.id,
+            &self.ctx.stitching,
+            self.ctx.live_lag_blocks,
+            allow_offline,
+            std_now(),
+        )
+    }
+
+    /// Plan again from the client's cursor: after a failover backoff, a
+    /// wait's view change or recheck, or an ABI exclusion.
+    async fn replan(&mut self, purpose: Purpose) -> Flow {
+        if !self.c.in_progress() {
+            self.hold = None;
+            self.set_phase(Phase::Idle);
+            return Flow::Continue;
+        }
+        let step = self.plan(self.c.cursor, false);
+        self.apply_step(step, purpose, self.c.credit).await
+    }
+
+    /// Act on a planner step. `pre` is the client credit that tells whether
+    /// the current link is quiescent (before a new request: the old credit).
+    async fn apply_step(&mut self, step: Step, purpose: Purpose, pre: u32) -> Flow {
+        match step {
+            Step::Serve(st) => self.serve(st, purpose, pre).await,
+            Step::Done => {
+                self.hold = None;
+                self.dial = None;
+                self.retired = None;
+                self.discard_standby();
+                self.set_phase(Phase::Idle);
+                Flow::Continue
+            }
+            Step::Gap { block } => {
+                tracing::warn!(
+                    block,
+                    "no upstream covers the block (a hole in the fleet's coverage); closing client"
+                );
+                self.close_client(CloseCode::Error, &block_unavailable_reason(block))
+                    .await;
+                self.end_reason = "coverage gap";
+                Flow::Stop
+            }
+            Step::Wait { block } => {
+                if !matches!(self.phase, Phase::Waiting { block: waiting, .. } if waiting == block)
+                {
+                    tracing::debug!(block, "waiting for the fleet to reach the block");
+                }
+                self.hold = None;
+                self.handoff_started = None;
+                self.dial = None;
+                self.retired = None;
+                self.discard_standby();
+                self.keep_link_if_quiescent(pre);
+                self.set_phase(Phase::Waiting {
+                    block,
+                    recheck: Instant::now() + WAIT_RECHECK,
+                    purpose,
+                });
+                Flow::Continue
+            }
+            Step::Hold {
+                block,
+                why,
+                bounded,
+            } => {
+                self.dial = None;
+                self.retired = None;
+                self.dial_attempts = 0;
+                self.discard_standby();
+                self.keep_link_if_quiescent(pre);
+                let now = Instant::now();
+                let (since, attempt) = match self.hold {
+                    Some(h) if h.block == block => (h.since, h.attempt.saturating_add(1)),
+                    _ => {
+                        self.ctx.hub.stats.holds.inc(why);
+                        tracing::warn!(
+                            block,
+                            why = why.as_str(),
+                            bounded,
+                            "no upstream can serve the block now; holding"
+                        );
+                        (now, 0)
+                    }
+                };
+                let deadline =
+                    bounded.then(|| since + Duration::from_millis(self.ctx.stitching.gap_wait_ms));
+                self.hold = Some(HoldInfo {
+                    block,
+                    why,
+                    since,
+                    deadline,
+                    attempt,
+                });
+                self.set_phase(Phase::Holding {
+                    next_retry: now + jitter(hold_backoff(attempt), self.id, attempt),
+                    purpose,
+                });
+                Flow::Continue
+            }
+        }
+    }
+
+    /// Serve the leg `st`: on the current socket when it is quiescent and on
+    /// the same upstream, on the standby link pre-dialed to it, on a dial
+    /// already running to it, or on a new dial.
+    async fn serve(&mut self, st: ServeStep, purpose: Purpose, pre: u32) -> Flow {
+        let up = st.up;
+        if self
+            .link
+            .as_ref()
+            .is_some_and(|l| l.st.up == up && self.link_quiescent(l, pre))
+        {
+            self.dial = None;
+            return self.send_request(st.req_end, purpose).await;
+        }
+        // Drop what the old request may still send.
+        self.retire_link(false);
+        if self.standby.as_ref().is_some_and(|s| s.link.st.up == up) {
+            let standby = self.standby.take().expect("checked above");
+            self.dial = None;
+            self.standby_dial = None;
+            self.retired = None;
+            self.dial_attempts = 0;
+            self.link = Some(standby.link);
+            self.ctx.hub.stats.predials.inc(PredialResult::Used);
+            return self.send_request(st.req_end, purpose).await;
+        }
+        if self.dial.as_ref().is_some_and(|d| d.target().up == up) {
+            // The dial on its way carries the new leg.
+            self.discard_standby();
+            self.set_phase(Phase::Dialing {
+                purpose,
+                step: Some(st),
+            });
+            return Flow::Continue;
+        }
+        if self
+            .standby_dial
+            .as_ref()
+            .is_some_and(|d| d.target().up == up)
+        {
+            // The pre-dial becomes the leg's dial.
+            self.dial = self.standby_dial.take();
+            self.dial_was_predial = true;
+            self.discard_standby();
+            self.ctx.hub.stats.predials.inc(PredialResult::Used);
+            self.set_phase(Phase::Dialing {
+                purpose,
+                step: Some(st),
+            });
+            return Flow::Continue;
+        }
+        self.discard_standby();
+        if self.start_dial(up, purpose, Some(st)) {
+            Flow::Continue
+        } else {
+            self.failover_unavailable().await
+        }
+    }
+
+    /// Keep the current link when nothing of its request can still arrive
+    /// (it may serve a later leg; it is closed after [`LINGER`] unused),
+    /// otherwise close it.
+    fn keep_link_if_quiescent(&mut self, pre: u32) {
+        let Some(link) = self.link.as_ref() else {
+            return;
+        };
+        if self.link_quiescent(link, pre) {
+            if let Some(link) = self.link.as_mut() {
+                link.st.linger_until.get_or_insert(Instant::now() + LINGER);
+            }
+        } else {
+            self.retire_link(false);
+        }
+    }
+
+    /// After a stitched result was forwarded: the request is satisfied
+    /// (idle, a frozen link lingers for a following range), or the leg
+    /// reached its clamped end (hand off), or the next leg may be pre-dialed.
+    async fn after_stitched_result(&mut self, leg: Option<(u32, bool)>, role: Role) -> Flow {
+        if !self.c.in_progress() {
+            if matches!(self.phase, Phase::Streaming) {
+                self.set_phase(Phase::Idle);
+            }
+            if role == Role::Frozen {
+                if let Some(link) = self.link.as_mut() {
+                    link.st.linger_until = Some(Instant::now() + LINGER);
+                }
+            }
+            return Flow::Continue;
+        }
+        if let Some((end, true)) = leg {
+            if self.c.cursor >= end {
+                return self.handoff().await;
+            }
+        }
+        self.maybe_predial();
+        Flow::Continue
+    }
+
+    /// The client's cursor reached the clamped end of the leg: plan the next
+    /// leg from the cursor with the outstanding credit. A frozen link at its
+    /// end is quiescent, so the same upstream reuses its socket. A handoff is
+    /// never a failure: no strike, no budget, no backoff, no exclusion.
+    async fn handoff(&mut self) -> Flow {
+        self.ctx.hub.stats.handoffs.fetch_add(1, Ordering::Relaxed);
+        self.counts.handoffs += 1;
+        self.handoff_started = Some(Instant::now());
+        let from = self.link.as_ref().map(|l| l.name.clone());
+        let step = self.plan(self.c.cursor, false);
+        if let Step::Serve(st) = &step {
+            tracing::info!(
+                from = %from.as_deref().unwrap_or(""),
+                to = %self.view.up(st.up).map_or("", |u| &*u.name),
+                block = self.c.cursor,
+                "handing the stream off to the next upstream"
+            );
+        }
+        self.apply_step(step, Purpose::Handoff, self.c.credit).await
+    }
+
+    /// Open the next leg's link ahead of the handoff once the cursor is
+    /// within `predial_blocks` of the clamped end and the next leg is on
+    /// another upstream. The standby link is connected and has read the ABI;
+    /// it gets its request at the handoff.
+    fn maybe_predial(&mut self) {
+        let window = self.ctx.stitching.predial_blocks;
+        if window == 0 || self.standby.is_some() || self.standby_dial.is_some() {
+            return;
+        }
+        let Some((up, end)) = self.link.as_ref().and_then(|l| {
+            l.st.req
+                .as_ref()
+                .filter(|r| r.clamped)
+                .map(|r| (l.st.up, r.end))
+        }) else {
+            return;
+        };
+        if end.saturating_sub(self.c.cursor) > window || self.predial_for == Some(end) {
+            return;
+        }
+        self.predial_for = Some(end);
+        let Step::Serve(st) = self.plan(end, false) else {
+            return;
+        };
+        if st.up == up {
+            return;
+        }
+        if let Some(task) = self.spawn_dial(st.up) {
+            tracing::debug!(upstream = %st.endpoint, block = end, "pre-dialing the next leg's upstream");
+            self.standby_dial = Some(task);
+        }
+    }
+
+    /// The pre-dial finished.
+    fn on_standby(&mut self, outcome: Result<Established, DialError>) -> Flow {
+        let Some(task) = self.standby_dial.take() else {
+            return Flow::Continue;
+        };
+        let target = task.target().clone();
+        drop(task);
+        let stats = self.ctx.hub.stats.clone();
+        match outcome {
+            Ok(est) => {
+                let fp = abi_fingerprint(&est.abi);
+                if fp != self.c.abi_fp {
+                    self.warn_abi_mismatch(&target, fp);
+                    if self.ctx.stitching.abi_mismatch == AbiMismatch::Exclude {
+                        self.ex
+                            .add_hard(target.endpoint.clone(), ABI_EXCLUSION, std_now());
+                        stats.predials.inc(PredialResult::Discarded);
+                        return Flow::Continue;
+                    }
+                }
+                if let Some(u) = stats.upstream(target.up) {
+                    u.links.inc(LinkPurpose::Predial);
+                }
+                let now = Instant::now();
+                self.standby = Some(Standby {
+                    link: Link::new(&target, est, now),
+                    until: now + STANDBY_LINGER,
+                });
+            }
+            Err(error) => {
+                if let Some(u) = stats.upstream(target.up) {
+                    u.dial_failures.inc(error.label());
+                }
+                tracing::debug!(upstream = %target.endpoint, %error, "pre-dial failed");
+                if matches!(error, DialError::Busy) {
+                    self.busy
+                        .push((target.endpoint.clone(), std_now() + DIAL_EXCLUSION));
+                }
+                self.ex
+                    .add_hard(target.endpoint.clone(), DIAL_EXCLUSION, std_now());
+                stats.predials.inc(PredialResult::Failed);
+            }
+        }
+        Flow::Continue
+    }
+
+    /// Drop the standby link and any pre-dial in progress.
+    fn discard_standby(&mut self) {
+        let stats = &self.ctx.hub.stats;
+        if let Some(standby) = self.standby.take() {
+            drop(standby.link.close_quietly());
+            stats.predials.inc(PredialResult::Discarded);
+        }
+        if self.standby_dial.take().is_some() {
+            stats.predials.inc(PredialResult::Discarded);
+        }
+    }
+
+    /// A view change: drop the standby when its upstream went offline or can
+    /// no longer serve.
+    fn check_standby(&mut self) {
+        let up = match (&self.standby, &self.standby_dial) {
+            (Some(standby), _) => standby.link.st.up,
+            (None, Some(dial)) => dial.target().up,
+            (None, None) => return,
+        };
+        let usable = self
+            .view
+            .up(up)
+            .is_some_and(|u| u.enabled && u.online && u.abi_ok);
+        if !usable {
+            self.discard_standby();
+        }
+    }
+
+    /// A stitched dial finished: send the planned leg, or plan again.
+    async fn on_stitched_dial(
+        &mut self,
+        target: DialTarget,
+        outcome: Result<Established, DialError>,
+        purpose: Purpose,
+        step: Option<ServeStep>,
+    ) -> Flow {
+        let predial = std::mem::take(&mut self.dial_was_predial);
+        match outcome {
+            Ok(est) => {
+                let fp = abi_fingerprint(&est.abi);
+                if fp != self.c.abi_fp {
+                    self.warn_abi_mismatch(&target, fp);
+                    if self.ctx.stitching.abi_mismatch == AbiMismatch::Exclude {
+                        drop(est);
+                        self.ex
+                            .add_hard(target.endpoint.clone(), ABI_EXCLUSION, std_now());
+                        return self.replan(purpose).await;
+                    }
+                }
+                let label = if predial {
+                    LinkPurpose::Predial
+                } else {
+                    purpose.label()
+                };
+                self.adopt_link(&target, est, label);
+                if purpose == Purpose::Failover {
+                    tracing::info!(upstream = %target.name, "reconnected to upstream after failover");
+                }
+                match step {
+                    Some(st) if self.c.in_progress() => {
+                        self.send_request(st.req_end, purpose).await
+                    }
+                    _ => {
+                        // Nothing to send now: keep the link for a following
+                        // request, for a while.
+                        if let Some(link) = self.link.as_mut() {
+                            link.st.linger_until = Some(Instant::now() + LINGER);
+                        }
+                        self.set_phase(Phase::Idle);
+                        Flow::Continue
+                    }
+                }
+            }
+            Err(error) => {
+                let busy = matches!(error, DialError::Busy);
+                self.on_dial_failed(&target, error).await;
+                if busy {
+                    self.busy
+                        .push((target.endpoint.clone(), std_now() + DIAL_EXCLUSION));
+                }
+                self.dial_attempts += 1;
+                if self.dial_attempts < MAX_DIAL_ATTEMPTS {
+                    // The failed upstream is excluded for a moment; a held
+                    // session may still try an offline one.
+                    let step = self.plan(self.c.cursor, self.hold.is_some());
+                    return self.apply_step(step, purpose, self.c.credit).await;
+                }
+                let block = self.c.cursor;
+                let why = if busy {
+                    HoldWhy::Busy
+                } else {
+                    HoldWhy::Offline
+                };
+                let bounded = !tip_region(&self.view, block);
+                self.apply_step(
+                    Step::Hold {
+                        block,
+                        why,
+                        bounded,
+                    },
+                    purpose,
+                    self.c.credit,
+                )
+                .await
+            }
+        }
+    }
+
+    /// An upstream's ABI differs from the one this client was sent: warned
+    /// once per upstream and fingerprint for the listener.
+    fn warn_abi_mismatch(&self, target: &DialTarget, fp: u64) {
+        let first = self
+            .ctx
+            .abi_warned
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((target.up, fp));
+        let exclude = self.ctx.stitching.abi_mismatch == AbiMismatch::Exclude;
+        if first {
+            tracing::warn!(
+                upstream = %target.endpoint,
+                name = %target.name,
+                fingerprint = %format!("{fp:016x}"),
+                served = %format!("{:016x}", self.c.abi_fp),
+                excluded = exclude,
+                "upstream ABI differs from the ABI clients of this listener were sent"
+            );
+        } else {
+            tracing::debug!(upstream = %target.endpoint, "upstream ABI differs from the served ABI");
+        }
+    }
+
+    /// A bounded hold ran out of `gap_wait_ms`.
+    async fn hold_expired(&mut self, hold: HoldInfo) -> Flow {
+        self.ctx.hub.stats.hold_closes.inc(hold.why);
+        let reason = hold_close_reason(hold.why, hold.block);
+        tracing::warn!(
+            block = hold.block,
+            why = hold.why.as_str(),
+            "hold expired; closing client"
+        );
+        self.close_client(CloseCode::Error, &reason).await;
+        self.end_reason = "hold expired";
         Flow::Stop
     }
 
@@ -1618,16 +2403,21 @@ impl Session {
     }
 
     /// Earliest of the client idle deadline, the status deadline, the owed
-    /// link's silence deadlines and the end of a failover backoff.
+    /// link's silence deadlines, the end of a failover backoff and, stitched,
+    /// a hold's expiry and retry, a wait's recheck and the linger of an idle
+    /// or standby link.
     fn next_deadline(&self) -> Option<Instant> {
         let client = self
             .idle_timeout()
             .and_then(|idle| self.client_seen.checked_add(idle));
         let status = self.status.deadline();
-        let backoff = match self.phase {
+        let phase = match self.phase {
             Phase::Backoff { until, .. } => Some(until),
+            Phase::Holding { next_retry, .. } => Some(next_retry),
+            Phase::Waiting { recheck, .. } => Some(recheck),
             _ => None,
         };
+        let hold = self.hold.and_then(|h| h.deadline);
         let link = self.link.as_ref().filter(|l| l.st.was_owed).and_then(|l| {
             let from = self.silence_from(l);
             self.silence_limits(l)
@@ -1636,7 +2426,12 @@ impl Session {
                 .filter_map(|(limit, _)| from.checked_add(limit))
                 .min()
         });
-        [client, status, backoff, link].into_iter().flatten().min()
+        let linger = self.link.as_ref().and_then(|l| l.st.linger_until);
+        let standby = self.standby.as_ref().map(|s| s.until);
+        [client, status, phase, hold, link, linger, standby]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     async fn on_timer(&mut self) -> Flow {
@@ -1660,6 +2455,11 @@ impl Session {
             self.end_reason = "status unavailable";
             return Flow::Stop;
         }
+        if let Some(hold) = self.hold {
+            if hold.deadline.is_some_and(|at| now >= at) {
+                return self.hold_expired(hold).await;
+            }
+        }
         let silent = self.link.as_ref().filter(|l| l.st.was_owed).and_then(|l| {
             let silence = now.saturating_duration_since(self.silence_from(l));
             self.silence_limits(l)
@@ -1682,10 +2482,37 @@ impl Session {
             }
             return self.on_link_end(end).await;
         }
-        if let Phase::Backoff { until, purpose } = self.phase {
-            if now >= until {
+        match self.phase {
+            Phase::Backoff { until, purpose } if now >= until => {
                 return self.on_backoff_expired(purpose).await;
             }
+            Phase::Holding {
+                next_retry,
+                purpose,
+            } if now >= next_retry => {
+                // A retry may dial a covering upstream the monitor lost.
+                let step = self.plan(self.c.cursor, true);
+                return self.apply_step(step, purpose, self.c.credit).await;
+            }
+            Phase::Waiting {
+                recheck, purpose, ..
+            } if now >= recheck => {
+                return self.replan(purpose).await;
+            }
+            _ => {}
+        }
+        if self
+            .link
+            .as_ref()
+            .and_then(|l| l.st.linger_until)
+            .is_some_and(|at| now >= at)
+        {
+            tracing::debug!("closing an idle upstream link");
+            self.retire_link(false);
+        }
+        if self.standby.as_ref().is_some_and(|s| now >= s.until) {
+            tracing::debug!("dropping an unused standby link");
+            self.discard_standby();
         }
         Flow::Continue
     }

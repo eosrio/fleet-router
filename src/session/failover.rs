@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::abi::fnv1a64;
-use crate::fleet::{ContractViolation, FailoverReason, FleetHub};
+use crate::fleet::{ContractViolation, FailoverReason, FleetHub, HoldWhy};
 use crate::models::{BlockFailureQuarantine, Role};
 
 /// Per session, how many times the upstream stream may die with the same next
@@ -29,6 +29,10 @@ pub(super) const DIAL_EXCLUSION: Duration = Duration::from_secs(2);
 /// How long an upstream that jumped past the cursor on a resume is avoided.
 const UNCOVERED_EXCLUSION: Duration = Duration::from_secs(30);
 
+/// Stitched: how long a session avoids an upstream whose ABI differs from the
+/// one its client was sent, under `abi_mismatch: "exclude"`.
+pub(super) const ABI_EXCLUSION: Duration = Duration::from_secs(300);
+
 /// First retry waits 100 ms (the historical failover pause). Each further retry
 /// at that same block doubles the wait, up to 3.2 s.
 fn same_block_backoff(failures: u32) -> Duration {
@@ -37,8 +41,24 @@ fn same_block_backoff(failures: u32) -> Duration {
     Duration::from_millis((100u64 << shift).min(3_200))
 }
 
-fn block_unavailable_reason(block: u32) -> String {
+pub(super) fn block_unavailable_reason(block: u32) -> String {
     format!("block {block} unavailable on all upstreams")
+}
+
+/// The pause before retry `attempt` (from 0) of a held session: 100 ms,
+/// doubling to 3.2 s, before jitter.
+pub(super) fn hold_backoff(attempt: u32) -> Duration {
+    same_block_backoff(attempt.saturating_add(1))
+}
+
+/// The close reason when a bounded hold at `block` runs out of `gap_wait_ms`.
+pub(super) fn hold_close_reason(why: HoldWhy, block: u32) -> String {
+    match why {
+        HoldWhy::Offline | HoldWhy::Quarantined => block_unavailable_reason(block),
+        HoldWhy::AtCapacity | HoldWhy::Busy => {
+            format!("upstream capacity exhausted for block {block}")
+        }
+    }
 }
 
 pub(super) struct SameBlockPlan {
@@ -354,6 +374,26 @@ mod tests {
             block_unavailable_reason(115),
             "block 115 unavailable on all upstreams"
         );
+    }
+
+    #[test]
+    fn holds_back_off_from_100ms_and_close_with_the_reason_of_their_cause() {
+        let waits: Vec<u64> = (0..8)
+            .map(|attempt| hold_backoff(attempt).as_millis() as u64)
+            .collect();
+        assert_eq!(waits, [100, 200, 400, 800, 1600, 3200, 3200, 3200]);
+        for why in [HoldWhy::Offline, HoldWhy::Quarantined] {
+            assert_eq!(
+                hold_close_reason(why, 1001),
+                "block 1001 unavailable on all upstreams"
+            );
+        }
+        for why in [HoldWhy::AtCapacity, HoldWhy::Busy] {
+            assert_eq!(
+                hold_close_reason(why, 1001),
+                "upstream capacity exhausted for block 1001"
+            );
+        }
     }
 
     #[test]

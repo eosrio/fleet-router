@@ -85,6 +85,9 @@ pub(super) enum UpCursor {
 pub(super) enum Purpose {
     /// The client's own request, on the link it arrived for.
     Initial,
+    /// Stitched: the next leg of the client's request, after the previous
+    /// upstream served its range up to a clamped end.
+    Handoff,
     /// A resume after the previous link ended.
     Failover,
     /// The client's request, moved before it was forwarded to an upstream
@@ -96,6 +99,7 @@ impl Purpose {
     pub fn label(self) -> LinkPurpose {
         match self {
             Purpose::Initial => LinkPurpose::Initial,
+            Purpose::Handoff => LinkPurpose::Handoff,
             Purpose::Failover => LinkPurpose::Failover,
             Purpose::Reroute => LinkPurpose::Reroute,
         }
@@ -105,7 +109,7 @@ impl Purpose {
     /// router made). Its first result must follow the client's last block;
     /// a fresh client request may legitimately start anywhere.
     pub fn resumes(self) -> bool {
-        matches!(self, Purpose::Failover)
+        matches!(self, Purpose::Failover | Purpose::Handoff)
     }
 }
 
@@ -148,6 +152,9 @@ pub(super) struct LinkState {
     pub became_owed_at: Instant,
     pub was_owed: bool,
     pub frames: u64,
+    /// Stitched: a link kept open with nothing to send (its leg is done) is
+    /// closed at this instant unless a new request reuses it first.
+    pub linger_until: Option<Instant>,
 }
 
 impl LinkState {
@@ -168,6 +175,18 @@ impl LinkState {
             became_owed_at: now,
             was_owed: false,
             frames: 0,
+            linger_until: None,
+        }
+    }
+
+    /// The link's request, if any, has nothing left to send: the upstream's
+    /// cursor reached its end. A frozen upstream then stays silent until a
+    /// new request.
+    pub fn leg_done(&self) -> bool {
+        match (&self.req, self.up_cursor) {
+            (None, _) => true,
+            (Some(req), UpCursor::Exact(u)) => u >= req.end,
+            (Some(_), UpCursor::Uncertain { .. }) => false,
         }
     }
 
@@ -339,6 +358,7 @@ pub(super) fn build_request(
     };
     st.first_result_pending = true;
     st.became_owed_at = now;
+    st.linger_until = None;
     BlocksRequest {
         v1: creq.v1,
         start,
@@ -1030,6 +1050,30 @@ mod tests {
         assert!(!quiescent(&uncertain, 10, false));
     }
 
+    /// A leg is done when the upstream's known cursor reached its end; a
+    /// link without a request has nothing to send either.
+    #[test]
+    fn a_leg_is_done_at_its_end_and_only_with_a_known_cursor() {
+        assert!(LinkState::new(0, Role::Frozen, Instant::now()).leg_done());
+        let mut st = live_state(100, 200);
+        assert!(st.leg_done(), "at its end");
+        st.up_cursor = UpCursor::Exact(199);
+        assert!(!st.leg_done(), "one block owed");
+        st.up_cursor = UpCursor::Uncertain { lo: 150, hi: 200 };
+        assert!(!st.leg_done(), "a rewind may still come");
+    }
+
+    /// Router-made seams (handoffs and failovers) must continue the client's
+    /// stream; a client's own request need not.
+    #[test]
+    fn handoffs_and_failovers_are_seams() {
+        assert!(Purpose::Handoff.resumes());
+        assert!(Purpose::Failover.resumes());
+        assert!(!Purpose::Initial.resumes());
+        assert!(!Purpose::Reroute.resumes());
+        assert_eq!(Purpose::Handoff.label(), LinkPurpose::Handoff);
+    }
+
     #[test]
     fn owed_needs_a_request_credit_and_a_cursor_below_end_and_gate() {
         let mut st = live_state(100, 200);
@@ -1263,5 +1307,23 @@ mod tests {
             frozen.resume_floor, None,
             "no positions, not a failover: no window"
         );
+
+        // A stitched handoff to a frozen upstream: the next leg from the
+        // cursor, no positions, no window, and a kept link stops lingering.
+        frozen.linger_until = Some(Instant::now());
+        let req = build_request(
+            &c,
+            &creq,
+            &mut frozen,
+            200,
+            Purpose::Handoff,
+            STITCHED,
+            Instant::now(),
+        );
+        assert_eq!((req.start, req.end, req.max_in_flight), (103, 200, 7));
+        assert!(req.have_positions.is_empty());
+        assert_eq!(frozen.resume_floor, None);
+        assert_eq!(frozen.linger_until, None, "the link is in use again");
+        assert_eq!(frozen.req.as_ref().unwrap().purpose, Purpose::Handoff);
     }
 }

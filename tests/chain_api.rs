@@ -1298,10 +1298,11 @@ async fn config_test(cfg: &Value, strict: bool) -> (bool, String) {
     (output.status.success(), text)
 }
 
-/// `config test` lists each server's chain API; `--strict` fails when an
-/// enabled frozen server on a chain API listener has none.
+/// `config test` lists each server's chain API and warns about a frozen
+/// server without one; `--strict` fails only when archived blocks are left
+/// without any archive API, not for a replica whose twin has one.
 #[tokio::test]
-async fn config_test_lists_the_chain_api_and_strict_needs_every_archive_api() {
+async fn config_test_lists_the_chain_api_and_strict_needs_an_api_for_every_archived_block() {
     let archive = frozen_node("archive-a", (2, 1001), (1, 1001), 4).await;
     let second = frozen_node("archive-b", (1001, 2001), (1001, 2001), 4).await;
     let live = live_node("live-1", 1, 3000).await;
@@ -1333,6 +1334,31 @@ async fn config_test_lists_the_chain_api_and_strict_needs_every_archive_api() {
     );
     let (ok, out) = config_test(&partial, true).await;
     assert!(!ok, "--strict fails:\n{out}");
+    assert!(
+        out.contains("archived blocks [1001,2001) have no frozen server with an api_endpoint"),
+        "{out}"
+    );
+
+    // A replica without a block log has no chain API; its twin's covers
+    // every block of its range.
+    let replica = frozen_node("archive-a2", (2, 1001), (1, 1001), 4).await;
+    let mut bare = replica.frozen((2, 1001));
+    bare.as_object_mut().unwrap().remove("api_endpoint");
+    let replicated = config(
+        &[
+            archive.frozen((2, 1001)),
+            bare,
+            second.frozen((1001, 2001)),
+            live.live(),
+        ],
+        json!({}),
+    );
+    let (ok, out) = config_test(&replicated, true).await;
+    assert!(ok, "the twin's API covers the range:\n{out}");
+    assert!(
+        out.contains("frozen server 'archive-a2' has no api_endpoint"),
+        "{out}"
+    );
 }
 
 // ----------------------------------------------------------------------

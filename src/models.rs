@@ -1431,7 +1431,7 @@ fn chain_api_warnings(
     for s in servers.iter().filter(|s| s.enabled) {
         if s.role == Role::Frozen && s.api_endpoint.is_none() {
             out.push(format!(
-                "{prefix}server '{}': no api_endpoint; chain API requests for its blocks are answered by live nodes only",
+                "{prefix}server '{}': no api_endpoint; the chain API does not use it",
                 s.name
             ));
         }
@@ -4754,7 +4754,7 @@ mod tests {
         assert_eq!(
             cfg.warnings(),
             vec![
-                "listener 'eos': server 'archive-0b': no api_endpoint; chain API requests for its blocks are answered by live nodes only".to_string(),
+                "listener 'eos': server 'archive-0b': no api_endpoint; the chain API does not use it".to_string(),
                 "listener 'eos': chain_api: no enabled live server has api_endpoint; get_info, state, push and reversible blocks answer 503".to_string(),
                 "listener 'eos': chain_api allows push: the port relays transactions for anyone who can reach it".to_string(),
                 "listener 'eos': chain_api listens on 0.0.0.0:18888 (every interface): the chain API has no authentication".to_string(),

@@ -223,7 +223,7 @@ These are warnings, logged at startup and printed by `config test`:
 - A frozen server without `range`: the listener holds status requests while that server is down at startup (see [What clients see](operations.md#what-clients-see)).
 - The declared archive ranges leave a hole: a block range no archive declares, below the highest declared end.
 
-`fleet-router config test --strict <path>` also probes every server and prints the coverage each stitched listener adds up to, and exits 1 on a hole in the trace or chain-state coverage or a frozen server that did not report its ranges.
+`fleet-router config test --strict <path>` also probes every server and prints the coverage each stitched listener adds up to, and exits 1 on a hole in the trace or chain-state coverage, a frozen server that did not report its ranges, or (with a [chain API](#chain-api)) archived blocks that no frozen server with an `api_endpoint` covers.
 
 ## Chain API
 
@@ -268,12 +268,12 @@ A `chain_api` needs at least one enabled server with `api_endpoint`. Three more 
 These are warnings, logged at startup and printed by `config test`:
 
 - `api_endpoint` is set on a listener without `chain_api`: it is ignored.
-- An enabled frozen server on a `chain_api` listener has no `api_endpoint`: its blocks are answered by live nodes only.
+- An enabled frozen server on a `chain_api` listener has no `api_endpoint`: the chain API does not use it. Its blocks are still answered by another frozen server whose API covers them (its replica, say), else by live nodes only.
 - No enabled live server has an `api_endpoint`: `get_info`, state calls, pushes and reversible blocks answer `503`.
 - `allow` contains `"push"`: the port relays transactions for anyone who can reach it.
 - The chain API listens on every interface (`0.0.0.0` or `::`): it has no authentication.
 
-`config test` prints each chain API listener's servers with their role and `api_endpoint`. With `--strict` it exits 1 when an enabled frozen server on a `chain_api` listener has no `api_endpoint`.
+`config test` prints each chain API listener's servers with their role and `api_endpoint`, with a warning for each enabled frozen server that has none. With `--strict` it exits 1 when archived blocks of the listener's coverage (the trace and chain-state ranges of its enabled frozen servers) have no enabled frozen server with an `api_endpoint` covering them, so that only live nodes could answer them. A frozen server without a block log cannot serve a chain API at all; it passes `--strict` as long as a replica with an `api_endpoint` covers its range.
 
 ## Upstream TLS (`wss://`)
 

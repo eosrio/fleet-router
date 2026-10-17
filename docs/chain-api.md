@@ -33,7 +33,7 @@ The port is off unless the listener has [`chain_api`](configuration.md#chain-api
 ]
 ```
 
-3. Run `fleet-router config test <path>`. It prints each chain API listener's servers with their role and `api_endpoint`, and with `--strict` it exits 1 when an enabled frozen server has no `api_endpoint`.
+3. Run `fleet-router config test <path>`. It prints each chain API listener's servers with their role and `api_endpoint`, and with `--strict` it exits 1 when archived blocks have no enabled frozen server with an `api_endpoint` covering them. A frozen server without a block log has no chain API; its replica's API covers its blocks.
 
 A chain API works in pool and stitched listeners alike. Without a live server API, only blocks that a frozen range server holds can be answered.
 

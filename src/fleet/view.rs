@@ -121,6 +121,15 @@ fn subtract(top: Range, covered: &[Range]) -> Vec<Range> {
     out
 }
 
+/// The blocks of `ranges` that no range in `covered` holds, merged.
+pub fn uncovered(ranges: Vec<Range>, covered: Vec<Range>) -> Vec<Range> {
+    let covered = merge(covered);
+    merge(ranges)
+        .into_iter()
+        .flat_map(|r| subtract(r, &covered))
+        .collect()
+}
+
 /// Coverage of one log from every enabled known upstream's segment (`segs`),
 /// the online ones among them (`online`) and the live tail.
 pub fn coverage(segs: Vec<Range>, online: Vec<Range>, live_tail_begin: Option<u32>) -> LogCoverage {
@@ -1161,6 +1170,26 @@ mod tests {
         assert_eq!(empty.top, r(0, 0));
         assert!(empty.gaps.is_empty());
         assert!(empty.offline_only.is_empty());
+    }
+
+    #[test]
+    fn uncovered_is_the_union_minus_the_covered_union() {
+        assert_eq!(
+            uncovered(vec![r(1, 1501), r(2, 1501)], vec![r(1, 1501)]),
+            vec![]
+        );
+        assert_eq!(
+            uncovered(vec![r(1, 1001), r(1001, 2001)], vec![r(1, 1001)]),
+            vec![r(1001, 2001)]
+        );
+        assert_eq!(
+            uncovered(
+                vec![r(1, 3001), r(5001, 6001)],
+                vec![r(500, 1000), r(900, 2000), r(5001, 6001)]
+            ),
+            vec![r(1, 500), r(2000, 3001)]
+        );
+        assert_eq!(uncovered(vec![r(3, 3)], vec![]), vec![]);
     }
 
     #[test]

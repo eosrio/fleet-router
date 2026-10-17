@@ -59,9 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ranges, two live nodes and a chain API.
 - `config test --strict`: exits 1 when the config is invalid, a stitched
   listener's coverage has a hole or a frozen server did not report its
-  ranges, or a chain API listener has an enabled frozen server without
-  `api_endpoint`. `config test` prints each stitched listener's coverage and
-  each chain API listener's servers.
+  ranges, or a chain API listener has archived blocks that no frozen server
+  with an `api_endpoint` covers (a replica without one passes while its twin
+  has one). `config test` prints each stitched listener's coverage and each
+  chain API listener's servers.
 - `GET /coverage` and `/coverage/<listener>` on the metrics port (fleet tip,
   canonical ABI, per-log coverage and the upstreams of each segment), and
   `/ready?scope=history`, which also requires complete, online archive

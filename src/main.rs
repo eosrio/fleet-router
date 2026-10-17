@@ -32,6 +32,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::Instrument;
 
 use crate::config_sample::CONFIG_SAMPLE;
+use crate::fleet::view::uncovered;
 use crate::fleet::{FleetHub, FleetView, Log};
 use crate::models::{
     build_config_db, build_state_db_with_chain_id, format_bind_addr, ResolvedChainApi,
@@ -530,13 +531,13 @@ fn range_text(r: Range) -> String {
 
 /// `config test` for a stitched listener: apply the probed status results the
 /// way the monitor does, then print each upstream's ranges and the coverage
-/// they add up to. Returns what `--strict` fails on: a hole in the trace or
-/// chain-state coverage, and an enabled frozen upstream that did not report
-/// its ranges (a declared range is not verified).
+/// they add up to. Returns the view, and what `--strict` fails on: a hole in
+/// the trace or chain-state coverage, and an enabled frozen upstream that did
+/// not report its ranges (a declared range is not verified).
 async fn report_coverage(
     listener: &ResolvedListener,
     statuses: &[(String, Option<Vec<u8>>)],
-) -> Vec<String> {
+) -> (Arc<FleetView>, Vec<String>) {
     let state_db = build_state_db_with_chain_id(
         listener.servers.clone(),
         listener.expected_chain_id,
@@ -590,7 +591,7 @@ async fn report_coverage(
             u.name
         ));
     }
-    failures
+    (view, failures)
 }
 
 fn print_coverage(view: &FleetView, reported: &HashSet<&str>) {
@@ -637,17 +638,24 @@ fn print_coverage(view: &FleetView, reported: &HashSet<&str>) {
     }
 }
 
-/// `config test`: the chain API of a listener, one line per enabled server.
-/// Returns what `--strict` fails on: an enabled frozen server without
-/// `api_endpoint`, whose blocks only live nodes can then answer.
-fn report_chain_api(listener: &ResolvedListener, api: &ResolvedChainApi) -> Vec<String> {
+/// `config test`: the chain API of a listener, one line per enabled server,
+/// and a warning for each enabled frozen server without `api_endpoint`.
+/// Returns what `--strict` fails on: archived blocks of the stitched
+/// listener's coverage (`view`) that no frozen server with an `api_endpoint`
+/// covers, which only live nodes can then answer. A replica without one is
+/// no failure while another archive's API covers its range.
+fn report_chain_api(
+    listener: &ResolvedListener,
+    api: &ResolvedChainApi,
+    view: Option<&FleetView>,
+) -> Vec<String> {
     cprintln!(
         "\n 🔌 <bright-magenta,bold>Chain API</> on <cyan>{}</> ({} upstream API(s))",
         api.bind,
         api.upstreams.len()
     );
-    let mut failures = Vec::new();
-    for server in listener.servers.iter().filter(|s| s.enabled) {
+    let enabled = || listener.servers.iter().filter(|s| s.enabled);
+    for server in enabled() {
         let endpoint = server.api_endpoint.as_deref().unwrap_or("-");
         cprintln!(
             "    <cyan>{:<16}</> {:<6} {}",
@@ -655,20 +663,51 @@ fn report_chain_api(listener: &ResolvedListener, api: &ResolvedChainApi) -> Vec<
             server.role.as_str(),
             endpoint
         );
-        if server.role == Role::Frozen && server.api_endpoint.is_none() {
-            failures.push(format!(
-                "frozen server '{}' has no api_endpoint; its blocks are answered by live nodes only",
-                server.name
-            ));
-        }
     }
-    failures
+    for server in enabled().filter(|s| s.role == Role::Frozen && s.api_endpoint.is_none()) {
+        cprintln!(
+            "    <yellow>warning: frozen server '{}' has no api_endpoint; the chain API does not use it</>",
+            server.name
+        );
+    }
+    let Some(view) = view else {
+        return Vec::new();
+    };
+    let with_api: HashSet<&str> = enabled()
+        .filter(|s| s.api_endpoint.is_some())
+        .map(|s| s.endpoint.as_str())
+        .collect();
+    archived_without_api(view, &with_api)
+        .into_iter()
+        .map(|r| {
+            format!(
+                "archived blocks {} have no frozen server with an api_endpoint; chain API requests for them are answered by live nodes only",
+                range_text(r)
+            )
+        })
+        .collect()
+}
+
+/// The blocks of a stitched listener's archived history (the trace and
+/// chain-state ranges of its enabled frozen upstreams, reported or declared)
+/// that no frozen upstream whose server has an `api_endpoint` covers.
+/// `with_api` holds the SHiP endpoints of the servers with one.
+fn archived_without_api(view: &FleetView, with_api: &HashSet<&str>) -> Vec<Range> {
+    let ranges = |api_only: bool| -> Vec<Range> {
+        view.upstreams
+            .iter()
+            .filter(|u| u.enabled && u.known && u.role == Role::Frozen)
+            .filter(|u| !api_only || with_api.contains(&*u.endpoint))
+            .flat_map(|u| [u.range(Log::Trace), u.range(Log::ChainState)])
+            .collect()
+    };
+    uncovered(ranges(false), ranges(true))
 }
 
 /// Probe every server of every listener. Returns false when `strict` and a
 /// stitched listener's coverage has a hole or an unreported frozen upstream,
-/// or a chain API listener has an enabled frozen server without
-/// `api_endpoint`.
+/// or a chain API listener has archived blocks that no frozen server with an
+/// `api_endpoint` covers.
 async fn run_tests(config: &ServerConfig, strict: bool) -> bool {
     let mut total_valid = 0;
     let mut all_listeners_valid = true;
@@ -762,8 +801,10 @@ async fn run_tests(config: &ServerConfig, strict: bool) -> bool {
         if listener_valid == 0 {
             all_listeners_valid = false;
         }
+        let mut view = None;
         if listener.topology == ResolvedTopology::Stitched {
-            let failures = report_coverage(&listener, &statuses).await;
+            let (stitched, failures) = report_coverage(&listener, &statuses).await;
+            view = Some(stitched);
             for failure in &failures {
                 cprintln!("    <yellow>warning: {}</>", failure);
             }
@@ -775,7 +816,7 @@ async fn run_tests(config: &ServerConfig, strict: bool) -> bool {
             strict_failures.extend(failures.into_iter().map(|f| format!("{prefix}{f}")));
         }
         if let Some(api) = &chain_api {
-            let failures = report_chain_api(&listener, api);
+            let failures = report_chain_api(&listener, api, view.as_deref());
             for failure in &failures {
                 cprintln!("    <yellow>warning: {}</>", failure);
             }
@@ -843,7 +884,7 @@ fn process_args() -> Result<Option<(Action, ServerConfig)>> {
                             arg!(<CONFIG> "config file to test")
                                 .value_parser(value_parser!(PathBuf)),
                         )
-                        .arg(arg!(--strict "Exit 1 when the configuration is invalid, or a stitched listener's coverage has a hole or a frozen upstream that did not report its ranges, or a chain API listener has an enabled frozen server without api_endpoint")),
+                        .arg(arg!(--strict "Exit 1 when the configuration is invalid, or a stitched listener's coverage has a hole or a frozen upstream that did not report its ranges, or a chain API listener has archived blocks that no frozen server with an api_endpoint covers")),
                 ),
         )
         .subcommand(Command::new("run").about("Start the proxy server (default)"))

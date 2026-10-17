@@ -208,7 +208,7 @@ impl ApiSlot {
         self.in_flight.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code)] // Read by the metrics renderer.
+    /// Requests this API may have in flight now.
     pub fn cap(&self) -> usize {
         self.cap.load(Ordering::Acquire)
     }

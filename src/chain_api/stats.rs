@@ -206,13 +206,12 @@ impl ApiStats {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 
-    pub(super) fn set_bound(&self, bound: bool) {
+    pub(crate) fn set_bound(&self, bound: bool) {
         self.bound.store(bound, Ordering::Relaxed);
     }
 }
 
 // Read by the `/metrics` renderer and readiness.
-#[allow(dead_code)]
 impl ApiStats {
     pub fn requests(&self, class: RequestClass, code: StatusClass) -> u64 {
         self.requests[class.index()][code.index()].load(Ordering::Relaxed)

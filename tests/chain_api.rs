@@ -6,10 +6,9 @@
 //! "served_by":<name>}` and other calls with a tagged answer, so each test
 //! sees which upstream wrote what the client got. Probes run every 100 ms.
 //!
-//! The scenarios are CA1-CA20 and CA22 of the design (CA20, the shutdown
-//! drain, runs in process in `chain_api::tests`), plus the rule that an
-//! archived block never ends on an Unknown Block from a node whose log
-//! begins above it.
+//! The scenarios are CA1-CA22 of the design (CA20, the shutdown drain, runs
+//! in process in `chain_api::tests`), plus the rule that an archived block
+//! never ends on an Unknown Block from a node whose log begins above it.
 //!
 //! Run: cargo test --test chain_api
 
@@ -1283,4 +1282,301 @@ async fn config_test_lists_the_chain_api_and_strict_needs_every_archive_api() {
     );
     let (ok, out) = config_test(&partial, true).await;
     assert!(!ok, "--strict fails:\n{out}");
+}
+
+// ----------------------------------------------------------------------
+// Metrics, readiness and coverage
+// ----------------------------------------------------------------------
+
+/// The labels of every upstream series of `node`: its SHiP endpoint and
+/// name, after the listener's name with several listeners.
+fn upstream_labels(listener: Option<&str>, node: &Node) -> String {
+    let labels = format!("endpoint=\"{}\",server=\"{}\"", node.ship_ep, node.name);
+    match listener {
+        Some(name) => format!("listener=\"{name}\",{labels}"),
+        None => labels,
+    }
+}
+
+/// The value of one series on `/metrics`; panics when it is absent.
+async fn metric(metrics: u16, series: &str) -> f64 {
+    common::metric_value(metrics, series)
+        .await
+        .unwrap_or_else(|| panic!("no {series} on /metrics"))
+}
+
+/// The chain API lines of `/metrics`.
+async fn api_lines(metrics: u16) -> Vec<String> {
+    let (_, body) = http_get(metrics, "/metrics").await.unwrap();
+    body.lines()
+        .filter(|l| {
+            l.starts_with("fleet_router_api_") || l.starts_with("fleet_router_upstream_api_")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Poll `GET path` on the metrics port until it answers `status` with
+/// exactly `body`.
+async fn wait_http(metrics: u16, path: &str, status: u16, body: &str) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let got = http_get(metrics, path).await;
+        if got.as_ref().is_some_and(|(s, b)| *s == status && b == body) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{path}: wanted {status} {body:?}, last {got:?}"
+        );
+        sleep(POLL).await;
+    }
+}
+
+// CA21, one listener: the series carry no listener label.
+#[tokio::test]
+async fn chain_api_metrics_coverage_and_readiness_with_one_listener() {
+    let archive = frozen_node("archive-a", (2, 1001), (1, 1001), 4).await;
+    let live = live_node("live-1", 1, 2000).await;
+    let (router, port) = start(config(&[archive.frozen((2, 1001)), live.live()], json!({}))).await;
+    let metrics = router.metrics();
+    wait_served(port, RAW_BLOCK, &raw(500), "archive-a").await;
+    wait_served(port, GET_INFO, "", "live-1").await;
+    // One answer of each kind the router writes itself.
+    assert_eq!(post(port, "/v1/chain/push_block", "{}").await.status, 404);
+    assert_eq!(send(port, "OPTIONS", RAW_BLOCK, "").await.status, 200);
+
+    wait_http(
+        metrics,
+        "/ready?scope=api",
+        200,
+        "ready: 2 chain API upstream(s) up\n",
+    )
+    .await;
+
+    for (series, want) in [
+        (
+            r#"fleet_router_api_requests_total{class="denied",code="4xx"}"#,
+            1.0,
+        ),
+        (
+            r#"fleet_router_api_requests_total{class="node",code="2xx"}"#,
+            1.0,
+        ),
+        (
+            r#"fleet_router_api_requests_total{class="push",code="2xx"}"#,
+            0.0,
+        ),
+        (
+            r#"fleet_router_api_request_duration_seconds_count{class="denied"}"#,
+            1.0,
+        ),
+        (
+            r#"fleet_router_api_request_duration_seconds_bucket{class="denied",le="+Inf"}"#,
+            1.0,
+        ),
+        ("fleet_router_api_in_flight", 0.0),
+        (
+            r#"fleet_router_api_rejected_total{reason="connections"}"#,
+            0.0,
+        ),
+        (r#"fleet_router_api_pushes_total{result="ok"}"#, 0.0),
+    ] {
+        assert_eq!(metric(metrics, series).await, want, "{series}");
+    }
+    for series in [
+        r#"fleet_router_api_requests_total{class="block",code="2xx"}"#,
+        r#"fleet_router_api_requests_total{class="info",code="2xx"}"#,
+        r#"fleet_router_api_block_requests_total{region="irreversible",role="frozen"}"#,
+    ] {
+        assert!(metric(metrics, series).await >= 1.0, "{series}");
+    }
+
+    let a = upstream_labels(None, &archive);
+    let v = upstream_labels(None, &live);
+    for (series, want) in [
+        (format!("fleet_router_upstream_api_up{{{a}}}"), 1.0),
+        (format!("fleet_router_upstream_api_up{{{v}}}"), 1.0),
+        (format!("fleet_router_upstream_api_verified{{{a}}}"), 1.0),
+        (
+            format!("fleet_router_upstream_api_blocks_begin_block{{{a}}}"),
+            1.0,
+        ),
+        (
+            format!("fleet_router_upstream_api_blocks_end_block{{{a}}}"),
+            1001.0,
+        ),
+        (
+            format!("fleet_router_upstream_api_max_in_flight{{{a}}}"),
+            4.0,
+        ),
+        (format!("fleet_router_upstream_api_in_flight{{{a}}}"), 0.0),
+        (
+            format!("fleet_router_upstream_api_chain_id_mismatch{{{v}}}"),
+            0.0,
+        ),
+        (
+            format!("fleet_router_upstream_api_earliest_block{{{v}}}"),
+            1.0,
+        ),
+    ] {
+        assert_eq!(metric(metrics, &series).await, want, "{series}");
+    }
+    for series in [
+        format!("fleet_router_upstream_api_head_block{{{v}}}"),
+        format!("fleet_router_upstream_api_requests_total{{{a},result=\"ok\"}}"),
+        format!("fleet_router_upstream_api_requests_total{{{v},result=\"ok\"}}"),
+    ] {
+        assert!(metric(metrics, &series).await >= 1.0, "{series}");
+    }
+    let lines = api_lines(metrics).await;
+    assert!(lines.len() > 100, "{lines:#?}");
+    assert!(lines.iter().all(|l| !l.contains("listener=")), "{lines:#?}");
+
+    let (_, body) = http_get(metrics, "/coverage").await.unwrap();
+    let doc: Value = serde_json::from_str(&body).unwrap();
+    let api = &doc["listeners"][0]["chain_api"];
+    assert_eq!(api["listen"], format!("127.0.0.1:{port}"));
+    let node = &api["live"][0];
+    assert_eq!(node["server"], "live-1");
+    assert_eq!(node["up"], true);
+    assert_eq!(node["earliest"], 1);
+    assert_eq!(node["version"], "v1.2.2");
+    assert!(node["head"].is_u64() && node["lib"].is_u64(), "{api}");
+    assert_eq!(
+        api["frozen"],
+        json!([{ "server": "archive-a", "up": true, "verified": true,
+                 "blocks": { "begin": 1, "end": 1001 }, "get_block": "off" }])
+    );
+}
+
+// CA21 with several listeners, and CA13's readiness: a live API on another
+// chain leaves the chain API unready until it reports the listener's chain.
+#[tokio::test]
+async fn chain_api_series_name_their_listener_and_readiness_follows_the_live_chain() {
+    let node = live_api_only("live-other", [0x77; 32], Some(1), 2000, 1990).await;
+    // The second listener's SHiP endpoint, which never answers.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut cfg = base_config(&[]);
+    let top = cfg.as_object_mut().unwrap();
+    top.remove("servers");
+    top.remove("listen_port");
+    cfg["listeners"] = json!([
+        {
+            "name": "main",
+            "chain_id": hex(&CHAIN),
+            "servers": [node.live()],
+            "chain_api": { "listen_port": 0, "probe_ms": 100 },
+        },
+        {
+            "name": "plain",
+            "chain_id": hex(&CHAIN),
+            "servers": [{
+                "name": "plain-1",
+                "endpoint": dead.local_addr().unwrap().to_string(),
+                "enabled": true,
+            }],
+        },
+    ]);
+    let (router, ports) = start_with_chain_api(cfg).await;
+    let (port, metrics) = (ports[0], router.metrics());
+    let labels = upstream_labels(Some("main"), &node);
+
+    common::wait_metric(
+        metrics,
+        &format!("fleet_router_upstream_api_chain_id_mismatch{{{labels}}} 1\n"),
+        WAIT,
+    )
+    .await;
+    assert_eq!(
+        metric(
+            metrics,
+            &format!("fleet_router_upstream_api_up{{{labels}}}")
+        )
+        .await,
+        0.0
+    );
+    wait_http(
+        metrics,
+        "/ready?scope=api",
+        503,
+        "not ready: main: no live chain API upstream up\n",
+    )
+    .await;
+    wait_http(
+        metrics,
+        "/ready/plain?scope=api",
+        503,
+        "not ready (plain): no chain API configured\n",
+    )
+    .await;
+
+    node.api.set_chain_id(CHAIN);
+    wait_http(
+        metrics,
+        "/ready?scope=api",
+        200,
+        "ready: 1 listener(s) ready, 1 chain API upstream(s) up\n",
+    )
+    .await;
+    wait_http(
+        metrics,
+        "/ready/main?scope=api",
+        200,
+        "ready (main): 1 chain API upstream(s) up\n",
+    )
+    .await;
+    // The SHiP side of `main` never answers: its tip readiness is apart.
+    assert_eq!(http_get(metrics, "/ready/main").await.unwrap().0, 503);
+
+    assert_eq!(
+        served_by(&post(port, GET_INFO, "").await).as_deref(),
+        Some("live-other")
+    );
+    for (series, want) in [
+        (format!("fleet_router_upstream_api_up{{{labels}}}"), 1.0),
+        (
+            format!("fleet_router_upstream_api_chain_id_mismatch{{{labels}}}"),
+            0.0,
+        ),
+        (
+            format!("fleet_router_upstream_api_head_block{{{labels}}}"),
+            2000.0,
+        ),
+        (
+            format!("fleet_router_upstream_api_requests_total{{{labels},result=\"ok\"}}"),
+            1.0,
+        ),
+        (
+            r#"fleet_router_api_requests_total{listener="main",class="info",code="2xx"}"#
+                .to_string(),
+            1.0,
+        ),
+        (
+            r#"fleet_router_api_in_flight{listener="main"}"#.to_string(),
+            0.0,
+        ),
+    ] {
+        assert_eq!(metric(metrics, &series).await, want, "{series}");
+    }
+    // Only the listener with a chain API has chain API series.
+    let lines = api_lines(metrics).await;
+    assert!(!lines.is_empty());
+    assert!(
+        lines.iter().all(|l| l.contains("{listener=\"main\"")),
+        "{lines:#?}"
+    );
+
+    let (_, body) = http_get(metrics, "/coverage").await.unwrap();
+    let doc: Value = serde_json::from_str(&body).unwrap();
+    let api = &doc["listeners"][0]["chain_api"];
+    assert_eq!(api["listen"], format!("127.0.0.1:{port}"));
+    assert_eq!(
+        api["live"],
+        json!([{ "server": "live-other", "up": true, "head": 2000, "lib": 1990,
+                 "earliest": 1, "version": "v1.2.2" }])
+    );
+    assert_eq!(api["frozen"], json!([]));
+    assert_eq!(doc["listeners"][1]["name"], "plain");
+    assert_eq!(doc["listeners"][1]["chain_api"], Value::Null);
 }

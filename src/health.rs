@@ -3,10 +3,11 @@
 //!
 //! - `/ready`, `/ready/<name>`: whether every listener (or one) can serve
 //!   the tip; `?scope=history` also requires complete, online archive
-//!   coverage (stitched).
+//!   coverage (stitched); `?scope=api` asks about the chain API instead.
 //! - `/coverage`, `/coverage/<name>`: JSON fleet coverage of every listener,
-//!   or of one.
-//! - `/metrics`: Prometheus text exposition of upstream and listener state.
+//!   or of one, with its chain API upstreams.
+//! - `/metrics`: Prometheus text exposition of upstream and listener state,
+//!   and of the chain API where one is configured.
 //!
 //! A pool listener can serve the tip when at least one usable upstream is
 //! online. A stitched listener needs an online live upstream (any online
@@ -14,6 +15,11 @@
 //! through the control API does not count. History readiness is never part
 //! of plain `/ready`, so one archive outage cannot pull the router out of a
 //! load balancer.
+//!
+//! A chain API is ready when it accepts connections and a live API on the
+//! listener's chain is up; with no live server API configured, a verified
+//! frozen range server's API instead. Chain API readiness is never part of
+//! plain `/ready` either: the chain API port is balanced on its own.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -21,8 +27,14 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::chain_api::directory::{ApiSlot, Snapshot};
+use crate::chain_api::route::RequestClass;
+use crate::chain_api::stats::{AnswerRole, ApiStats, BlockRegion, StatusClass};
+use crate::chain_api::ChainApiCtx;
 use crate::fleet::view::AbiSource;
-use crate::fleet::{FleetHub, FleetView, ListenerStats, Log, MetricLabel, SessionGauge};
+use crate::fleet::{
+    FleetHub, FleetView, HistogramSnapshot, ListenerStats, Log, MetricLabel, SessionGauge,
+};
 use crate::models::{ResolvedTopology, Role, ServerStateDb};
 use crate::ship::{BlockPos, Range};
 
@@ -35,6 +47,8 @@ pub struct ListenerHealthState {
     /// The listener's fleet view and statistics. `None` keeps the
     /// state-map-only behaviour (pool readiness, upstream series).
     pub hub: Option<Arc<FleetHub>>,
+    /// The listener's chain API, when it has one.
+    pub chain_api: Option<Arc<ChainApiCtx>>,
 }
 
 /// What `/ready` checks.
@@ -45,16 +59,22 @@ enum Scope {
     /// Tip readiness, plus (stitched) no coverage gap, no archive segment
     /// without an online upstream, and no unreported frozen upstream.
     History,
+    /// The listener's chain API can answer: it accepts connections and has
+    /// an upstream API to send requests to. Only listeners with a chain API
+    /// count.
+    Api,
 }
 
-/// `scope=tip` (the default) or `scope=history` from a query string. Other
-/// parameters are ignored; an unknown scope is returned as the error.
+/// `scope=tip` (the default), `scope=history` or `scope=api` from a query
+/// string. Other parameters are ignored; an unknown scope is returned as the
+/// error.
 fn parse_scope(query: Option<&str>) -> Result<Scope, String> {
     for pair in query.unwrap_or("").split('&') {
         if let Some(value) = pair.strip_prefix("scope=") {
             return match value {
                 "" | "tip" => Ok(Scope::Tip),
                 "history" => Ok(Scope::History),
+                "api" => Ok(Scope::Api),
                 other => Err(other.to_string()),
             };
         }
@@ -82,7 +102,7 @@ pub(crate) async fn readiness(
             return (
                 "400 Bad Request",
                 "text/plain",
-                format!("unknown scope '{other}'; use tip or history\n"),
+                format!("unknown scope '{other}'; use tip, history or api\n"),
             )
         }
     };
@@ -94,7 +114,8 @@ pub(crate) async fn readiness(
 
 /// One listener's readiness verdict.
 struct Readiness {
-    /// Upstreams online, for the 200 body.
+    /// Upstreams online (for the chain API, upstream APIs up), for the 200
+    /// body.
     online: usize,
     /// Empty when ready.
     reasons: Vec<String>,
@@ -109,8 +130,58 @@ impl Readiness {
 }
 
 const NO_UPSTREAMS_ONLINE: &str = "no upstreams online";
+const NO_CHAIN_API: &str = "no chain API configured";
+
+/// "N upstream(s) online", or what the chain API counts.
+fn online_text(scope: Scope, online: usize) -> String {
+    match scope {
+        Scope::Tip | Scope::History => format!("{online} upstream(s) online"),
+        Scope::Api => format!("{online} chain API upstream(s) up"),
+    }
+}
+
+/// Whether the listener's chain API can answer: it accepts connections, and
+/// a live upstream API on the listener's chain is up. With no live server
+/// API configured (an archive-only chain API), a verified frozen range
+/// server API that is up stands in. APIs an operator disabled through the
+/// control API do not count, as the chain API does not use them.
+fn api_readiness(l: &ListenerHealthState) -> Readiness {
+    let Some(api) = &l.chain_api else {
+        return Readiness {
+            online: 0,
+            reasons: vec![NO_CHAIN_API.to_string()],
+            pool: false,
+        };
+    };
+    let snaps = api.snapshot();
+    let usable = |s: &&Snapshot| s.up && (s.role.is_live() || s.verified);
+    let live_configured = snaps.iter().any(|s| s.role.is_live());
+    let live_up = snaps
+        .iter()
+        .filter(usable)
+        .filter(|s| s.role.is_live())
+        .count();
+    let online = snaps.iter().filter(usable).count();
+    let mut reasons = Vec::new();
+    if !api.stats.bound() {
+        reasons.push("chain API not listening".to_string());
+    }
+    if live_configured && live_up == 0 {
+        reasons.push("no live chain API upstream up".to_string());
+    } else if !live_configured && online == 0 {
+        reasons.push("no verified frozen chain API upstream up".to_string());
+    }
+    Readiness {
+        online,
+        reasons,
+        pool: false,
+    }
+}
 
 async fn listener_readiness(l: &ListenerHealthState, scope: Scope) -> Readiness {
+    if scope == Scope::Api {
+        return api_readiness(l);
+    }
     let view = match &l.hub {
         Some(hub) if hub.topology == ResolvedTopology::Stitched => hub.view(),
         _ => {
@@ -196,7 +267,7 @@ async fn evaluate_overall(listeners: &[ListenerHealthState], scope: Scope) -> Re
             (
                 "200 OK",
                 "text/plain",
-                format!("ready: {} upstream(s) online\n", r.online),
+                format!("ready: {}\n", online_text(scope, r.online)),
             )
         } else {
             (
@@ -207,9 +278,22 @@ async fn evaluate_overall(listeners: &[ListenerHealthState], scope: Scope) -> Re
         };
     }
 
+    // The chain API scope asks about the listeners that have one.
+    let listeners: Vec<&ListenerHealthState> = listeners
+        .iter()
+        .filter(|l| scope != Scope::Api || l.chain_api.is_some())
+        .collect();
+    if scope == Scope::Api && listeners.is_empty() {
+        return (
+            "503 Service Unavailable",
+            "text/plain",
+            format!("not ready: {NO_CHAIN_API}\n"),
+        );
+    }
+
     let mut total_online = 0usize;
     let mut unready: Vec<(String, Readiness)> = Vec::new();
-    for l in listeners {
+    for l in &listeners {
         let r = listener_readiness(l, scope).await;
         total_online += r.online;
         if !r.ready() {
@@ -222,9 +306,9 @@ async fn evaluate_overall(listeners: &[ListenerHealthState], scope: Scope) -> Re
             "200 OK",
             "text/plain",
             format!(
-                "ready: {} listener(s) ready, {} upstream(s) online\n",
+                "ready: {} listener(s) ready, {}\n",
                 listeners.len(),
-                total_online
+                online_text(scope, total_online)
             ),
         )
     } else if unready.iter().all(|(_, r)| r.pool) {
@@ -271,7 +355,7 @@ async fn evaluate_listener(
         (
             "200 OK",
             "text/plain",
-            format!("ready ({target}): {} upstream(s) online\n", r.online),
+            format!("ready ({target}): {}\n", online_text(scope, r.online)),
         )
     } else {
         (
@@ -411,7 +495,43 @@ fn coverage_json(l: &ListenerHealthState) -> Option<Value> {
         "frozen_unreported": view.frozen_unknown,
         "abi": abi,
         "logs": logs,
+        "chain_api": l.chain_api.as_deref().map(chain_api_json),
     }))
+}
+
+/// A listener's chain API in `/coverage`: where it listens, and what the
+/// probes last learned about each upstream API. `up`: the API answers its
+/// probes on the listener's chain, and no request to it failed in transport
+/// since. Unknown values are `null`.
+fn chain_api_json(api: &ChainApiCtx) -> Value {
+    let mut live = Vec::new();
+    let mut frozen = Vec::new();
+    for slot in api.directory.slots() {
+        let state = slot.state();
+        let up = state.up && !state.chain_mismatch;
+        match slot.role {
+            Role::Live => live.push(json!({
+                "server": &*slot.name,
+                "up": up,
+                "head": state.head,
+                "lib": state.lib,
+                "earliest": state.earliest,
+                "version": state.version,
+            })),
+            Role::Frozen => frozen.push(json!({
+                "server": &*slot.name,
+                "up": up,
+                "verified": state.verification.verified().is_some(),
+                "blocks": state.blocks.map(range_json),
+                "get_block": state.get_block,
+            })),
+        }
+    }
+    json!({
+        "listen": api.bind,
+        "live": live,
+        "frozen": frozen,
+    })
 }
 
 fn topology_str(topology: ResolvedTopology) -> &'static str {
@@ -751,6 +871,7 @@ pub(crate) async fn render_metrics(listeners: &[ListenerHealthState]) -> String 
 
     render_upstream_session_series(&mut out, &snapshots);
     render_listener_series(&mut out, &fleets);
+    render_chain_api_series(&mut out, listeners);
 
     out
 }
@@ -909,6 +1030,42 @@ fn labeled_counter<L: MetricLabel>(
             ));
         }
     }
+}
+
+/// The `_bucket`, `_sum` and `_count` lines of one histogram of one
+/// listener; `extra` labels come before `le`.
+fn histogram_lines(
+    out: &mut String,
+    metric: &str,
+    name: Option<&str>,
+    extra: &str,
+    snap: &HistogramSnapshot,
+) {
+    let with_le = |le: &str| match extra {
+        "" => format!("le=\"{le}\""),
+        extra => format!("{extra},le=\"{le}\""),
+    };
+    for (le, n) in &snap.cumulative {
+        out.push_str(&format!(
+            "{metric}_bucket{} {n}\n",
+            listener_labels(name, &with_le(le))
+        ));
+    }
+    out.push_str(&format!(
+        "{metric}_bucket{} {}\n",
+        listener_labels(name, &with_le("+Inf")),
+        snap.count
+    ));
+    out.push_str(&format!(
+        "{metric}_sum{} {}\n",
+        listener_labels(name, extra),
+        snap.sum_seconds
+    ));
+    out.push_str(&format!(
+        "{metric}_count{} {}\n",
+        listener_labels(name, extra),
+        snap.count
+    ));
 }
 
 /// A plain counter for every listener.
@@ -1084,28 +1241,7 @@ fn render_listener_series(out: &mut String, fleets: &[ListenerSnapshot]) {
     );
     for f in fleets {
         let snap = f.hub.stats.handoff_latency.snapshot();
-        let name = f.name.as_deref();
-        for (le, n) in &snap.cumulative {
-            out.push_str(&format!(
-                "{metric}_bucket{} {n}\n",
-                listener_labels(name, &format!("le=\"{le}\""))
-            ));
-        }
-        out.push_str(&format!(
-            "{metric}_bucket{} {}\n",
-            listener_labels(name, "le=\"+Inf\""),
-            snap.count
-        ));
-        out.push_str(&format!(
-            "{metric}_sum{} {}\n",
-            listener_labels(name, ""),
-            snap.sum_seconds
-        ));
-        out.push_str(&format!(
-            "{metric}_count{} {}\n",
-            listener_labels(name, ""),
-            snap.count
-        ));
+        histogram_lines(out, metric, f.name.as_deref(), "", &snap);
     }
 
     labeled_counter(
@@ -1199,6 +1335,263 @@ fn render_listener_series(out: &mut String, fleets: &[ListenerSnapshot]) {
     );
 }
 
+/// What one upstream chain API contributes to the per-upstream API series,
+/// copied under its probe-state lock.
+struct ApiUpstreamSnapshot<'a> {
+    /// The server's usual upstream labels: `endpoint` is its SHiP endpoint,
+    /// so the API series join every other upstream series.
+    labels: String,
+    slot: &'a ApiSlot,
+    /// Up on its probes, on the listener's chain.
+    up: bool,
+    chain_mismatch: bool,
+    head: Option<u32>,
+    earliest: Option<u32>,
+    blocks: Option<Range>,
+    verified: bool,
+}
+
+/// The block requests that can occur, by region and by who answered: only
+/// an irreversible block is ever sent to a frozen range server.
+const BLOCK_ANSWERS: [(BlockRegion, AnswerRole); 7] = [
+    (BlockRegion::Irreversible, AnswerRole::Live),
+    (BlockRegion::Irreversible, AnswerRole::Frozen),
+    (BlockRegion::Irreversible, AnswerRole::None),
+    (BlockRegion::Reversible, AnswerRole::Live),
+    (BlockRegion::Reversible, AnswerRole::None),
+    (BlockRegion::Unhinted, AnswerRole::Live),
+    (BlockRegion::Unhinted, AnswerRole::None),
+];
+
+/// The chain API series: per upstream API, then per listener, for the
+/// listeners that have a chain API. Nothing when none has one.
+fn render_chain_api_series(out: &mut String, listeners: &[ListenerHealthState]) {
+    let apis: Vec<(Option<&str>, &ChainApiCtx)> = listeners
+        .iter()
+        .filter_map(|l| Some((l.name.as_deref(), l.chain_api.as_deref()?)))
+        .collect();
+    if apis.is_empty() {
+        return;
+    }
+    let mut upstreams = Vec::new();
+    for &(name, api) in &apis {
+        for slot in api.directory.slots() {
+            let state = slot.state();
+            upstreams.push(ApiUpstreamSnapshot {
+                labels: format_labels(name, &slot.ship_endpoint, &slot.name),
+                slot,
+                up: state.up && !state.chain_mismatch,
+                chain_mismatch: state.chain_mismatch,
+                head: state.head,
+                earliest: state.earliest,
+                blocks: state.blocks,
+                verified: state.verification.verified().is_some(),
+            });
+        }
+    }
+    render_api_upstream_series(out, &upstreams);
+    render_api_listener_series(out, &apis);
+}
+
+fn render_api_upstream_series(out: &mut String, upstreams: &[ApiUpstreamSnapshot<'_>]) {
+    type ValueOf<'v> = &'v dyn Fn(&ApiUpstreamSnapshot<'_>) -> Option<u64>;
+    let gauge = |out: &mut String, metric: &str, help: &str, value: ValueOf<'_>| {
+        header(out, metric, "gauge", help);
+        for u in upstreams {
+            if let Some(v) = value(u) {
+                out.push_str(&format!("{metric}{{{}}} {v}\n", u.labels));
+            }
+        }
+    };
+    let flag = |b: bool| u64::from(u8::from(b));
+    let live = |u: &ApiUpstreamSnapshot<'_>| u.slot.role == Role::Live;
+
+    gauge(
+        out,
+        "fleet_router_upstream_api_up",
+        "Whether an upstream's chain API is up (1): it answers its probes on the listener's chain, and no request to it failed in transport since. 0 otherwise.",
+        &|u| Some(flag(u.up)),
+    );
+    gauge(
+        out,
+        "fleet_router_upstream_api_chain_id_mismatch",
+        "Whether an upstream's chain API reports another chain_id than the listener's (1) or not (0). Such an API is not used.",
+        &|u| Some(flag(u.chain_mismatch)),
+    );
+    gauge(
+        out,
+        "fleet_router_upstream_api_head_block",
+        "Head block a live upstream's chain API reported to its probes (0 until known).",
+        &|u| live(u).then(|| u.head.unwrap_or(0).into()),
+    );
+    gauge(
+        out,
+        "fleet_router_upstream_api_earliest_block",
+        "First block a live upstream's chain API holds, from earliest_available_block_num (0 until known, and for nodes that do not report it).",
+        &|u| live(u).then(|| u.earliest.unwrap_or(0).into()),
+    );
+    gauge(
+        out,
+        "fleet_router_upstream_api_blocks_begin_block",
+        "First block a frozen range server's chain API serves (0 until it described itself).",
+        &|u| (!live(u)).then(|| u.blocks.map_or(0, |r| r.begin).into()),
+    );
+    gauge(
+        out,
+        "fleet_router_upstream_api_blocks_end_block",
+        "One past the last block a frozen range server's chain API serves (0 until it described itself).",
+        &|u| (!live(u)).then(|| u.blocks.map_or(0, |r| r.end).into()),
+    );
+    gauge(
+        out,
+        "fleet_router_upstream_api_verified",
+        "Whether a frozen range server's chain API is verified against its SHiP endpoint (1) or not (0). An API never verified is not used.",
+        &|u| (!live(u)).then(|| flag(u.verified)),
+    );
+    gauge(
+        out,
+        "fleet_router_upstream_api_in_flight",
+        "Chain API requests in flight to an upstream.",
+        &|u| Some(u.slot.in_flight() as u64),
+    );
+    gauge(
+        out,
+        "fleet_router_upstream_api_max_in_flight",
+        "Chain API requests an upstream may have in flight: max_in_flight_per_upstream, for a frozen range server at most its own limit.",
+        &|u| Some(u.slot.cap() as u64),
+    );
+
+    let metric = "fleet_router_upstream_api_requests_total";
+    header(
+        out,
+        metric,
+        "counter",
+        "Chain API request attempts sent to an upstream, by result.",
+    );
+    for u in upstreams {
+        for (result, n) in u.slot.results.values() {
+            out.push_str(&format!(
+                "{metric}{{{},result=\"{}\"}} {n}\n",
+                u.labels,
+                result.as_str()
+            ));
+        }
+    }
+}
+
+/// A counter family with one fixed label, for every chain API listener.
+fn api_labeled_counter<L: MetricLabel>(
+    out: &mut String,
+    apis: &[(Option<&str>, &ChainApiCtx)],
+    metric: &str,
+    label: &str,
+    help: &str,
+    counter: impl Fn(&ApiStats) -> &crate::fleet::LabeledCounter<L>,
+) {
+    header(out, metric, "counter", help);
+    for &(name, api) in apis {
+        for (value, n) in counter(&api.stats).values() {
+            let extra = format!("{label}=\"{}\"", value.as_str());
+            out.push_str(&format!("{metric}{} {n}\n", listener_labels(name, &extra)));
+        }
+    }
+}
+
+fn render_api_listener_series(out: &mut String, apis: &[(Option<&str>, &ChainApiCtx)]) {
+    let metric = "fleet_router_api_requests_total";
+    header(
+        out,
+        metric,
+        "counter",
+        "Chain API requests a listener answered, by endpoint class and HTTP status class.",
+    );
+    for &(name, api) in apis {
+        for &class in RequestClass::ALL {
+            for &code in StatusClass::ALL {
+                let extra = format!("class=\"{}\",code=\"{}\"", class.as_str(), code.as_str());
+                out.push_str(&format!(
+                    "{metric}{} {}\n",
+                    listener_labels(name, &extra),
+                    api.stats.requests(class, code)
+                ));
+            }
+        }
+    }
+
+    let metric = "fleet_router_api_request_duration_seconds";
+    header(
+        out,
+        metric,
+        "histogram",
+        "Time from a chain API request's head to the head of its answer (body read included), by endpoint class.",
+    );
+    for &(name, api) in apis {
+        for &class in RequestClass::ALL {
+            let extra = format!("class=\"{}\"", class.as_str());
+            histogram_lines(out, metric, name, &extra, &api.stats.duration(class));
+        }
+    }
+
+    let metric = "fleet_router_api_in_flight";
+    header(
+        out,
+        metric,
+        "gauge",
+        "Chain API requests holding one of a listener's max_in_flight slots.",
+    );
+    for &(name, api) in apis {
+        out.push_str(&format!(
+            "{metric}{} {}\n",
+            listener_labels(name, ""),
+            api.stats.in_flight()
+        ));
+    }
+
+    api_labeled_counter(
+        out,
+        apis,
+        "fleet_router_api_rejected_total",
+        "reason",
+        "Chain API connections closed and requests refused by a listener limit, by reason.",
+        |s| &s.rejected,
+    );
+    api_labeled_counter(
+        out,
+        apis,
+        "fleet_router_api_retries_total",
+        "reason",
+        "Chain API attempts whose answer passed the request on to the next candidate upstream, by reason.",
+        |s| &s.retries,
+    );
+
+    let metric = "fleet_router_api_block_requests_total";
+    header(
+        out,
+        metric,
+        "counter",
+        "Chain API block requests, by region (unhinted: no block number the router could read) and by who wrote the answer (none: the router answered Busy).",
+    );
+    for &(name, api) in apis {
+        for (region, role) in BLOCK_ANSWERS {
+            let extra = format!("region=\"{}\",role=\"{}\"", region.as_str(), role.as_str());
+            out.push_str(&format!(
+                "{metric}{} {}\n",
+                listener_labels(name, &extra),
+                api.stats.block_requests(region, role)
+            ));
+        }
+    }
+
+    api_labeled_counter(
+        out,
+        apis,
+        "fleet_router_api_pushes_total",
+        "result",
+        "Chain API pushes, by outcome: ok (a 2xx), error (another answer, or no node reached), ambiguous (the connection failed after the push was written; never resent).",
+        |s| &s.pushes,
+    );
+}
+
 /// Prometheus text-format label value. Backslash is replaced first so the
 /// escapes inserted for `"` and newline are not doubled.
 fn escape(s: &str) -> String {
@@ -1226,6 +1619,7 @@ mod tests {
             name: None,
             state_db: db.clone(),
             hub: None,
+            chain_api: None,
         }];
 
         let (status, _, body) = evaluate_overall_readiness(&listeners).await;
@@ -1278,11 +1672,13 @@ mod tests {
                 name: Some("eos".to_string()),
                 state_db: db_eos.clone(),
                 hub: None,
+                chain_api: None,
             },
             ListenerHealthState {
                 name: Some("wax".to_string()),
                 state_db: db_wax.clone(),
                 hub: None,
+                chain_api: None,
             },
         ];
 
@@ -1366,11 +1762,13 @@ mod tests {
                 name: None,
                 state_db: legacy,
                 hub: None,
+                chain_api: None,
             },
             ListenerHealthState {
                 name: Some("wax\"main".to_string()),
                 state_db: named,
                 hub: None,
+                chain_api: None,
             },
         ];
         let metrics = render_metrics(&listeners).await;
@@ -1455,11 +1853,13 @@ mod tests {
                 name: None,
                 state_db: legacy,
                 hub: None,
+                chain_api: None,
             },
             ListenerHealthState {
                 name: Some("wax".to_string()),
                 state_db: named,
                 hub: None,
+                chain_api: None,
             },
         ];
         let metrics = render_metrics(&listeners).await;
@@ -1594,6 +1994,7 @@ mod tests {
             name: Some("eos".to_string()),
             state_db: db,
             hub: None,
+            chain_api: None,
         }];
         let metrics = render_metrics(&listeners).await;
         {
@@ -1686,6 +2087,7 @@ mod tests {
                 name: name.map(str::to_string),
                 state_db: db.clone(),
                 hub: None,
+                chain_api: None,
             }]
         };
 
@@ -1812,6 +2214,7 @@ mod tests {
                 name: name.map(str::to_string),
                 state_db: db,
                 hub: Some(hub),
+                chain_api: None,
             }
         }
 
@@ -2337,6 +2740,531 @@ mod tests {
             assert_eq!(parse_scope(Some("scope=tip")), Ok(Scope::Tip));
             assert_eq!(parse_scope(Some("v=1&scope=history")), Ok(Scope::History));
             assert_eq!(parse_scope(Some("scope=all")), Err("all".to_string()));
+        }
+    }
+
+    /// The chain API parts: readiness with `scope=api`, the `/coverage`
+    /// block and the series. The listener's chain API is not served here:
+    /// the probe state is set by hand.
+    mod chain_api {
+        use std::time::Duration;
+
+        use super::*;
+        use crate::chain_api::pick::RetryReason;
+        use crate::chain_api::stats::{PushResult, Rejection, UpstreamResult};
+        use crate::models::{build_config_db, build_state_db, ServerConfig};
+
+        const ARCHIVE: &str = "127.0.0.1:19000";
+        const LIVE: &str = "127.0.0.1:19002";
+        const CHAIN: [u8; 32] = [0x5a; 32];
+
+        /// A frozen archive with a chain API, and a live node with one when
+        /// `live`.
+        fn servers(live: bool) -> Value {
+            let mut servers = vec![json!({
+                "name": "archive-a",
+                "endpoint": ARCHIVE,
+                "enabled": true,
+                "role": "frozen",
+                "range": { "begin": 2, "end": 1001 },
+                "api_endpoint": "http://127.0.0.1:18890",
+            })];
+            if live {
+                servers.push(json!({
+                    "name": "live-1",
+                    "endpoint": LIVE,
+                    "enabled": true,
+                    "api_endpoint": "127.0.0.1:18888",
+                }));
+            }
+            Value::Array(servers)
+        }
+
+        /// One listener over `servers` (named in multi-listener mode), with
+        /// a chain API on 127.0.0.1:18889 when `with_api`.
+        fn listener(name: Option<&str>, servers: Value, with_api: bool) -> ListenerHealthState {
+            let mut entry = json!({
+                "listen_port": 17000,
+                "chain_id": hex(&CHAIN),
+                "servers": servers,
+            });
+            if with_api {
+                entry["chain_api"] = json!({ "listen_address": "127.0.0.1", "listen_port": 18889 });
+            }
+            let mut cfg = json!({
+                "listen_address": "127.0.0.1",
+                "upstream_reconnect_ms": 1000,
+                "upstream_monitoring_ms": 1000,
+                "upstream_status_ms": 1000,
+            });
+            match name {
+                None => {
+                    for (key, value) in entry.as_object().unwrap() {
+                        cfg[key] = value.clone();
+                    }
+                }
+                Some(name) => {
+                    entry["name"] = json!(name);
+                    cfg["listeners"] = json!([entry]);
+                }
+            }
+            let cfg: ServerConfig = serde_json::from_value(cfg).unwrap();
+            let resolved = cfg.resolved_listeners().remove(0);
+            let db = build_state_db(resolved.servers.clone());
+            let hub = FleetHub::new(
+                &resolved,
+                db.clone(),
+                build_config_db(resolved.servers.clone()),
+            );
+            let chain_api = cfg
+                .resolved_chain_apis()
+                .remove(0)
+                .map(|api| ChainApiCtx::new(&api, hub.clone(), Duration::from_secs(1), 1_000, 0));
+            ListenerHealthState {
+                name: name.map(str::to_string),
+                state_db: db,
+                hub: Some(hub),
+                chain_api,
+            }
+        }
+
+        fn api(l: &ListenerHealthState) -> &ChainApiCtx {
+            l.chain_api.as_deref().unwrap()
+        }
+
+        fn slot(l: &ListenerHealthState, role: Role) -> &Arc<ApiSlot> {
+            api(l)
+                .directory
+                .slots()
+                .iter()
+                .find(|s| s.role == role)
+                .unwrap()
+        }
+
+        /// What good probes leave: the archive described and verified, the
+        /// live node's head, LIB, earliest block and version; the listener
+        /// accepting.
+        fn probed(l: &ListenerHealthState) {
+            for slot in api(l).directory.slots() {
+                let mut state = slot.state();
+                state.up = true;
+                state.chain_id = Some(CHAIN);
+                match slot.role {
+                    Role::Frozen => {
+                        let last = BlockPos {
+                            num: 1000,
+                            id: [1; 32],
+                        };
+                        state.blocks = Some(Range {
+                            begin: 1,
+                            end: 1001,
+                        });
+                        state.last = Some(last);
+                        state.get_block = Some("off".to_string());
+                        state.verification.described(last, true, Some(last));
+                        state.verification.checked(last, last.id);
+                    }
+                    Role::Live => {
+                        state.head = Some(2000);
+                        state.lib = Some(1990);
+                        state.earliest = Some(1);
+                        state.version = Some("v1.2.2".to_string());
+                    }
+                }
+            }
+            api(l).stats.set_bound(true);
+        }
+
+        /// The API of `role` reports another chain (as a probe records it),
+        /// or the listener's again.
+        fn chain_mismatch(l: &ListenerHealthState, role: Role, mismatch: bool) {
+            let mut state = slot(l, role).state();
+            state.chain_mismatch = mismatch;
+            state.up = !mismatch;
+        }
+
+        async fn get(listeners: &[ListenerHealthState], path: &str) -> (String, String) {
+            let app = crate::api::AppState::health_only(listeners.to_vec());
+            let resp = crate::http::request(
+                app,
+                &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+            )
+            .await;
+            let (head, body) = resp.split_once("\r\n\r\n").unwrap();
+            (head.lines().next().unwrap().to_string(), body.to_string())
+        }
+
+        fn ok(body: &str) -> (String, String) {
+            ("HTTP/1.1 200 OK".to_string(), body.to_string())
+        }
+
+        fn unavailable(body: &str) -> (String, String) {
+            (
+                "HTTP/1.1 503 Service Unavailable".to_string(),
+                body.to_string(),
+            )
+        }
+
+        #[tokio::test]
+        async fn api_readiness_needs_a_listening_chain_api_and_an_upstream_api() {
+            assert_eq!(parse_scope(Some("v=1&scope=api")), Ok(Scope::Api));
+            let l = listener(None, servers(true), true);
+            let one = std::slice::from_ref(&l);
+            assert_eq!(
+                get(one, "/ready?scope=api").await,
+                unavailable("not ready: chain API not listening; no live chain API upstream up\n")
+            );
+            probed(&l);
+            assert_eq!(
+                get(one, "/ready?scope=api").await,
+                ok("ready: 2 chain API upstream(s) up\n")
+            );
+            // Independent of the SHiP side, which has nothing online.
+            assert_eq!(
+                get(one, "/ready").await.0,
+                "HTTP/1.1 503 Service Unavailable"
+            );
+
+            // A live API on another chain does not count, and a verified
+            // archive does not stand in while a live API is configured.
+            chain_mismatch(&l, Role::Live, true);
+            assert_eq!(
+                get(one, "/ready?scope=api").await,
+                unavailable("not ready: no live chain API upstream up\n")
+            );
+            chain_mismatch(&l, Role::Live, false);
+            assert_eq!(get(one, "/ready?scope=api").await.0, "HTTP/1.1 200 OK");
+            // Nor does one an operator disabled: the chain API skips it.
+            {
+                let mut db = l.state_db.lock().await;
+                db.get_mut(LIVE).unwrap().operator_disabled = true;
+                l.hub.as_ref().unwrap().rebuild(&db);
+            }
+            assert_eq!(
+                get(one, "/ready?scope=api").await,
+                unavailable("not ready: no live chain API upstream up\n")
+            );
+
+            // Archive-only: a verified frozen API that is up.
+            let archive = listener(None, servers(false), true);
+            api(&archive).stats.set_bound(true);
+            slot(&archive, Role::Frozen).state().up = true;
+            let only = std::slice::from_ref(&archive);
+            assert_eq!(
+                get(only, "/ready?scope=api").await,
+                unavailable("not ready: no verified frozen chain API upstream up\n")
+            );
+            probed(&archive);
+            assert_eq!(
+                get(only, "/ready?scope=api").await,
+                ok("ready: 1 chain API upstream(s) up\n")
+            );
+
+            // Unknown scopes name the new one.
+            assert_eq!(
+                get(only, "/ready?scope=apis").await,
+                (
+                    "HTTP/1.1 400 Bad Request".to_string(),
+                    "unknown scope 'apis'; use tip, history or api\n".to_string()
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn api_readiness_asks_only_listeners_with_a_chain_api() {
+            let main = listener(Some("main"), servers(true), true);
+            let plain = listener(Some("plain"), servers(true), false);
+            let both = vec![main.clone(), plain.clone()];
+            probed(&main);
+            assert_eq!(
+                get(&both, "/ready?scope=api").await,
+                ok("ready: 1 listener(s) ready, 2 chain API upstream(s) up\n")
+            );
+            assert_eq!(
+                get(&both, "/readyz/main?scope=api").await,
+                ok("ready (main): 2 chain API upstream(s) up\n")
+            );
+            assert_eq!(
+                get(&both, "/ready/plain?scope=api").await,
+                unavailable("not ready (plain): no chain API configured\n")
+            );
+            assert_eq!(
+                get(&both, "/ready/missing?scope=api").await.0,
+                "HTTP/1.1 404 Not Found"
+            );
+            assert_eq!(
+                get(std::slice::from_ref(&plain), "/ready?scope=api").await,
+                unavailable("not ready: no chain API configured\n")
+            );
+            let single = listener(None, servers(true), false);
+            assert_eq!(
+                get(std::slice::from_ref(&single), "/ready?scope=api").await,
+                unavailable("not ready: no chain API configured\n")
+            );
+
+            chain_mismatch(&main, Role::Live, true);
+            assert_eq!(
+                get(&both, "/ready?scope=api").await,
+                unavailable("not ready: main: no live chain API upstream up\n")
+            );
+            api(&main).stats.set_bound(false);
+            assert_eq!(
+                get(&both, "/ready/main?scope=api").await,
+                unavailable(
+                    "not ready (main): chain API not listening; no live chain API upstream up\n"
+                )
+            );
+        }
+
+        #[tokio::test]
+        async fn coverage_lists_the_chain_api_upstreams() {
+            let main = listener(Some("main"), servers(true), true);
+            let plain = listener(Some("plain"), servers(true), false);
+            let both = vec![main.clone(), plain];
+
+            // Before any probe: nothing is known.
+            let (_, body) = get(&both, "/coverage").await;
+            let doc: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                doc["listeners"][0]["chain_api"],
+                json!({
+                    "listen": "127.0.0.1:18889",
+                    "live": [{ "server": "live-1", "up": false, "head": null, "lib": null,
+                               "earliest": null, "version": null }],
+                    "frozen": [{ "server": "archive-a", "up": false, "verified": false,
+                                 "blocks": null, "get_block": null }],
+                })
+            );
+            assert_eq!(doc["listeners"][1]["chain_api"], Value::Null);
+
+            probed(&main);
+            chain_mismatch(&main, Role::Live, true);
+            let (_, body) = get(&both, "/coverage/main").await;
+            let doc: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                doc["listeners"][0]["chain_api"],
+                json!({
+                    "listen": "127.0.0.1:18889",
+                    "live": [{ "server": "live-1", "up": false, "head": 2000, "lib": 1990,
+                               "earliest": 1, "version": "v1.2.2" }],
+                    "frozen": [{ "server": "archive-a", "up": true, "verified": true,
+                                 "blocks": { "begin": 1, "end": 1001 }, "get_block": "off" }],
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn chain_api_series_render_per_upstream_and_per_listener() {
+            for name in [None, Some("main")] {
+                let l = listener(name, servers(true), true);
+                probed(&l);
+                let archive = slot(&l, Role::Frozen);
+                let live = slot(&l, Role::Live);
+                archive.set_cap(4);
+                archive.results.add(UpstreamResult::Ok, 2);
+                live.results.inc(UpstreamResult::UnknownBlock);
+                let _held = live.try_acquire().unwrap();
+                let stats = &api(&l).stats;
+                stats.request(RequestClass::Block, 200, Duration::from_millis(3));
+                stats.request(RequestClass::Block, 503, Duration::from_millis(30));
+                stats.request(RequestClass::Denied, 404, Duration::from_micros(10));
+                stats.rejected.inc(Rejection::InFlight);
+                stats.retries.inc(RetryReason::UnknownBlock);
+                stats.block_request(BlockRegion::Irreversible, AnswerRole::Frozen);
+                stats.pushes.inc(PushResult::Ambiguous);
+
+                let metrics = render_metrics(std::slice::from_ref(&l)).await;
+                let lab = |extra: &str| listener_labels(name, extra);
+                let up = |endpoint: &str, server: &str, extra: &str| {
+                    let base = format_labels(name, endpoint, server);
+                    if extra.is_empty() {
+                        format!("{{{base}}}")
+                    } else {
+                        format!("{{{base},{extra}}}")
+                    }
+                };
+                let a = |extra: &str| up(ARCHIVE, "archive-a", extra);
+                let v = |extra: &str| up(LIVE, "live-1", extra);
+                let expected = [
+                    format!("fleet_router_upstream_api_up{} 1\n", a("")),
+                    format!("fleet_router_upstream_api_up{} 1\n", v("")),
+                    format!("fleet_router_upstream_api_chain_id_mismatch{} 0\n", v("")),
+                    format!("fleet_router_upstream_api_head_block{} 2000\n", v("")),
+                    format!("fleet_router_upstream_api_earliest_block{} 1\n", v("")),
+                    format!("fleet_router_upstream_api_blocks_begin_block{} 1\n", a("")),
+                    format!("fleet_router_upstream_api_blocks_end_block{} 1001\n", a("")),
+                    format!("fleet_router_upstream_api_verified{} 1\n", a("")),
+                    format!("fleet_router_upstream_api_in_flight{} 0\n", a("")),
+                    format!("fleet_router_upstream_api_in_flight{} 1\n", v("")),
+                    format!("fleet_router_upstream_api_max_in_flight{} 4\n", a("")),
+                    format!("fleet_router_upstream_api_max_in_flight{} 64\n", v("")),
+                    format!(
+                        "fleet_router_upstream_api_requests_total{} 2\n",
+                        a("result=\"ok\"")
+                    ),
+                    format!(
+                        "fleet_router_upstream_api_requests_total{} 1\n",
+                        v("result=\"unknown_block\"")
+                    ),
+                    format!(
+                        "fleet_router_upstream_api_requests_total{} 0\n",
+                        v("result=\"timeout\"")
+                    ),
+                    format!(
+                        "fleet_router_api_requests_total{} 1\n",
+                        lab("class=\"block\",code=\"2xx\"")
+                    ),
+                    format!(
+                        "fleet_router_api_requests_total{} 1\n",
+                        lab("class=\"block\",code=\"5xx\"")
+                    ),
+                    format!(
+                        "fleet_router_api_requests_total{} 1\n",
+                        lab("class=\"denied\",code=\"4xx\"")
+                    ),
+                    format!(
+                        "fleet_router_api_requests_total{} 0\n",
+                        lab("class=\"invalid\",code=\"3xx\"")
+                    ),
+                    format!(
+                        "fleet_router_api_request_duration_seconds_bucket{} 1\n",
+                        lab("class=\"block\",le=\"0.005\"")
+                    ),
+                    format!(
+                        "fleet_router_api_request_duration_seconds_bucket{} 2\n",
+                        lab("class=\"block\",le=\"0.05\"")
+                    ),
+                    format!(
+                        "fleet_router_api_request_duration_seconds_bucket{} 2\n",
+                        lab("class=\"block\",le=\"+Inf\"")
+                    ),
+                    format!(
+                        "fleet_router_api_request_duration_seconds_sum{} 0.033\n",
+                        lab("class=\"block\"")
+                    ),
+                    format!(
+                        "fleet_router_api_request_duration_seconds_count{} 2\n",
+                        lab("class=\"block\"")
+                    ),
+                    format!(
+                        "fleet_router_api_request_duration_seconds_count{} 0\n",
+                        lab("class=\"push\"")
+                    ),
+                    format!("fleet_router_api_in_flight{} 0\n", lab("")),
+                    format!(
+                        "fleet_router_api_rejected_total{} 1\n",
+                        lab("reason=\"in_flight\"")
+                    ),
+                    format!(
+                        "fleet_router_api_rejected_total{} 0\n",
+                        lab("reason=\"connections\"")
+                    ),
+                    format!(
+                        "fleet_router_api_retries_total{} 1\n",
+                        lab("reason=\"unknown_block\"")
+                    ),
+                    format!(
+                        "fleet_router_api_retries_total{} 0\n",
+                        lab("reason=\"error\"")
+                    ),
+                    format!(
+                        "fleet_router_api_block_requests_total{} 1\n",
+                        lab("region=\"irreversible\",role=\"frozen\"")
+                    ),
+                    format!(
+                        "fleet_router_api_block_requests_total{} 0\n",
+                        lab("region=\"unhinted\",role=\"none\"")
+                    ),
+                    format!(
+                        "fleet_router_api_pushes_total{} 1\n",
+                        lab("result=\"ambiguous\"")
+                    ),
+                ];
+                for line in expected {
+                    assert!(metrics.contains(&line), "missing {line:?} in:\n{metrics}");
+                }
+                // Role-specific series, and answers that cannot occur.
+                for absent in [
+                    format!("fleet_router_upstream_api_head_block{}", a("")),
+                    format!("fleet_router_upstream_api_earliest_block{}", a("")),
+                    format!("fleet_router_upstream_api_verified{}", v("")),
+                    format!("fleet_router_upstream_api_blocks_begin_block{}", v("")),
+                    format!(
+                        "fleet_router_api_block_requests_total{}",
+                        lab("region=\"reversible\",role=\"frozen\"")
+                    ),
+                    format!(
+                        "fleet_router_api_block_requests_total{}",
+                        lab("region=\"unhinted\",role=\"frozen\"")
+                    ),
+                ] {
+                    assert!(
+                        !metrics.contains(&absent),
+                        "unexpected {absent} in:\n{metrics}"
+                    );
+                }
+                for (metric, kind, series) in [
+                    ("fleet_router_upstream_api_up", "gauge", 2),
+                    ("fleet_router_upstream_api_chain_id_mismatch", "gauge", 2),
+                    ("fleet_router_upstream_api_head_block", "gauge", 1),
+                    ("fleet_router_upstream_api_earliest_block", "gauge", 1),
+                    ("fleet_router_upstream_api_blocks_begin_block", "gauge", 1),
+                    ("fleet_router_upstream_api_blocks_end_block", "gauge", 1),
+                    ("fleet_router_upstream_api_verified", "gauge", 1),
+                    ("fleet_router_upstream_api_in_flight", "gauge", 2),
+                    ("fleet_router_upstream_api_max_in_flight", "gauge", 2),
+                    ("fleet_router_upstream_api_requests_total", "counter", 14),
+                    ("fleet_router_api_requests_total", "counter", 32),
+                    (
+                        "fleet_router_api_request_duration_seconds",
+                        "histogram",
+                        8 * 15,
+                    ),
+                    ("fleet_router_api_in_flight", "gauge", 1),
+                    ("fleet_router_api_rejected_total", "counter", 4),
+                    ("fleet_router_api_retries_total", "counter", 6),
+                    ("fleet_router_api_block_requests_total", "counter", 7),
+                    ("fleet_router_api_pushes_total", "counter", 3),
+                ] {
+                    assert_eq!(
+                        metrics
+                            .matches(&format!("# TYPE {metric} {kind}\n"))
+                            .count(),
+                        1,
+                        "one TYPE line for {metric}"
+                    );
+                    let lines: Vec<&str> = metrics
+                        .lines()
+                        .filter(|line| {
+                            line.strip_prefix(metric).is_some_and(|rest| {
+                                rest.starts_with('{')
+                                    || rest.starts_with(' ')
+                                    || rest.starts_with("_bucket{")
+                                    || rest.starts_with("_sum")
+                                    || rest.starts_with("_count")
+                            })
+                        })
+                        .collect();
+                    assert_eq!(lines.len(), series, "{metric}: {lines:#?}");
+                    assert!(
+                        lines
+                            .iter()
+                            .all(|line| line.contains("listener=") == name.is_some()),
+                        "{metric}: the listener label only with several listeners: {lines:#?}"
+                    );
+                }
+                if name.is_none() {
+                    assert!(metrics.contains("fleet_router_api_in_flight 0\n"));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn no_chain_api_series_without_a_chain_api() {
+            let plain = listener(None, servers(true), false);
+            let metrics = render_metrics(&[plain]).await;
+            assert!(!metrics.contains("fleet_router_api_"), "{metrics}");
+            assert!(!metrics.contains("fleet_router_upstream_api_"), "{metrics}");
         }
     }
 }

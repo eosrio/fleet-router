@@ -183,10 +183,24 @@ async fn main() -> Result<()> {
             server_config_db.clone(),
         );
 
+        // The listener's chain API, served further down; readiness, coverage
+        // and metrics read it.
+        let chain_api = chain_api.map(|(api, api_listener)| {
+            let api_ctx = chain_api::ChainApiCtx::new(
+                &api,
+                hub.clone(),
+                Duration::from_millis(limits.connect_timeout_ms),
+                limits.handshake_timeout_ms,
+                config.live_lag_blocks,
+            );
+            (api_ctx, api_listener)
+        });
+
         let health_state = health::ListenerHealthState {
             name: listener_cfg.name.clone(),
             state_db: server_state_db.clone(),
             hub: Some(hub.clone()),
+            chain_api: chain_api.as_ref().map(|(api_ctx, _)| api_ctx.clone()),
         };
         let listener_stats = Arc::new(telemetry::ListenerStats::default());
         listener_contexts.push(api::ListenerContext {
@@ -238,14 +252,7 @@ async fn main() -> Result<()> {
         // The chain API: its probes and its accept loop. Its connections
         // drain with the SHiP ones. `chain_apis` lines up with the
         // listeners.
-        let api_ctx = chain_api.map(|(api, api_listener)| {
-            let api_ctx = chain_api::ChainApiCtx::new(
-                &api,
-                hub.clone(),
-                Duration::from_millis(limits.connect_timeout_ms),
-                limits.handshake_timeout_ms,
-                config.live_lag_blocks,
-            );
+        let api_ctx = chain_api.map(|(api_ctx, api_listener)| {
             conn_limits.push((api_ctx.connections.clone(), api_ctx.max_connections()));
             accept_handles.push(api_ctx.spawn(api_listener, &shutdown_tx));
             api_ctx

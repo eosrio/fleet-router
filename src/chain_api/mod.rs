@@ -613,7 +613,8 @@ impl ChainApiCtx {
             .unwrap_or(Err(BodyError::Timeout))
     }
 
-    fn snapshot(&self) -> Vec<Snapshot> {
+    /// Every upstream API as a request sees it now.
+    pub fn snapshot(&self) -> Vec<Snapshot> {
         self.directory.snapshot(&self.hub, Instant::now())
     }
 

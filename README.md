@@ -29,7 +29,7 @@ Clients open a single WebSocket connection to the router. The router picks a hea
 ## Features
 
 - **Failover without reconnecting.** On upstream loss the session moves to another node, resumes at the next block, drops replayed blocks, and replays client frames sent during the swap.
-- **Range-aware, least-connections routing.** Requests go to an upstream whose trace range covers the requested block, otherwise to the least-loaded healthy one. `fetch_finality_data` requests go only to nodes whose finality range covers the block.
+- **Range-aware, least-connections routing.** Requests go to an upstream whose trace range covers the requested block, otherwise to the least-loaded healthy one. Optional per-node `priority` and `weight` mark preferred and last-resort nodes and split load. `fetch_finality_data` requests go only to nodes whose finality range covers the block.
 - **Stale nodes are deprioritized, not excluded.** Upstreams that stop advancing drop down the list.
 - **Bounded failure on corrupted SHiP logs.** A block that breaks every upstream ends the session with close code 1011 and a clear reason instead of a silent stall. Opt-in quarantine skips one node for just the bad block range.
 - **Several networks in one process.** Each listener has its own port, upstream pool, `chain_id`, connection cap, and `/ready/<name>` check.

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Optional per-server `priority` (default `0`, lower is preferred) and
+  `weight` (default `1`). Among upstreams that are equally able to serve a
+  request (same block coverage and freshness), the router uses the lowest
+  priority tier, then the fewest connections per unit of weight. A high
+  priority makes an upstream a last resort. Failover still moves off a failed
+  preferred upstream to a backup that covers the block. New gauges
+  `fleet_router_upstream_priority` and `fleet_router_upstream_weight`.
+  Requested by @Rossco99.
 - Static landing page under `site/` for GitHub Pages.
 
 ### Changed

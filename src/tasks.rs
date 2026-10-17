@@ -635,6 +635,8 @@ mod tests {
             name: "alpha".to_string(),
             endpoint: "127.0.0.1:18080".to_string(),
             enabled: true,
+            priority: 0,
+            weight: 1,
         };
         let db = build_state_db(vec![server.clone()]);
         (server, db)
@@ -896,11 +898,15 @@ mod tests {
             name: "alpha".to_string(),
             endpoint: "127.0.0.1:18080".to_string(),
             enabled: true,
+            priority: 0,
+            weight: 1,
         };
         let s2 = Server {
             name: "beta".to_string(),
             endpoint: "127.0.0.1:18081".to_string(),
             enabled: true,
+            priority: 0,
+            weight: 1,
         };
         let db = build_state_db(vec![s1.clone(), s2.clone()]);
 
@@ -932,6 +938,8 @@ mod tests {
             name: "alpha".to_string(),
             endpoint: "127.0.0.1:18080".to_string(),
             enabled: true,
+            priority: 0,
+            weight: 1,
         };
         let db = crate::models::build_state_db_with_chain_id(
             vec![server.clone()],
@@ -1031,11 +1039,15 @@ mod tests {
             name: "alpha".to_string(),
             endpoint: "127.0.0.1:18080".to_string(),
             enabled: true,
+            priority: 0,
+            weight: 1,
         };
         let s2 = Server {
             name: "beta".to_string(),
             endpoint: "127.0.0.1:18081".to_string(),
             enabled: true,
+            priority: 0,
+            weight: 1,
         };
         let db = build_state_db(vec![s1.clone(), s2.clone()]);
         apply_status_update(&status_message(&status_body()), &db, &s1)
@@ -1066,11 +1078,15 @@ mod tests {
             name: "alpha".to_string(),
             endpoint: "127.0.0.1:18080".to_string(),
             enabled: true,
+            priority: 0,
+            weight: 1,
         };
         let other = Server {
             name: "beta".to_string(),
             endpoint: "127.0.0.1:18081".to_string(),
             enabled: true,
+            priority: 0,
+            weight: 1,
         };
         let db = crate::models::build_state_db_with_chain_id(
             vec![server.clone(), other.clone()],
@@ -1146,11 +1162,15 @@ mod tests {
             name: "alpha".to_string(),
             endpoint: "127.0.0.1:18080".to_string(),
             enabled: true,
+            priority: 0,
+            weight: 1,
         };
         let s2 = Server {
             name: "beta".to_string(),
             endpoint: "127.0.0.1:18081".to_string(),
             enabled: true,
+            priority: 0,
+            weight: 1,
         };
         let db = build_state_db(vec![s1.clone(), s2.clone()]);
 

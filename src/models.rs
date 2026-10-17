@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 
 pub type ServerStateDb = Arc<Mutex<HashMap<String, ServerState>>>;
 pub type ServerConfigDb = Arc<Mutex<HashMap<String, Server>>>;
@@ -22,6 +23,9 @@ fn default_handshake_timeout_ms() -> u64 {
 }
 fn default_idle_timeout_ms() -> u64 {
     0 // 0 = disabled
+}
+fn default_upstream_liveness_timeout_ms() -> u64 {
+    4_000
 }
 fn default_max_message_bytes() -> usize {
     256 * 1024 * 1024 // 256 MiB
@@ -330,6 +334,15 @@ pub struct ServerConfig {
     /// Idle timeout (ms): close a connection that exchanges no data for this long. 0 = disabled.
     #[serde(default = "default_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
+    /// Fail a session over when its upstream socket goes silent (ms).
+    ///
+    /// After half this time with no frame from the upstream, the session
+    /// sends a WebSocket ping. If no frame at all arrives within the full
+    /// time, the upstream is treated as dead: it is marked offline and the
+    /// session fails over. Catches a node that stops answering without
+    /// closing the connection. 0 = disabled.
+    #[serde(default = "default_upstream_liveness_timeout_ms")]
+    pub upstream_liveness_timeout_ms: u64,
     /// Maximum WebSocket message size (bytes) accepted on upstream links.
     #[serde(default = "default_max_message_bytes")]
     pub max_message_bytes: usize,
@@ -785,6 +798,7 @@ impl ServerConfig {
         ProxyLimits {
             handshake_timeout_ms: self.handshake_timeout_ms,
             idle_timeout_ms: self.idle_timeout_ms,
+            upstream_liveness_timeout_ms: self.upstream_liveness_timeout_ms,
             max_message_bytes: self.max_message_bytes,
             max_client_message_bytes: self.max_client_message_bytes,
         }
@@ -803,6 +817,10 @@ pub struct UpstreamCounters {
     pub blocks_total: AtomicU64,
     /// Bytes forwarded from this upstream to clients.
     pub bytes_total: AtomicU64,
+    /// Woken when the upstream goes from online to offline, so sessions on
+    /// it can check their socket right away instead of waiting for their own
+    /// liveness timeout.
+    pub went_offline: Notify,
 }
 
 /// Live state tracked per upstream by the monitoring loop and the proxy.
@@ -943,6 +961,14 @@ impl ServerState {
         true
     }
 
+    /// Mark the upstream offline and wake sessions waiting on it.
+    pub fn set_offline(&mut self) {
+        if self.online {
+            self.online = false;
+            self.counters.went_offline.notify_waiters();
+        }
+    }
+
     /// Whether selection may use this upstream (online or not).
     pub fn routable(&self) -> bool {
         self.enabled && !self.operator_disabled
@@ -1018,6 +1044,8 @@ pub struct StaticConfig {
 pub struct ProxyLimits {
     pub handshake_timeout_ms: u64,
     pub idle_timeout_ms: u64,
+    /// See [`ServerConfig::upstream_liveness_timeout_ms`]. 0 = disabled.
+    pub upstream_liveness_timeout_ms: u64,
     /// Upstream WebSocket message/frame cap.
     pub max_message_bytes: usize,
     /// Client WebSocket message/frame cap.

@@ -192,7 +192,7 @@ impl MockShipServer {
             .expect("Failed WebSocket handshake");
 
         let config = self.config.clone();
-        Self::handle_session(ws_stream, config).await;
+        Self::handle_session(ws_stream, config, None).await;
     }
 
     /// Start accepting connections in a loop. Returns a handle to stop it.
@@ -233,7 +233,7 @@ impl MockShipServer {
                                         _ = wait_until_killed(&control) => {}
                                         _ = async {
                                             if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
-                                                Self::handle_session(ws, cfg).await;
+                                                Self::handle_session(ws, cfg, Some(control.clone())).await;
                                             }
                                         } => {}
                                     }
@@ -268,10 +268,19 @@ impl MockShipServer {
     async fn handle_session<S>(
         ws_stream: tokio_tungstenite::WebSocketStream<S>,
         config: MockShipConfig,
+        control: Option<Arc<SessionControl>>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let (mut writer, mut reader) = ws_stream.split();
+        let close_generation = control
+            .as_ref()
+            .map(|control| control.close_generation.load(Ordering::Acquire));
+        let close_requested = |control: &Option<Arc<SessionControl>>| {
+            control.as_ref().is_some_and(|control| {
+                Some(control.close_generation.load(Ordering::Acquire)) != close_generation
+            })
+        };
 
         // Step 1: Send ABI as Text frame
         if writer
@@ -362,6 +371,10 @@ impl MockShipServer {
                                 traces_data.as_deref(),
                                 deltas_data.as_deref(),
                             );
+                            if close_requested(&control) {
+                                let _ = writer.send(Message::Close(None)).await;
+                                return;
+                            }
                             if writer.send(Message::Binary(result.into())).await.is_err() {
                                 return;
                             }
@@ -375,8 +388,29 @@ impl MockShipServer {
                 }
             }
 
-            // Read next request from client
-            let msg = match reader.next().await {
+            // Read next request from client, unless a clean close is requested
+            // first (as nodeos does when it shuts down).
+            let next = match &control {
+                Some(session_control) => {
+                    tokio::select! {
+                        next = reader.next() => next,
+                        _ = async {
+                            loop {
+                                let notified = session_control.close.notified();
+                                if close_requested(&control) {
+                                    return;
+                                }
+                                notified.await;
+                            }
+                        } => {
+                            let _ = writer.send(Message::Close(None)).await;
+                            return;
+                        }
+                    }
+                }
+                None => reader.next().await,
+            };
+            let msg = match next {
                 Some(Ok(msg)) => msg,
                 Some(Err(_)) | None => return,
             };
@@ -494,6 +528,10 @@ struct SessionControl {
     stall: AtomicBool,
     killed: AtomicBool,
     kill: Notify,
+    /// Bumped by [`MockShipHandle::close_sessions`]. A session closes when the
+    /// value differs from the one it started with.
+    close_generation: AtomicUsize,
+    close: Notify,
 }
 
 impl SessionControl {
@@ -502,6 +540,8 @@ impl SessionControl {
             stall: AtomicBool::new(false),
             killed: AtomicBool::new(false),
             kill: Notify::new(),
+            close_generation: AtomicUsize::new(0),
+            close: Notify::new(),
         }
     }
 }
@@ -546,6 +586,14 @@ impl MockShipHandle {
         self.control.kill.notify_waiters();
     }
 
+    /// Send a WebSocket Close on every open session, as nodeos does when it
+    /// shuts down cleanly. New connections are still accepted, like a node
+    /// that has restarted.
+    pub fn close_sessions(&self) {
+        self.control.close_generation.fetch_add(1, Ordering::AcqRel);
+        self.control.close.notify_waiters();
+    }
+
     /// Gracefully shut down the server.
     pub async fn shutdown(mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
@@ -575,5 +623,5 @@ pub async fn serve_websocket<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    MockShipServer::handle_session(ws_stream, config).await;
+    MockShipServer::handle_session(ws_stream, config, None).await;
 }

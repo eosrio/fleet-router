@@ -8,7 +8,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::spawn;
 use tokio::sync::{broadcast, Mutex, Notify};
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, sleep_until, timeout};
 use tokio_tungstenite::{
     accept_async_with_config, connect_async_with_config, tungstenite, MaybeTlsStream,
     WebSocketStream,
@@ -28,6 +28,30 @@ use crate::models::{
 use crate::telemetry::{self, Event, EventKind, Level};
 
 type UpstreamStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type UpstreamSink = futures::stream::SplitSink<UpstreamStream, Message>;
+
+/// Payload of the router's own pings to an upstream. Pongs carrying it are
+/// not forwarded to the client.
+const LIVENESS_PING: &[u8] = b"fleet-router-liveness";
+
+/// When the monitor reports the current upstream offline, a session pings it
+/// at once and fails over if nothing arrives within this time.
+const OFFLINE_PROBE: Duration = Duration::from_secs(1);
+
+/// Send a liveness ping to the upstream. Bounded so a stuck socket cannot
+/// hold the session loop.
+async fn send_liveness_ping(server_writer: &Mutex<UpstreamSink>) {
+    let ping = async {
+        server_writer
+            .lock()
+            .await
+            .send(Message::Ping(LIVENESS_PING.into()))
+            .await
+    };
+    if !matches!(timeout(Duration::from_secs(1), ping).await, Ok(Ok(()))) {
+        tracing::debug!("liveness ping to upstream not sent");
+    }
+}
 
 /// Maximum payload bytes of client frames buffered per session while an upstream
 /// is mid-failover. A frame counts as at least one byte, so an empty-frame flood
@@ -66,6 +90,9 @@ fn next_block_after(last_seen: Option<u32>, request: Option<&[u8]>) -> Option<u3
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UpstreamStop {
     Idle,
+    /// No frame at all, not even a reply to a liveness ping, within
+    /// `upstream_liveness_timeout_ms`. The socket may still look open.
+    Silent,
     /// TCP dropped, or the websocket ended without a Close frame.
     Unclean,
     /// Upstream sent a WebSocket Close frame.
@@ -99,6 +126,14 @@ fn plan_same_block_failover(
         exclude_failed: false,
         failures: 0,
     };
+    if !rerouted && matches!(stop, Some(UpstreamStop::Silent)) {
+        // A dead node, not a bad block: prefer another upstream, but do not
+        // count a strike against the block.
+        return SameBlockPlan {
+            exclude_failed: true,
+            ..passthrough
+        };
+    }
     if rerouted || !matches!(stop, Some(UpstreamStop::Unclean)) {
         return passthrough;
     }
@@ -213,7 +248,7 @@ impl Drop for AbortOnDrop {
 
 async fn mark_offline(backend_servers: &ServerStateDb, endpoint: &str) {
     if let Some(s) = backend_servers.lock().await.get_mut(endpoint) {
-        s.online = false;
+        s.set_offline();
     }
 }
 
@@ -590,6 +625,7 @@ pub async fn handle_client(
     let mut cw_guard = client_writer.lock().await;
     let mut sr_guard = server_reader.lock().await;
     let idle_ms = limits.idle_timeout_ms;
+    let liveness_ms = limits.upstream_liveness_timeout_ms;
 
     let mut restarting = false;
     let mut last_seen_block: Option<u32> = None;
@@ -605,6 +641,14 @@ pub async fn handle_client(
         let mut upstream_sent_close = false;
         let mut operator_close = false;
         let mut operator_move = false;
+        // Liveness of the current upstream socket.
+        let mut last_upstream_frame = Instant::now();
+        // Last frame other than a reply to a liveness ping, for idle_timeout_ms.
+        let mut last_data_frame = last_upstream_frame;
+        let mut ping_sent = false;
+        // Set when the monitor reported this upstream offline: fail over at
+        // this instant unless a frame arrives first.
+        let mut probe_until: Option<Instant> = None;
         // Kept across iterations so a permit is not lost when another branch wins.
         let reroute_fut = reroute_notify.notified();
         tokio::pin!(reroute_fut);
@@ -614,94 +658,100 @@ pub async fn handle_client(
                 break;
             }
 
-            let next_msg: Option<Message> = if idle_ms > 0 {
-                tokio::select! {
-                    _ = shutdown.recv() => {
-                        let _ = cw_guard.send(Message::Close(Some(CloseFrame {
-                            code: CloseCode::Away,
-                            reason: "server shutting down".into(),
-                        }))).await;
-                        return;
-                    }
-                    _ = client_disconnect_notify.notified() => { client_down = true; break; }
-                    _ = &mut reroute_fut => { rerouted = true; break; }
-                    _ = session.control.notified() => {
-                        if session.close_requested() {
-                            operator_close = true;
-                            break;
-                        }
-                        if session.take_move_request() {
-                            let current = current_endpoint.lock().await.clone();
-                            let next_block = session.next_block();
-                            if has_alternative_for(&*backend_servers.lock().await, &current, next_block) {
-                                operator_move = true;
-                                rerouted = true;
-                                break;
-                            }
-                            tracing::info!(upstream = %current, ?next_block, "operator move skipped: no other upstream can serve the next block");
-                        }
-                        continue;
-                    }
-                    r = timeout(Duration::from_millis(idle_ms), sr_guard.next()) => match r {
-                        Ok(Some(Ok(m))) => Some(m),
-                        Ok(_) => {
-                            upstream_stop = Some(if upstream_sent_close {
-                                UpstreamStop::Clean
-                            } else {
-                                UpstreamStop::Unclean
-                            });
-                            None
-                        }
-                        Err(_) => {
-                            tracing::debug!("upstream idle timeout; failing over");
-                            upstream_stop = Some(UpstreamStop::Idle);
-                            None
-                        }
-                    }
+            // When the liveness check is on: ping after half the timeout
+            // with no upstream frame, give up after the full timeout.
+            let liveness_deadline = (liveness_ms > 0).then(|| {
+                let wait = if ping_sent {
+                    liveness_ms
+                } else {
+                    liveness_ms / 2
+                };
+                let deadline = last_upstream_frame + Duration::from_millis(wait);
+                probe_until.map_or(deadline, |probe| probe.min(deadline))
+            });
+
+            let next_msg: Option<Message> = tokio::select! {
+                _ = shutdown.recv() => {
+                    let _ = cw_guard.send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Away,
+                        reason: "server shutting down".into(),
+                    }))).await;
+                    return;
                 }
-            } else {
-                tokio::select! {
-                    _ = shutdown.recv() => {
-                        let _ = cw_guard.send(Message::Close(Some(CloseFrame {
-                            code: CloseCode::Away,
-                            reason: "server shutting down".into(),
-                        }))).await;
-                        return;
+                _ = client_disconnect_notify.notified() => { client_down = true; break; }
+                _ = &mut reroute_fut => { rerouted = true; break; }
+                _ = session.control.notified() => {
+                    if session.close_requested() {
+                        operator_close = true;
+                        break;
                     }
-                    _ = client_disconnect_notify.notified() => { client_down = true; break; }
-                    _ = &mut reroute_fut => { rerouted = true; break; }
-                    _ = session.control.notified() => {
-                        if session.close_requested() {
-                            operator_close = true;
+                    if session.take_move_request() {
+                        let current = current_endpoint.lock().await.clone();
+                        let next_block = session.next_block();
+                        if has_alternative_for(&*backend_servers.lock().await, &current, next_block) {
+                            operator_move = true;
+                            rerouted = true;
                             break;
                         }
-                        if session.take_move_request() {
-                            let current = current_endpoint.lock().await.clone();
-                            let next_block = session.next_block();
-                            if has_alternative_for(&*backend_servers.lock().await, &current, next_block) {
-                                operator_move = true;
-                                rerouted = true;
-                                break;
-                            }
-                            tracing::info!(upstream = %current, ?next_block, "operator move skipped: no other upstream can serve the next block");
-                        }
+                        tracing::info!(upstream = %current, ?next_block, "operator move skipped: no other upstream can serve the next block");
+                    }
+                    continue;
+                }
+                _ = async {
+                    match liveness_deadline {
+                        Some(deadline) => sleep_until(deadline.into()).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if !ping_sent && probe_until.is_none() {
+                        ping_sent = true;
+                        send_liveness_ping(&server_writer).await;
                         continue;
                     }
-                    r = sr_guard.next() => match r {
-                        Some(Ok(m)) => Some(m),
-                        _ => {
-                            upstream_stop = Some(if upstream_sent_close {
-                                UpstreamStop::Clean
-                            } else {
-                                UpstreamStop::Unclean
-                            });
-                            None
-                        }
+                    upstream_stop = Some(UpstreamStop::Silent);
+                    break;
+                }
+                _ = active_conn.counters.went_offline.notified(), if liveness_ms > 0 => {
+                    // The monitor lost this upstream. Check the session's own
+                    // socket now instead of waiting out the liveness timeout.
+                    if probe_until.is_none() {
+                        probe_until = Some(Instant::now() + OFFLINE_PROBE);
+                        ping_sent = true;
+                        send_liveness_ping(&server_writer).await;
+                    }
+                    continue;
+                }
+                // Idle time counts from the last data frame, against a fixed
+                // deadline: replies to the router's own pings do not reset it.
+                _ = sleep_until((last_data_frame + Duration::from_millis(idle_ms)).into()), if idle_ms > 0 => {
+                    tracing::debug!("upstream idle timeout; failing over");
+                    upstream_stop = Some(UpstreamStop::Idle);
+                    break;
+                }
+                r = sr_guard.next() => match r {
+                    Some(Ok(m)) => Some(m),
+                    _ => {
+                        upstream_stop = Some(if upstream_sent_close {
+                            UpstreamStop::Clean
+                        } else {
+                            UpstreamStop::Unclean
+                        });
+                        None
                     }
                 }
             };
 
             let Some(msg) = next_msg else { break };
+            last_upstream_frame = Instant::now();
+            ping_sent = false;
+            probe_until = None;
+
+            // Replies to the router's own liveness pings stay here, and do not
+            // count as upstream activity for idle_timeout_ms.
+            if matches!(&msg, Message::Pong(payload) if payload.as_ref() == LIVENESS_PING) {
+                continue;
+            }
+            last_data_frame = last_upstream_frame;
 
             if matches!(msg, Message::Close(_)) {
                 upstream_sent_close = true;
@@ -770,6 +820,15 @@ pub async fn handle_client(
             }
         }
         let failed_endpoint = current_endpoint.lock().await.clone();
+        if upstream_stop == Some(UpstreamStop::Silent) && !rerouted {
+            tracing::warn!(
+                upstream = %failed_endpoint,
+                timeout_ms = liveness_ms,
+                "upstream silent: no frames and no reply to a ping; marking offline and failing over"
+            );
+            // New sessions skip it until the monitor sees it answer again.
+            mark_offline(&backend_servers, &failed_endpoint).await;
+        }
         let next_block = {
             let lr = last_request.lock().await;
             next_block_after(last_seen_block, lr.as_deref())
@@ -825,6 +884,7 @@ pub async fn handle_client(
                 Some(UpstreamStop::Unclean) => "stream dropped",
                 Some(UpstreamStop::Clean) => "upstream closed the stream",
                 Some(UpstreamStop::Idle) => "upstream idle",
+                Some(UpstreamStop::Silent) => "upstream silent",
                 None => "stream ended",
             }
         };
@@ -1127,6 +1187,27 @@ mod tests {
                 "{stop:?} must not count toward the same-block budget"
             );
         }
+    }
+
+    #[test]
+    fn a_silent_upstream_is_avoided_without_a_block_strike() {
+        let mut stuck_at = None;
+        for _ in 0..8 {
+            let plan = plan_same_block_failover(
+                &mut stuck_at,
+                Some(UpstreamStop::Silent),
+                false,
+                Some(115),
+            );
+            assert!(
+                plan.close_reason.is_none(),
+                "a dead node must not close with 1011"
+            );
+            assert!(plan.exclude_failed, "prefer another upstream");
+            assert_eq!(plan.failures, 0);
+            assert_eq!(plan.delay, Duration::from_millis(100));
+        }
+        assert!(stuck_at.is_none(), "a dead node is not a bad block");
     }
 
     #[test]

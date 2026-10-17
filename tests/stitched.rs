@@ -1403,6 +1403,74 @@ async fn s12b_a_declared_range_answers_status_at_once() {
     assert_eq!(s.trace.0, 2);
 }
 
+/// S12a without a status first: blocks below B's begin may be the
+/// unreported archive's, so they are held like an offline archive's (and
+/// closed after `gap_wait_ms`), never delivered id-less from B.
+#[tokio::test]
+async fn s12a_blocks_an_unreported_archive_may_hold_are_never_sent_id_less() {
+    let (dead, _held) = dead_endpoint();
+    let b = up("b", frozen_mock(B_RANGE)).await;
+    let c = up("c", live_mock(C_BEGIN, C_HEAD)).await;
+    let router = RouterProcess::start(config(vec![
+        frozen("a", &dead, None),
+        frozen_server(&b),
+        live_server(&c),
+    ]))
+    .await;
+    wait_ready(&router, &[&b, &c]).await;
+    let (mut w, mut r, _) = client(&router).await;
+
+    send(&mut w, blocks(&request(500, 1010, 1000))).await;
+    let (close, waited) = expect_close(&mut r, WAIT).await;
+    assert_eq!(close.code, CloseCode::Error);
+    assert_eq!(
+        close.reason.as_str(),
+        "block 500 unavailable on all upstreams"
+    );
+    assert!(
+        waited >= Duration::from_millis(800) && waited < Duration::from_secs(3),
+        "closed after {waited:?}"
+    );
+    assert!(legs(&b.mock).is_empty(), "{:?}", legs(&b.mock));
+    assert_eq!(
+        metric(&router, "fleet_router_holds_total{why=\"offline\"}").await,
+        1.0
+    );
+}
+
+/// The held request goes on, with ids, once the archive reports its range.
+#[tokio::test]
+async fn s12a_a_request_held_for_an_unreported_archive_goes_on_when_it_reports() {
+    let a = bound("a", frozen_mock(A_RANGE)).await;
+    let a_server = frozen(&a.1, &a.0, None);
+    let b = up("b", frozen_mock(B_RANGE)).await;
+    let c = up("c", live_mock(C_BEGIN, C_HEAD)).await;
+    let mut cfg = config(vec![a_server, frozen_server(&b), live_server(&c)]);
+    cfg["handshake_timeout_ms"] = json!(500);
+    cfg["stitching"]["gap_wait_ms"] = json!(6000);
+    let router = RouterProcess::start(cfg).await;
+    wait_ready(&router, &[&b, &c]).await;
+    let (mut w, mut r, _) = client(&router).await;
+
+    send(&mut w, blocks(&request(500, 510, 100))).await;
+    wait_metric(
+        router.metrics(),
+        "fleet_router_sessions{state=\"holding\"} 1",
+        WAIT,
+    )
+    .await;
+    let a = start(a);
+    let (got, close) = read_blocks(&mut r, 10, Duration::from_secs(6)).await;
+    assert!(close.is_none(), "{close:?}");
+    assert_eq!(
+        nums(&got),
+        (500..510).collect::<Vec<_>>(),
+        "every result has its id"
+    );
+    assert_eq!(legs(&a.mock).first().map(|l| l.start), Some(500));
+    assert!(legs(&b.mock).is_empty(), "{:?}", legs(&b.mock));
+}
+
 // ----------------------------------------------------------------------
 // S13, S14: holes and the fleet's first block
 // ----------------------------------------------------------------------

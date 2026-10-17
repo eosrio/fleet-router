@@ -312,6 +312,11 @@ pub fn tip_region(v: &FleetView, from: u32) -> bool {
 /// an upstream reuses or replaces that slot, so it does not count against
 /// the upstream's `max_sessions`. `allow_offline` lets a bounded hold's retry
 /// dial an offline but enabled covering upstream.
+///
+/// While an enabled frozen upstream has neither reported nor declared a
+/// range, it may hold blocks below the known fleet begin or inside a hole:
+/// those hold (bounded, as offline) instead of being served id-less by
+/// another archive or closed as a gap.
 #[allow(clippy::too_many_arguments)]
 pub fn next_step(
     v: &FleetView,
@@ -331,15 +336,28 @@ pub fn next_step(
     }
     let ids_begin = v.ids.components.first().map(|c| c.begin);
     let below = ids_begin.is_some_and(|b| from < b);
+    let unknown_hold = Step::Hold {
+        block: from,
+        why: HoldWhy::Offline,
+        bounded: true,
+    };
     if !below && !v.ids.has(from) {
         return if ids_begin.is_none() || (from >= v.ids.top.end && v.ids.live_tail_begin.is_none())
         {
             // Nothing known yet, or the top of an archive-only fleet.
             Step::Wait { block: from }
+        } else if v.frozen_unknown > 0 {
+            // The archive that has not reported may cover the hole.
+            unknown_hold
         } else {
             // A configured hole: ids exist below and above `from`.
             Step::Gap { block: from }
         };
+    }
+    if below && v.frozen_unknown > 0 {
+        // The archive that has not reported may hold these blocks: never
+        // deliver them id-less from the owner of the known fleet begin.
+        return unknown_hold;
     }
     let full = |u: &UpstreamView| {
         let mine = own.iter().filter(|&&i| i == u.index).count();
@@ -1353,6 +1371,77 @@ mod tests {
         let v = view(vec![b, b2, live(2, 1900, 2300)]);
         assert_eq!(served_by(&plan_owning(&v, 1100, false, &[1])).0, 1);
         assert_eq!(served_by(&plan_owning(&v, 1100, false, &[0])).0, 0);
+    }
+
+    #[test]
+    fn an_unreported_archive_holds_the_blocks_it_may_hold() {
+        // A is enabled, down and has never reported or declared a range: the
+        // blocks below the known fleet begin (B's) may be A's, so they are
+        // held like an offline archive's, never served id-less by B.
+        let v = view(vec![
+            frozen_unreported(0, None),
+            frozen(1, 1001, 2001),
+            live(2, 1900, 2300),
+        ]);
+        assert_eq!(v.frozen_unknown, 1);
+        let held = Step::Hold {
+            block: 500,
+            why: HoldWhy::Offline,
+            bounded: true,
+        };
+        assert_eq!(plan(&v, all(), 500), held);
+        let retry = next_step(
+            &v,
+            tip_of(&v),
+            &shape(all(), u32::MAX),
+            500,
+            &Excludes::default(),
+            &[],
+            1,
+            &StitchingPolicy::default(),
+            1200,
+            true,
+            now(),
+        );
+        assert_eq!(
+            retry, held,
+            "a retry may dial offline upstreams, not unknown ones"
+        );
+        // Covered blocks are served as usual.
+        assert_eq!(served_by(&plan(&v, all(), 1500)), (1, 1500, 2001));
+        // A known but offline A holds the same way.
+        let mut a = frozen(0, 2, 1001);
+        a.online = false;
+        let v = view(vec![a, frozen(1, 1001, 2001), live(2, 1900, 2300)]);
+        assert_eq!(plan(&v, all(), 500), held);
+        // With every archive known, blocks below the fleet begin go to its
+        // owner (PL6).
+        let v = view(vec![frozen(1, 1001, 2001), live(2, 1900, 2300)]);
+        assert_eq!(served_by(&plan(&v, all(), 500)), (1, 500, 2001));
+
+        // A hole the unreported archive may fill holds instead of closing.
+        let v = view(vec![
+            frozen(0, 2, 1001),
+            frozen(1, 1101, 2001),
+            live(2, 1900, 2300),
+            frozen_unreported(3, None),
+        ]);
+        assert_eq!(
+            plan(&v, all(), 1050),
+            Step::Hold {
+                block: 1050,
+                why: HoldWhy::Offline,
+                bounded: true
+            }
+        );
+        // A declared range is known: the hole is a gap again.
+        let v = view(vec![
+            frozen(0, 2, 1001),
+            frozen(1, 1101, 2001),
+            live(2, 1900, 2300),
+            frozen_unreported(3, Some((5000, 6000))),
+        ]);
+        assert_eq!(plan(&v, all(), 1050), Step::Gap { block: 1050 });
     }
 
     // PL12: every routing test of `functions.rs`, ported to `pool_pick`.

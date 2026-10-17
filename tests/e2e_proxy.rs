@@ -1571,7 +1571,7 @@ async fn e2e_proxy_multi_listener_network_isolation() {
 }
 
 // ===========================================================================
-// Corrupted SHiP log entry (nodeos zlib error) — see /workspace/shipcorrupt
+// Corrupted SHiP log entry (nodeos zlib error)
 // ===========================================================================
 
 /// Read `this_block.block_num` from up to `n` block frames until timeout/close.

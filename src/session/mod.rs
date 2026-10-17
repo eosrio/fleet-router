@@ -267,6 +267,31 @@ struct Standby {
     until: Instant,
 }
 
+/// Why a session left an upstream, reported once its next link is up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Left {
+    Failover(FailoverReason),
+    /// Pool: a new request went to an upstream that serves it better.
+    Reroute,
+}
+
+impl Left {
+    fn label(self) -> &'static str {
+        match self {
+            Left::Failover(reason) => reason.as_str(),
+            Left::Reroute => "reroute",
+        }
+    }
+
+    /// Operator moves and reroutes are routine; other failovers are not.
+    fn level(self) -> Level {
+        match self {
+            Left::Failover(FailoverReason::Operator) | Left::Reroute => Level::Info,
+            Left::Failover(_) => Level::Warn,
+        }
+    }
+}
+
 /// Per-session totals for the summary line logged when the session ends.
 #[derive(Debug, Default)]
 struct Counts {
@@ -437,9 +462,9 @@ struct Session {
     /// This session in the dashboard registry, which an operator moves or
     /// closes it through. Removed when the session ends.
     registry: SessionRegistration,
-    /// The upstream the last failover or operator move left, and why. The
-    /// move is reported once the next link is up.
-    moved_from: Option<(Arc<str>, FailoverReason)>,
+    /// The upstream the last failover, operator move or reroute left, and
+    /// why. The move is reported once the next link is up.
+    moved_from: Option<(Arc<str>, Left)>,
     /// The upstream an operator move left, hard-excluded (for at most
     /// [`MOVE_EXCLUSION`]) until the next link is up or nothing else can take
     /// the session.
@@ -846,7 +871,7 @@ impl Session {
         let flow = self.on_link_end(UpEnd::Moved).await;
         let failing_over = matches!(
             &self.moved_from,
-            Some((from, FailoverReason::Operator)) if *from == endpoint
+            Some((from, Left::Failover(FailoverReason::Operator))) if *from == endpoint
         );
         if failing_over {
             self.ex
@@ -1136,6 +1161,14 @@ impl Session {
                 block = r.start,
                 "rerouting get_blocks to an upstream that serves it"
             );
+            if let Some(link) = self.link.as_ref() {
+                // Counted and reported like a failover off the link's upstream.
+                link.counters
+                    .failovers_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.registry.info.note_failover();
+                self.moved_from = Some((link.endpoint.clone(), Left::Reroute));
+            }
         }
         let purpose = if rerouted {
             Purpose::Reroute
@@ -1822,7 +1855,7 @@ impl Session {
                 self.counts.failovers += 1;
                 counters.failovers_total.fetch_add(1, Ordering::Relaxed);
                 self.registry.info.note_failover();
-                self.moved_from = Some((endpoint.clone(), reason));
+                self.moved_from = Some((endpoint.clone(), Left::Failover(reason)));
                 if plan.failures > 0 {
                     tracing::warn!(
                         upstream = %endpoint,
@@ -1939,17 +1972,12 @@ impl Session {
         // An operator move is done: from now on the upstream it left is only
         // soft-excluded, like after any failover.
         self.release_move_exclusion();
-        if let Some((from, reason)) = self.moved_from.take() {
-            let level = if reason == FailoverReason::Operator {
-                Level::Info
-            } else {
-                Level::Warn
-            };
+        if let Some((from, left)) = self.moved_from.take() {
             telemetry::global().emit(
                 Event::new(
-                    level,
+                    left.level(),
                     EventKind::SessionFailover,
-                    format!("moved from {from} to {endpoint} ({})", reason.as_str()),
+                    format!("moved from {from} to {endpoint} ({})", left.label()),
                 )
                 .listener(&self.ctx.label)
                 .upstream(&endpoint)
@@ -3967,6 +3995,52 @@ mod tests {
             harness.hub.stats.failovers.get(FailoverReason::Silent),
             0,
             "the holding upstream answers pings"
+        );
+    }
+
+    /// Pool: a request for blocks far above a lagging upstream's head is
+    /// rerouted to one that has them, and the reroute is counted and reported
+    /// like a failover: on the old upstream's `failovers_total`, the
+    /// session's failovers, and a `session_failover` event.
+    #[tokio::test]
+    async fn a_reroute_is_counted_and_reported_like_a_failover() {
+        let (a, _mock_a) = start_mock(MockShipConfig::live(1, 999)).await;
+        let (b, mock_b) = start_mock(MockShipConfig::live(1, 2999)).await;
+        let harness = start_session_with(&[&a, &b], &[&a], limits(0)).await;
+        set_tip(&harness.hub, &a, 999, 989).await;
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        assert_eq!(info.upstream(), a);
+        set_online(&harness.hub, &b).await;
+        set_tip(&harness.hub, &b, 2999, 2989).await;
+
+        client.send(blocks_request(1500, 1510, 100)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 10).await,
+            (1500..1510).collect::<Vec<_>>()
+        );
+        assert_eq!(info.upstream(), b);
+        assert_eq!(mock_b.sessions_accepted(), 1);
+        assert_eq!(harness.hub.stats.reroutes.load(Ordering::Relaxed), 1);
+        assert_eq!(info.failovers(), 1);
+        let view = harness.hub.view();
+        let failovers_total = |endpoint: &str| {
+            view.upstreams
+                .iter()
+                .find(|u| &*u.endpoint == endpoint)
+                .map(|u| u.counters.failovers_total.load(Ordering::Relaxed))
+        };
+        assert_eq!(failovers_total(&a), Some(1));
+        assert_eq!(failovers_total(&b), Some(0));
+        let events = telemetry::global()
+            .events_after(0)
+            .into_iter()
+            .filter(|e| e.session == Some(info.id) && e.kind == EventKind::SessionFailover)
+            .map(|e| (e.level, e.message))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            [(Level::Info, format!("moved from {a} to {b} (reroute)"))]
         );
     }
 

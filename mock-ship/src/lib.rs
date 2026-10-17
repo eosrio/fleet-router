@@ -7,9 +7,22 @@
 //   3. Server switches to Binary mode
 //   4. Client sends `state_request` variants (fc::raw packed)
 //   5. Server responds with `state_result` variants (fc::raw packed)
+//
+// `MockShipConfig::live` and `MockShipConfig::frozen` give Spring-faithful
+// live nodes and frozen range servers. `client` builds requests and parses
+// results for tests.
+
+pub mod client;
+pub mod protocol;
 
 mod abi;
-mod protocol;
+pub use abi::SHIP_ABI_JSON;
+mod clock;
+pub use clock::ChainClock;
 mod server;
 
-pub use server::{serve_websocket, MockShipConfig, MockShipServer, StatusFault};
+pub use protocol::{fake_block_id, fake_block_id_seeded};
+pub use server::{
+    serve_websocket, EndOfRange, Fidelity, MockShipConfig, MockShipHandle, MockShipServer,
+    Observed, StatusFault,
+};

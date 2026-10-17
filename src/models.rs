@@ -1447,7 +1447,15 @@ impl ServerState {
     }
 
     /// Whether reported trace or chain-state ranges differ from the declared
-    /// `range`. False until the first report, and for undeclared servers.
+    /// `range` beyond the shapes real logs have. False until the first
+    /// report, and for undeclared servers.
+    ///
+    /// One declared range cannot describe two logs exactly, so each log may
+    /// start at block 2 when the range starts at 1 (the chain's first block
+    /// has no entry in it), and may end one block before the range when the
+    /// other log reaches its end (one log was written one block further at
+    /// the tail of the data). A log that reaches outside the range, is
+    /// absent, or leaves any other hole in it is a mismatch.
     pub fn range_mismatch(&self) -> bool {
         match self.declared {
             Some(declared) if self.ranges_known => {
@@ -1459,7 +1467,13 @@ impl ServerState {
                     begin: self.chain_state_begin_block,
                     end: self.chain_state_end_block,
                 };
-                trace != declared || chain_state != declared
+                let fits = |r: Range| {
+                    let begin = r.begin == declared.begin || (declared.begin == 1 && r.begin == 2);
+                    let end = r.end == declared.end || r.end.checked_add(1) == Some(declared.end);
+                    begin && end && !r.is_empty()
+                };
+                let tail_served = trace.end.max(chain_state.end) == declared.end;
+                !(fits(trace) && fits(chain_state) && tail_served)
             }
             _ => false,
         }
@@ -3200,5 +3214,59 @@ mod tests {
         assert_eq!(frozen.reported_end(), 1001);
         frozen.finality_data_end_block = 1100;
         assert_eq!(frozen.reported_end(), 1100);
+    }
+
+    /// The shapes real logs have against one declared range are no
+    /// mismatch: a log starting at block 2 when the range starts at 1, and
+    /// one log ending a block before the other at the tail. A log that
+    /// reaches outside the range, is missing, or leaves another hole is.
+    #[test]
+    fn the_normal_log_shapes_are_no_range_mismatch() {
+        let report = |declared: (u32, u32), trace: (u32, u32), chain_state: (u32, u32)| {
+            let mut s = ServerState::new();
+            s.role = Role::Frozen;
+            s.declared = Some(Range {
+                begin: declared.0,
+                end: declared.1,
+            });
+            s.ranges_known = true;
+            (s.trace_begin_block, s.trace_end_block) = trace;
+            (s.chain_state_begin_block, s.chain_state_end_block) = chain_state;
+            s.range_mismatch()
+        };
+        // Matches and normal shapes.
+        for (declared, trace, chain_state) in [
+            ((1, 30000), (1, 30000), (1, 30000)),
+            // The chain's first block has no trace entry.
+            ((1, 30000), (2, 30000), (1, 30000)),
+            ((1, 30000), (2, 30000), (2, 30000)),
+            // Chain state ends a block before trace at the data tail.
+            ((60000, 91919), (60000, 91919), (60000, 91918)),
+            ((60000, 91919), (60000, 91918), (60000, 91919)),
+            ((1, 91919), (2, 91919), (1, 91918)),
+        ] {
+            assert!(
+                !report(declared, trace, chain_state),
+                "{declared:?} {trace:?} {chain_state:?}"
+            );
+        }
+        // Real mismatches.
+        for (declared, trace, chain_state) in [
+            // Outside the declared range.
+            ((30000, 60000), (29999, 60000), (30000, 60000)),
+            ((30000, 60000), (30000, 60001), (30000, 60000)),
+            // Both logs short of the end: the last block is served by none.
+            ((60000, 91919), (60000, 91918), (60000, 91918)),
+            // Holes: a later start, an earlier end, a missing log.
+            ((30000, 60000), (30001, 60000), (30000, 60000)),
+            ((2, 1001), (3, 1001), (2, 1001)),
+            ((30000, 60000), (30000, 59000), (30000, 60000)),
+            ((30000, 60000), (30000, 60000), (0, 0)),
+        ] {
+            assert!(
+                report(declared, trace, chain_state),
+                "{declared:?} {trace:?} {chain_state:?}"
+            );
+        }
     }
 }

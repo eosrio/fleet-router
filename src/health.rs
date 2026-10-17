@@ -730,7 +730,7 @@ pub(crate) async fn render_metrics(listeners: &[ListenerHealthState]) -> String 
         ));
     }
 
-    out.push_str("# HELP fleet_router_upstream_range_mismatch Whether a frozen server's reported trace or chain-state range differs from its declared range (1) or not (0).\n");
+    out.push_str("# HELP fleet_router_upstream_range_mismatch Whether a frozen server's reported trace or chain-state range differs from its declared range (1) or not (0). A log starting at block 2 when the range starts at 1, or ending one block before the other log at the range's end, is no mismatch.\n");
     out.push_str("# TYPE fleet_router_upstream_range_mismatch gauge\n");
     for s in &snapshots {
         out.push_str(&format!(

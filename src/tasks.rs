@@ -1811,4 +1811,28 @@ mod tests {
         assert!(!guard[&server.endpoint].range_mismatch());
         assert!(!guard[&server.endpoint].warned.range_mismatch);
     }
+
+    #[tokio::test]
+    async fn normal_log_shapes_are_not_warned_as_a_range_mismatch() {
+        // Declared [1, 1001); trace starts at 2 (the first block has no
+        // entry) and chain state ends a block early at the data tail.
+        let (server, db) = frozen_fixture(Some(Range {
+            begin: 1,
+            end: 1001,
+        }));
+        let mut body = status_body();
+        body[72..76].copy_from_slice(&2u32.to_le_bytes());
+        body[80..84].copy_from_slice(&1u32.to_le_bytes());
+        apply_status_update(&status_message(&body), &db, &server)
+            .await
+            .expect("status");
+        let guard = db.lock().await;
+        let state = &guard[&server.endpoint];
+        assert_eq!(
+            (state.trace_begin_block, state.chain_state_end_block),
+            (2, 1000)
+        );
+        assert!(!state.range_mismatch());
+        assert!(!state.warned.range_mismatch, "not warned");
+    }
 }

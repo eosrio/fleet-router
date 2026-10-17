@@ -40,9 +40,12 @@ mod abi;
 mod config_sample;
 mod connection_handler;
 mod errors;
+mod fleet;
 mod functions;
 mod health;
 mod models;
+mod session;
+mod ship;
 mod tasks;
 mod zcd;
 

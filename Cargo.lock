@@ -419,6 +419,7 @@ name = "fleet-router"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "clap",
  "color-print",

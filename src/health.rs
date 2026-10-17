@@ -876,6 +876,20 @@ fn render_upstream_session_series(out: &mut String, snapshots: &[MetricSnapshot]
 
     header(
         out,
+        "fleet_router_upstream_prev_blocks_filled_total",
+        "counter",
+        "Frozen results that lacked prev_block right after a block the session delivered, filled in by the router from that block.",
+    );
+    for (s, stats) in with_stats().filter(|(s, _)| s.role == Role::Frozen) {
+        out.push_str(&format!(
+            "fleet_router_upstream_prev_blocks_filled_total{{{}}} {}\n",
+            s.labels,
+            stats.prev_blocks_filled.load(Ordering::Relaxed)
+        ));
+    }
+
+    header(
+        out,
         "fleet_router_upstream_stalls_total",
         "counter",
         "Session links to an upstream that went silent while blocks were owed.",
@@ -2216,6 +2230,11 @@ mod tests {
                     .unwrap()
                     .results_without_block
                     .fetch_add(3, Ordering::Relaxed);
+                stats
+                    .upstream(1)
+                    .unwrap()
+                    .prev_blocks_filled
+                    .fetch_add(2, Ordering::Relaxed);
                 stats.failovers.inc(FailoverReason::NoBlockLog);
 
                 let metrics = render_metrics(std::slice::from_ref(&l)).await;
@@ -2334,6 +2353,10 @@ mod tests {
                         up(ARCHIVE_B, "archive-b", "")
                     ),
                     format!(
+                        "fleet_router_upstream_prev_blocks_filled_total{} 2\n",
+                        up(ARCHIVE_B, "archive-b", "")
+                    ),
+                    format!(
                         "fleet_router_failovers_total{} 1\n",
                         lab("reason=\"no_block_log\"")
                     ),
@@ -2363,6 +2386,7 @@ mod tests {
                 for series in [
                     "fleet_router_upstream_no_block_log",
                     "fleet_router_upstream_results_without_block_total",
+                    "fleet_router_upstream_prev_blocks_filled_total",
                 ] {
                     assert!(
                         !metrics.contains(&format!("{series}{}", up(LIVE, "live-1", ""))),
@@ -2395,6 +2419,7 @@ mod tests {
                         "fleet_router_upstream_results_without_block_total",
                         "counter",
                     ),
+                    ("fleet_router_upstream_prev_blocks_filled_total", "counter"),
                 ] {
                     assert_eq!(
                         metrics.matches(&format!("# TYPE {name} {kind}\n")).count(),

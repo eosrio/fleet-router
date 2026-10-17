@@ -192,6 +192,15 @@ impl ClientSide {
         }
     }
 
+    /// The last delivered block, when it was at or below the LIB the client
+    /// had been sent: its id is the chain's for good. (`irr_hwm` at or above
+    /// it means so, because `last` is the newest delivery and `lib_sent`
+    /// never goes down.)
+    pub fn last_irreversible(&self) -> Option<BlockPos> {
+        self.last
+            .filter(|last| self.irr_hwm.is_some_and(|w| w >= last.num))
+    }
+
     /// Whether the current request still owes the client blocks.
     pub fn in_progress(&self) -> bool {
         self.req
@@ -439,8 +448,20 @@ pub(super) fn judge(
             fw.jump = true;
         }
     }
-    if seam {
-        if let (Some(this), Some(prev), Some(last)) = (h.this_block, h.prev_block, c.last) {
+    // At a seam the router made, the first result must continue the last
+    // delivered block. A frozen leg's first result must also continue an
+    // irreversible block the client got before, whatever started the leg
+    // (a new request that goes on where the last one ended): an archive on
+    // another chain is not served across it.
+    let last = if seam {
+        c.last
+    } else if frozen && st.first_result_pending {
+        c.last_irreversible()
+    } else {
+        None
+    };
+    if let Some(last) = last {
+        if let (Some(this), Some(prev)) = (h.this_block, h.prev_block) {
             if last.num.checked_add(1) == Some(this.num) && prev.id != last.id {
                 if frozen {
                     return violation(ViolationKind::Discontinuity);
@@ -1016,6 +1037,57 @@ mod tests {
                     kind: ResultKind::IdLess,
                     ..
                 },
+                ..
+            })
+        ));
+    }
+
+    /// A frozen leg started by a new client request that goes on where the
+    /// last one ended: a `prev_block` that does not continue the irreversible
+    /// block delivered before is a discontinuity. A reversible one may have
+    /// been forked out since, and a live node may switch forks: neither is
+    /// checked outside a seam the router made.
+    #[test]
+    fn a_new_frozen_leg_must_continue_an_irreversible_last_block() {
+        let mut c = client_at(100, 100, false);
+        c.last = Some(pos(99));
+        c.irr_hwm = Some(99);
+        assert_eq!(c.last_irreversible(), Some(pos(99)));
+        let mut st = state(Role::Frozen, 100, 200, Purpose::Initial);
+        st.expect_ids_from = 50;
+        let creq = c.req.clone().unwrap();
+        let lr = st.req.clone().unwrap();
+        let mut other = head(false, 199, 199, Some(pos(100)));
+        other.prev_block = Some(forked(99));
+        let judged = |c: &ClientSide, st: &LinkState, h: &ResultHead| {
+            judge(c, st, &creq, &lr, h, |_| Lacks::Nothing, |_| false)
+        };
+        assert_eq!(
+            judged(&c, &st, &other),
+            Judgement::End(UpEnd::Violation(ViolationKind::Discontinuity))
+        );
+        assert!(matches!(
+            judged(&c, &st, &head(false, 199, 199, Some(pos(100)))),
+            Judgement::Forward(Forward {
+                discontinuity: false,
+                ..
+            })
+        ));
+        // Only the leg's first result is checked.
+        st.first_result_pending = false;
+        assert!(matches!(judged(&c, &st, &other), Judgement::Forward(_)));
+        st.first_result_pending = true;
+        // A last block delivered above the LIB is not checked.
+        c.irr_hwm = Some(98);
+        assert_eq!(c.last_irreversible(), None);
+        assert!(matches!(judged(&c, &st, &other), Judgement::Forward(_)));
+        // Nor is a live node's first result on a new request.
+        c.irr_hwm = Some(99);
+        let live = state(Role::Live, 100, 200, Purpose::Initial);
+        assert!(matches!(
+            judged(&c, &live, &other),
+            Judgement::Forward(Forward {
+                discontinuity: false,
                 ..
             })
         ));

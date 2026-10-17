@@ -1636,6 +1636,10 @@ impl Session {
             stats.credit_overruns.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(upstream = %endpoint, block, "result forwarded with no client credit");
         }
+        let frame = match role {
+            Role::Frozen => self.fill_prev_block(frame, &h, up),
+            Role::Live => frame,
+        };
         let out = self.apply_head_lib(frame, h.head, h.lib, role, up);
         let len = out.len();
         if let Err(e) = self.client_tx.send(Message::Binary(out)).await {
@@ -1673,6 +1677,36 @@ impl Session {
             self.set_phase(Phase::Idle);
         }
         Flow::Continue
+    }
+
+    /// A frozen result for block `n > 1` without `prev_block`, while the
+    /// last block this session delivered is `n - 1` and irreversible: the
+    /// router fills `prev_block` in from it, so the stream is the one a node
+    /// that knows block `n - 1` sends. An archive leaves it out for the first
+    /// block of its range when the block before is in no log it has (no
+    /// block log). Only that optional changes; head/LIB are patched after.
+    fn fill_prev_block(&self, frame: Bytes, h: &ResultHead, up: usize) -> Bytes {
+        let (Some(this), None, Some(last)) =
+            (h.this_block, h.prev_block, self.c.last_irreversible())
+        else {
+            return frame;
+        };
+        if this.num <= 1 || last.num.checked_add(1) != Some(this.num) {
+            return frame;
+        }
+        match wire::insert_prev_block(&frame, h, last) {
+            Some((filled, _)) => {
+                if let Some(u) = self.ctx.hub.stats.upstream(up) {
+                    u.prev_blocks_filled.fetch_add(1, Ordering::Relaxed);
+                }
+                tracing::debug!(
+                    block = this.num,
+                    "filled the missing prev_block from the block delivered before"
+                );
+                filled
+            }
+            None => frame,
+        }
     }
 
     /// Count one frame forwarded from the link's upstream to the client:
@@ -4687,6 +4721,102 @@ mod tests {
             .await
             .unwrap();
         assert!(!harness.hub.state.lock().await[&archive].no_block_log);
+    }
+
+    fn filled(hub: &FleetHub, up: usize) -> u64 {
+        hub.stats
+            .upstream(up)
+            .unwrap()
+            .prev_blocks_filled
+            .load(Ordering::Relaxed)
+    }
+
+    /// Stitched: an archive without a block log sends its first block with
+    /// no `prev_block`. Right after the block before it, from a handoff or
+    /// from a new request that goes on where the last one ended, the router
+    /// fills it in, and only there.
+    #[tokio::test]
+    async fn a_missing_prev_block_after_a_delivered_block_is_filled_in() {
+        let (a, _a_mock) = start_mock(MockShipConfig::frozen(1, 1001)).await;
+        let (b, _b_mock) = start_mock(MockShipConfig {
+            no_block_log: true,
+            ..MockShipConfig::frozen(1001, 2001)
+        })
+        .await;
+        let harness = start_stitched(&[(&a, 1, 1001), (&b, 1001, 2001)]).await;
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(990, 1010, 100)).await.unwrap();
+        let views = read_views(&mut client, 20).await;
+        assert_eq!(
+            views.iter().filter_map(BlockView::num).collect::<Vec<_>>(),
+            (990..1010).collect::<Vec<_>>()
+        );
+        for pair in views.windows(2) {
+            assert_eq!(pair[1].prev, pair[0].this, "the chain continues");
+        }
+        assert_eq!(views[11].prev, Some((1000, mock_ship::fake_block_id(1000))));
+        assert_eq!((filled(&harness.hub, 0), filled(&harness.hub, 1)), (0, 1));
+
+        // A new request that goes on where the last one ended.
+        client.send(blocks_request(995, 1001, 10)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 6).await,
+            (995..1001).collect::<Vec<_>>()
+        );
+        client.send(blocks_request(1001, 1003, 10)).await.unwrap();
+        let views = read_views(&mut client, 2).await;
+        assert_eq!(views[0].prev, Some((1000, mock_ship::fake_block_id(1000))));
+        assert_eq!(filled(&harness.hub, 1), 2);
+
+        // A request that starts there after another block is left as sent.
+        client.send(blocks_request(1001, 1002, 10)).await.unwrap();
+        let views = read_views(&mut client, 1).await;
+        assert_eq!(views[0].prev, None, "1002 was delivered last");
+        assert_eq!(filled(&harness.hub, 1), 2);
+    }
+
+    /// Stitched: a new request that goes on where the last one ended lands
+    /// on an archive whose first block does not continue the block the
+    /// client got (another chain): a discontinuity, so the archive is struck
+    /// and its replica serves the request.
+    #[tokio::test]
+    async fn a_new_request_on_an_archive_that_does_not_continue_is_a_violation() {
+        let (a, _a_mock) = start_mock(MockShipConfig::frozen(1, 1001)).await;
+        let (b, _b_mock) = start_mock(MockShipConfig {
+            fork: Some((900, 9)),
+            ..MockShipConfig::frozen(1001, 2001)
+        })
+        .await;
+        let (b2, b2_mock) = start_mock(MockShipConfig::frozen(1001, 2001)).await;
+        let harness = start_stitched(&[(&a, 1, 1001), (&b, 1001, 2001), (&b2, 1001, 2001)]).await;
+        {
+            // The archive on the other chain is tried first.
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&b2).unwrap().priority = 5;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(995, 1001, 10)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 6).await,
+            (995..1001).collect::<Vec<_>>()
+        );
+        client.send(blocks_request(1001, 1005, 10)).await.unwrap();
+        let views = read_views(&mut client, 4).await;
+        assert_eq!(
+            views.iter().filter_map(BlockView::num).collect::<Vec<_>>(),
+            (1001..1005).collect::<Vec<_>>()
+        );
+        assert_eq!(views[0].prev, Some((1000, mock_ship::fake_block_id(1000))));
+        assert_eq!(blocks_requests(&b2_mock)[0].1, 1001);
+        let b_stats = harness.hub.stats.upstream(1).unwrap();
+        assert_eq!(
+            b_stats
+                .contract_violations
+                .get(crate::fleet::ContractViolation::Discontinuity),
+            1
+        );
+        assert_eq!(harness.hub.state.lock().await[&b].block_failures, 1);
     }
 
     /// Stitched: a live node that goes silent while serving the tip is

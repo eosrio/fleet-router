@@ -1831,6 +1831,73 @@ async fn archives_without_a_block_log_serve_fetch_block_without_blocks() {
     }
 }
 
+/// Send `req` on a fresh connection to `url` and return the first `n`
+/// binary frames exactly as they arrive.
+async fn raw_frames(url: &str, req: &BlocksReq, n: usize) -> Vec<Vec<u8>> {
+    let (mut w, mut r) = ws_connect(url).await;
+    match read_msg(&mut r, WAIT).await {
+        Message::Text(_) => {}
+        other => panic!("expected the ABI, got {other:?}"),
+    }
+    send(&mut w, blocks(req)).await;
+    let mut frames = Vec::with_capacity(n);
+    while frames.len() < n {
+        match read_msg(&mut r, WAIT).await {
+            Message::Binary(frame) => frames.push(frame.to_vec()),
+            Message::Ping(_) | Message::Pong(_) => {}
+            other => panic!("after {} frames: {other:?}", frames.len()),
+        }
+    }
+    frames
+}
+
+/// A stream over A = `[2,1001)` and B = `[1001,2001)`, where B has no
+/// block log and so sends its first block without `prev_block`, is byte
+/// for byte the stream of one archive of `[2,2001)`, in v0 and in v1: the
+/// router fills B's `prev_block` in from A's last block, and gives A's
+/// frames the fleet tip.
+#[tokio::test]
+async fn a_stitched_stream_equals_one_unsplit_archive_byte_for_byte() {
+    let a = up("a", frozen_mock(A_RANGE)).await;
+    let b = up("b", no_block_log(B_RANGE)).await;
+    let whole = up("whole", frozen_mock((2, 2001))).await;
+    let router = RouterProcess::start(config(vec![frozen_server(&a), frozen_server(&b)])).await;
+    wait_ready(&router, &[&a, &b]).await;
+
+    for v1 in [false, true] {
+        let req = BlocksReq {
+            v1,
+            fetch_traces: true,
+            fetch_deltas: true,
+            ..request(2, 2001, 2000)
+        };
+        let stitched = raw_frames(&router.ws_url(), &req, 1999).await;
+        let direct = raw_frames(&format!("ws://{}", whole.ep), &req, 1999).await;
+        for (i, (s, d)) in stitched.iter().zip(&direct).enumerate() {
+            assert_eq!(s, d, "v1 = {v1}: the result for block {}", 2 + i);
+        }
+        let seam = BlockView::parse(&stitched[999]).unwrap();
+        assert_eq!(seam.num(), Some(1001));
+        assert_eq!(seam.prev, Some((1000, fake_block_id(1000))));
+    }
+    assert_eq!(
+        metric(&router, &b.series("upstream_prev_blocks_filled_total", "")).await,
+        2.0
+    );
+    assert_eq!(
+        metric(&router, &a.series("upstream_prev_blocks_filled_total", "")).await,
+        0.0
+    );
+    assert_eq!(
+        metric(
+            &router,
+            "fleet_router_failovers_total{reason=\"violation\"}"
+        )
+        .await,
+        0.0
+    );
+}
+
 // ----------------------------------------------------------------------
 // S16, S17: pre-dial and zero credit at a seam
 // ----------------------------------------------------------------------

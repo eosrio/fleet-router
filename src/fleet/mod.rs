@@ -274,6 +274,9 @@ pub struct UpstreamStats {
     /// Frozen results forwarded without the `block` the request asked for,
     /// because no upstream that holds blocks could serve them.
     pub results_without_block: AtomicU64,
+    /// Frozen results that lacked `prev_block` right after a block the
+    /// session had delivered, filled in by the router from that block.
+    pub prev_blocks_filled: AtomicU64,
 }
 
 /// Session counters and gauges of one listener (`fleet_router_*` per-listener

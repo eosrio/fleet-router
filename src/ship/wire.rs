@@ -386,6 +386,40 @@ pub fn patch_head_lib(frame: Bytes, head: BlockPos, lib: BlockPos) -> Bytes {
     buf.freeze()
 }
 
+/// The block result `frame` with its absent `prev_block` set to `prev`, and
+/// the head of the new message.
+///
+/// Only the `prev_block` optional changes: its presence byte becomes 1 and
+/// the position follows it; every other byte is kept. The message is copied
+/// once. `None` when the result has no `this_block` (Spring never sends a
+/// `prev_block` without one) or already has a `prev_block`.
+pub fn insert_prev_block(
+    frame: &[u8],
+    h: &ResultHead,
+    prev: BlockPos,
+) -> Option<(Bytes, ResultHead)> {
+    if h.this_block.is_none() || h.prev_block.is_some() {
+        return None;
+    }
+    let flag = h.fields_at.checked_sub(1)?;
+    if frame.get(flag) != Some(&0) {
+        return None;
+    }
+    let mut out = BytesMut::with_capacity(frame.len() + POS_LEN);
+    out.extend_from_slice(&frame[..flag]);
+    out.extend_from_slice(&[1]);
+    let mut slot = [0u8; POS_LEN];
+    write_pos(&mut slot, &prev);
+    out.extend_from_slice(&slot);
+    out.extend_from_slice(&frame[h.fields_at..]);
+    let head = ResultHead {
+        prev_block: Some(prev),
+        fields_at: h.fields_at + POS_LEN,
+        ..*h
+    };
+    Some((out.freeze(), head))
+}
+
 /// Width of a `bytes?` length prefix.
 #[derive(Clone, Copy)]
 enum LenWidth {
@@ -1518,6 +1552,71 @@ mod tests {
             assert_eq!(zcd_u32(&parsed, "trace_begin_block"), 2);
             assert_eq!(zcd_id(&parsed, "chain_id"), s.chain_id);
         }
+    }
+
+    /// A result without `prev_block` (a frozen range server's first block
+    /// when the block before its range is in no log it has) becomes, byte
+    /// for byte, the result a node that knows that block sends, in v0 and
+    /// v1, and head/LIB patching still applies in place afterwards.
+    #[test]
+    fn insert_prev_block_matches_the_result_with_prev_block_byte_for_byte() {
+        use mock_ship::protocol::{encode_blocks_result, BlockFields};
+
+        let block = vec![7u8; 300];
+        let traces = vec![8u8; 200];
+        let deltas = vec![9u8; 5];
+        let finality = [1u8; 130];
+        let pair = |p: BlockPos| (p.num, p.id);
+        for v1 in [false, true] {
+            let result = |head: u32, prev: Option<BlockPos>| {
+                encode_blocks_result(&BlockFields {
+                    v1,
+                    head: pair(pos(head)),
+                    lib: pair(pos(head - 10)),
+                    this_block: Some(pair(pos(1001))),
+                    prev_block: prev.map(pair),
+                    block: Some(&block),
+                    traces: Some(&traces),
+                    deltas: Some(&deltas),
+                    finality: v1.then_some(&finality[..]),
+                })
+            };
+            let seam = result(2000, None);
+            let unsplit = result(2000, Some(pos(1000)));
+            let UpstreamMsg::Blocks(h) = classify_upstream(&seam) else {
+                panic!("a block result");
+            };
+            let (filled, fh) = insert_prev_block(&seam, &h, pos(1000)).expect("inserted");
+            assert_eq!(&filled[..], &unsplit[..], "v1 = {v1}");
+            assert_eq!(classify_upstream(&filled), UpstreamMsg::Blocks(fh));
+            assert_eq!(fh.prev_block, Some(pos(1000)));
+            assert_eq!(
+                result_presence(&filled, &fh),
+                result_presence(&seam, &h),
+                "the payload fields are untouched"
+            );
+
+            let ptr = filled.as_ptr();
+            let patched = patch_head_lib(filled, pos(2300), pos(2290));
+            assert_eq!(patched.as_ptr(), ptr, "the new message is patched in place");
+            assert_eq!(&patched[..], &result(2300, Some(pos(1000)))[..]);
+
+            // Nothing to insert: the result has a prev_block already.
+            let UpstreamMsg::Blocks(uh) = classify_upstream(&unsplit) else {
+                panic!("a block result");
+            };
+            assert!(insert_prev_block(&unsplit, &uh, pos(1000)).is_none());
+        }
+        // Nor into an id-less result.
+        let idless = encode_blocks_result(&BlockFields {
+            head: pair(pos(2000)),
+            lib: pair(pos(1990)),
+            ..BlockFields::default()
+        });
+        let UpstreamMsg::Blocks(h) = classify_upstream(&idless) else {
+            panic!("a block result");
+        };
+        assert!(insert_prev_block(&idless, &h, pos(1000)).is_none());
     }
 
     #[test]

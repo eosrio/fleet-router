@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-17
+
+### Upgrade notes
+
+- The new upstream liveness check is on by default. A session pings an
+  upstream that has sent nothing for 2 s and fails over if nothing comes
+  back within 4 s. Clients keep their connection either way, but if single
+  blocks from your upstreams take seconds to transfer (very large blocks over
+  a slow link), raise `upstream_liveness_timeout_ms`.
+- The dashboard and control API are off unless `dashboard.enabled` is set.
+  An existing `metrics_port` serves the same health, readiness and metrics
+  as before.
+- `/ready` no longer counts an upstream that an operator disabled through
+  the control API.
+- The health/metrics endpoint now runs on hyper. Paths and bodies are
+  unchanged; a non-GET request to an unknown path returns `404` instead of
+  `405`.
+
 ### Fixed
 
 - A session on an upstream that went silent without closing the connection
@@ -300,7 +318,8 @@ First public release on crates.io and GitHub.
 - Upstream handshake now skips leading control frames and retries against
   another upstream instead of dropping the client on an unexpected first frame.
 
-[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/eosrio/fleet-router/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/eosrio/fleet-router/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/eosrio/fleet-router/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/eosrio/fleet-router/compare/v0.3.0...v0.3.1

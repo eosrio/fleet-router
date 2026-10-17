@@ -98,8 +98,8 @@ use failover::{
 };
 pub use link::ConnectionGuard;
 use link::{
-    build_request, mark_offline, owed, quiescent, DialError, DialTarget, DialTask, Established,
-    Link, Purpose, Target, UpCursor, MAX_DIAL_ATTEMPTS,
+    build_request, mark_offline, owed, quiescent, settled, DialError, DialTarget, DialTask,
+    Established, Link, Purpose, Target, UpCursor, MAX_DIAL_ATTEMPTS,
 };
 use status::{router_status, status_ready, StatusFlow, StatusStep};
 
@@ -1006,6 +1006,11 @@ impl Session {
     fn link_quiescent(&self, link: &Link, pre_credit: u32) -> bool {
         let legacy = self.view.up(link.st.up).is_some_and(|u| u.legacy_status);
         quiescent(&link.st, pre_credit, legacy)
+    }
+
+    fn link_settled(&self, link: &Link) -> bool {
+        let legacy = self.view.up(link.st.up).is_some_and(|u| u.legacy_status);
+        settled(&link.st, legacy)
     }
 
     // ------------------------------------------------------------------
@@ -1952,14 +1957,20 @@ impl Session {
 
     /// Act on a planner step. `pre` is the client credit that tells whether
     /// the current link is quiescent (before a new request: the old credit).
+    ///
+    /// Every step but `Serve` leaves the link without a new request, so it is
+    /// kept only when nothing of its old request can still arrive (see
+    /// [`Session::keep_link_if_settled`]).
     async fn apply_step(&mut self, step: Step, purpose: Purpose, pre: u32) -> Flow {
         match step {
             Step::Serve(st) => self.serve(st, purpose, pre).await,
             Step::Done => {
                 self.hold = None;
+                self.handoff_started = None;
                 self.dial = None;
                 self.retired = None;
                 self.discard_standby();
+                self.keep_link_if_settled();
                 self.set_phase(Phase::Idle);
                 Flow::Continue
             }
@@ -1983,7 +1994,7 @@ impl Session {
                 self.dial = None;
                 self.retired = None;
                 self.discard_standby();
-                self.keep_link_if_quiescent(pre);
+                self.keep_link_if_settled();
                 self.set_phase(Phase::Waiting {
                     block,
                     recheck: Instant::now() + WAIT_RECHECK,
@@ -2000,7 +2011,7 @@ impl Session {
                 self.retired = None;
                 self.dial_attempts = 0;
                 self.discard_standby();
-                self.keep_link_if_quiescent(pre);
+                self.keep_link_if_settled();
                 let now = Instant::now();
                 let (since, attempt) = match self.hold {
                     Some(h) if h.block == block => (h.since, h.attempt.saturating_add(1)),
@@ -2091,14 +2102,17 @@ impl Session {
         }
     }
 
-    /// Keep the current link when nothing of its request can still arrive
-    /// (it may serve a later leg; it is closed after [`LINGER`] unused),
-    /// otherwise close it.
-    fn keep_link_if_quiescent(&mut self, pre: u32) {
+    /// Keep the current link when nothing of its request can still arrive,
+    /// whatever the client acks next (it may serve a later leg; it is closed
+    /// after [`LINGER`] unused), otherwise close it. A link that is quiet only
+    /// because the client's credit ran out is closed too: the client's acks
+    /// would reach it and resume its old request, whose frames do not follow
+    /// the client's cursor.
+    fn keep_link_if_settled(&mut self) {
         let Some(link) = self.link.as_ref() else {
             return;
         };
-        if self.link_quiescent(link, pre) {
+        if self.link_settled(link) {
             if let Some(link) = self.link.as_mut() {
                 link.st.linger_until.get_or_insert(Instant::now() + LINGER);
             }

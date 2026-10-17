@@ -209,12 +209,17 @@ impl LinkState {
 /// ended at or below LIB + 1, and a node that sends head keep-alives (or only
 /// speaks status v0, the legacy family that does) may send at any time.
 pub(super) fn quiescent(st: &LinkState, pre_credit: u32, legacy_status: bool) -> bool {
+    pre_credit == 0 || settled(st, legacy_status)
+}
+
+/// Whether nothing of the link's request can ever arrive, whatever credit
+/// the client adds: it has none, or its end was reached as [`quiescent`]
+/// describes. A link that is quiet only for lack of credit is not settled:
+/// the next ack would resume its old request.
+pub(super) fn settled(st: &LinkState, legacy_status: bool) -> bool {
     let Some(req) = &st.req else {
         return true;
     };
-    if pre_credit == 0 {
-        return true;
-    }
     match st.up_cursor {
         UpCursor::Exact(u) if u >= req.end => match st.role {
             Role::Frozen => true,
@@ -1025,15 +1030,21 @@ mod tests {
     fn quiescence_rules() {
         let mut idle = LinkState::new(0, Role::Live, Instant::now());
         assert!(quiescent(&idle, 10, false), "no request");
+        assert!(settled(&idle, false), "no request");
         idle.req = live_state(100, 200).req;
         idle.up_cursor = UpCursor::Exact(150);
         assert!(quiescent(&idle, 0, false), "C == 0: nothing in flight");
         assert!(!quiescent(&idle, 10, false), "mid-stream");
+        assert!(
+            !settled(&idle, false),
+            "quiet only for lack of credit: an ack resumes the old request"
+        );
 
         let mut frozen = live_state(100, 200);
         frozen.role = Role::Frozen;
         frozen.last_lib = None;
         assert!(quiescent(&frozen, 10, false), "frozen at its end");
+        assert!(settled(&frozen, false), "frozen at its end");
 
         let at_end = live_state(100, 200);
         assert!(quiescent(&at_end, 10, false), "live, end <= LIB + 1");

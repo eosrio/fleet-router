@@ -2187,6 +2187,80 @@ async fn s24_a_busy_socket_is_not_reused() {
     assert_eq!(link_sessions(&a.mock), 2, "a fresh link");
 }
 
+/// A new request that ends before it starts, with a position below its
+/// start (so not empty), arrives after `read` of A's 20 credited results:
+/// it is satisfied at once, and A's old request stops with it. Nothing of
+/// the old request follows, the client's ack never reaches it, and A is not
+/// struck for frames that do not match the new cursor. The session goes on
+/// with a later request.
+async fn ended_request_mid_stream(read: usize) {
+    // A paces its results, so with `read` < 20 the old request is still
+    // streaming when the new one arrives.
+    let a = up(
+        "a",
+        MockShipConfig {
+            block_delay: Some(Duration::from_millis(3)),
+            ..frozen_mock(A_RANGE)
+        },
+    )
+    .await;
+    let b = up("b", frozen_mock(B_RANGE)).await;
+    let c = up("c", live_mock(C_BEGIN, C_HEAD)).await;
+    let router = RouterProcess::start(fleet_config(&a, &b, &c)).await;
+    wait_ready(&router, &[&a, &b, &c]).await;
+    let (mut w, mut r, _) = client(&router).await;
+
+    send(&mut w, blocks(&request(2, 1001, 20))).await;
+    let (got, _) = read_blocks(&mut r, read, WAIT).await;
+    assert_eq!(nums(&got), (2..2 + read as u32).collect::<Vec<_>>());
+    send(
+        &mut w,
+        blocks(&BlocksReq {
+            have_positions: vec![(10, fake_block_id(10))],
+            ..request(600, 500, 50)
+        }),
+    )
+    .await;
+    send(&mut w, ack(50)).await;
+    // Only results A sent under its first 20 credits can still arrive.
+    let (late, close) = read_blocks(&mut r, 50, Duration::from_secs(1)).await;
+    assert!(close.is_none(), "{close:?}");
+    assert!(
+        nums(&late).iter().all(|&n| n < 22),
+        "the old request went on: {:?}",
+        nums(&late)
+    );
+    let la = legs(&a.mock);
+    assert_eq!(la.len(), 1, "{la:?}");
+    assert_eq!(la[0].acks, 0, "the ack reached the old request");
+    for kind in ["gap", "rewind", "credit", "idless", "variant"] {
+        let series = a.series(
+            "upstream_contract_violations_total",
+            &format!("kind=\"{kind}\""),
+        );
+        assert_eq!(metric(&router, &series).await, 0.0, "{series}");
+    }
+    assert_eq!(
+        metric(&router, &a.series("upstream_block_failures_total", "")).await,
+        0.0
+    );
+
+    send(&mut w, blocks(&request(100, 110, 10))).await;
+    let (got, close) = read_blocks(&mut r, 10, WAIT).await;
+    assert!(close.is_none(), "{close:?}");
+    assert_eq!(nums(&got), (100..110).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn a_request_ending_before_its_start_stops_a_streaming_link() {
+    ended_request_mid_stream(10).await;
+}
+
+#[tokio::test]
+async fn a_request_ending_before_its_start_stops_a_link_out_of_credit() {
+    ended_request_mid_stream(20).await;
+}
+
 // ----------------------------------------------------------------------
 // S25: a clean close mid-leg
 // ----------------------------------------------------------------------

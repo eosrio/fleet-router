@@ -1720,6 +1720,118 @@ async fn s15_missing_traces_are_a_violation() {
 }
 
 // ----------------------------------------------------------------------
+// Archives without a block log
+// ----------------------------------------------------------------------
+
+/// A frozen range server without a block log.
+fn no_block_log(range: (u32, u32)) -> MockShipConfig {
+    MockShipConfig {
+        no_block_log: true,
+        ..frozen_mock(range)
+    }
+}
+
+/// `fetch_block` + traces + deltas from block 1 over two replicas of
+/// `[1,1001)` without a block log and an archive of `[1001,2001)` that has
+/// one: the replicas send no block, which is no violation. The first one
+/// tried moves the session to the other (it might hold blocks); that one
+/// serves 1..1000 without blocks, as one node with a pruned block log would,
+/// and B serves the rest with blocks.
+#[tokio::test]
+async fn archives_without_a_block_log_serve_fetch_block_without_blocks() {
+    let a = up("a", no_block_log((1, 1001))).await;
+    let a2 = up("a2", no_block_log((1, 1001))).await;
+    let b = up("b", frozen_mock(B_RANGE)).await;
+    let router = RouterProcess::start(config(vec![
+        frozen_server(&a),
+        frozen_server(&a2),
+        frozen_server(&b),
+    ]))
+    .await;
+    wait_ready(&router, &[&a, &a2, &b]).await;
+    let (mut w, mut r, _) = client(&router).await;
+
+    const WINDOW: u32 = 200;
+    send(
+        &mut w,
+        blocks(&BlocksReq {
+            fetch_block: true,
+            fetch_traces: true,
+            fetch_deltas: true,
+            ..request(1, 2001, WINDOW)
+        }),
+    )
+    .await;
+    let mut s = Stream::default();
+    stream_acking(&mut w, &mut r, &mut s, 2000, WINDOW, 100).await;
+    assert_eq!(nums(&s.blocks), (1..2001).collect::<Vec<_>>());
+    for b in &s.blocks {
+        let n = b.num().unwrap();
+        assert_eq!(b.block.is_some(), n >= 1001, "block at {n}");
+        assert!(b.traces.is_some() && b.deltas.is_some(), "data at {n}");
+    }
+
+    assert_eq!(
+        metric(
+            &router,
+            "fleet_router_failovers_total{reason=\"no_block_log\"}"
+        )
+        .await,
+        1.0
+    );
+    assert_eq!(
+        metric(
+            &router,
+            "fleet_router_failovers_total{reason=\"violation\"}"
+        )
+        .await,
+        0.0
+    );
+    let without = metric(
+        &router,
+        &a.series("upstream_results_without_block_total", ""),
+    )
+    .await
+        + metric(
+            &router,
+            &a2.series("upstream_results_without_block_total", ""),
+        )
+        .await;
+    assert_eq!(without, 1000.0);
+    for u in [&a, &a2] {
+        assert_eq!(
+            metric(&router, &u.series("upstream_no_block_log", "")).await,
+            1.0,
+            "{} is flagged",
+            u.name
+        );
+        assert_eq!(
+            metric(
+                &router,
+                &u.series(
+                    "upstream_contract_violations_total",
+                    "kind=\"missing_field\""
+                )
+            )
+            .await,
+            0.0
+        );
+    }
+    assert_eq!(
+        metric(&router, &b.series("upstream_no_block_log", "")).await,
+        0.0
+    );
+    for u in [&a, &a2, &b] {
+        assert_eq!(
+            metric(&router, &u.series("upstream_block_failures_total", "")).await,
+            0.0,
+            "{} was struck",
+            u.name
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
 // S16, S17: pre-dial and zero credit at a seam
 // ----------------------------------------------------------------------
 

@@ -323,6 +323,21 @@ pub(super) fn classify_result(h: &ResultHead, cursor: UpCursor, lr: &LinkReq) ->
     }
 }
 
+/// What a frozen block result lacks of the fields its request asked for and
+/// its upstream advertises at that block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Lacks {
+    /// Nothing: every such field is there.
+    Nothing,
+    /// Only `block`: the archive has no block log there. Spring leaves
+    /// `block` out the same way when its block log lacks the block, so this
+    /// is no contract violation.
+    Block,
+    /// Traces, deltas or finality data its status claims, or payload fields
+    /// that do not decode: a contract violation.
+    Data,
+}
+
 /// A result that will be forwarded, and what it means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Forward {
@@ -336,6 +351,9 @@ pub(super) struct Forward {
     pub discontinuity: bool,
     /// A live result whose variant does not follow the request version.
     pub variant_mismatch: bool,
+    /// A frozen result without the requested `block`, for a block the
+    /// upstream covers ([`Lacks::Block`]).
+    pub no_block: bool,
 }
 
 /// What to do with one upstream block result.
@@ -354,8 +372,9 @@ pub(super) enum Judgement {
 
 /// Judge one block result before anything is forwarded.
 ///
-/// `missing_field(n)` tells whether a frozen result lacks a field the
-/// request asked for and the upstream advertises at `n`.
+/// `lacks(n)` tells what a frozen result lacks of the fields the request
+/// asked for and the upstream advertises at `n`: missing data is a contract
+/// violation, a missing `block` is not (see [`Lacks`]).
 /// `alternative(k)` tells whether another upstream could serve block `k`.
 pub(super) fn judge(
     c: &ClientSide,
@@ -363,12 +382,13 @@ pub(super) fn judge(
     creq: &BlocksRequest,
     lr: &LinkReq,
     h: &ResultHead,
-    missing_field: impl FnOnce(u32) -> bool,
+    lacks: impl FnOnce(u32) -> Lacks,
     alternative: impl FnOnce(u32) -> bool,
 ) -> Judgement {
     let cls = classify_result(h, st.up_cursor, lr);
     let frozen = st.role == Role::Frozen;
     let violation = |kind| Judgement::End(UpEnd::Violation(kind));
+    let mut no_block = false;
     if frozen {
         if h.v1 != creq.v1 {
             return violation(ViolationKind::Variant);
@@ -380,9 +400,11 @@ pub(super) fn judge(
             (ResultKind::IdLess, Some(n)) if n >= st.expect_ids_from => {
                 return violation(ViolationKind::Idless);
             }
-            (ResultKind::Block, Some(n)) if missing_field(n) => {
-                return violation(ViolationKind::MissingField);
-            }
+            (ResultKind::Block, Some(n)) => match lacks(n) {
+                Lacks::Data => return violation(ViolationKind::MissingField),
+                Lacks::Block => no_block = true,
+                Lacks::Nothing => {}
+            },
             _ => {}
         }
     }
@@ -392,6 +414,7 @@ pub(super) fn judge(
         jump: false,
         discontinuity: false,
         variant_mismatch: !frozen && h.v1 != creq.v1,
+        no_block,
     };
     let k = c.cursor;
     let seam = st.first_result_pending && lr.purpose.resumes();
@@ -774,7 +797,7 @@ mod tests {
     ) -> Option<Forward> {
         let creq = c.req.clone().unwrap();
         let lr = st.req.clone().unwrap();
-        match judge(c, st, &creq, &lr, h, |_| false, |_| false) {
+        match judge(c, st, &creq, &lr, h, |_| Lacks::Nothing, |_| false) {
             Judgement::Forward(fw) => {
                 assert!(!c.charge(), "unexpected overrun");
                 head_lib_for(c, st.role, h.head, h.lib, None, true);
@@ -841,7 +864,7 @@ mod tests {
         let dup = head(false, 1000, 990, Some(pos(100)));
         let before = c.credit;
         assert_eq!(
-            judge(&c, &st, &creq, &lr, &dup, |_| false, |_| false),
+            judge(&c, &st, &creq, &lr, &dup, |_| Lacks::Nothing, |_| false),
             Judgement::Duplicate {
                 advance_to: Some(101)
             }
@@ -861,7 +884,7 @@ mod tests {
                 &creq,
                 &lr,
                 &head(false, 1000, 990, Some(pos(102))),
-                |_| false,
+                |_| Lacks::Nothing,
                 |_| false
             ),
             Judgement::End(UpEnd::Violation(ViolationKind::Credit))
@@ -898,7 +921,7 @@ mod tests {
         let lr = st.req.clone().unwrap();
         let h = head(false, 1000, 990, Some(pos(500)));
         assert_eq!(
-            judge(&c, &st, &creq, &lr, &h, |_| false, |k| k == 100),
+            judge(&c, &st, &creq, &lr, &h, |_| Lacks::Nothing, |k| k == 100),
             Judgement::End(UpEnd::Uncovered)
         );
 
@@ -908,7 +931,7 @@ mod tests {
         let creq = c.req.clone().unwrap();
         let lr = st.req.clone().unwrap();
         assert!(matches!(
-            judge(&c, &st, &creq, &lr, &h, |_| false, |_| true),
+            judge(&c, &st, &creq, &lr, &h, |_| Lacks::Nothing, |_| true),
             Judgement::Forward(Forward { jump: true, .. })
         ));
 
@@ -919,8 +942,9 @@ mod tests {
         st.expect_ids_from = 100;
         let lr = st.req.clone().unwrap();
         let creq = c.req.clone().unwrap();
-        let end =
-            |h: &ResultHead, st: &LinkState| judge(&c, st, &creq, &lr, h, |_| false, |_| false);
+        let end = |h: &ResultHead, st: &LinkState| {
+            judge(&c, st, &creq, &lr, h, |_| Lacks::Nothing, |_| false)
+        };
         assert_eq!(
             end(&head(false, 199, 199, Some(pos(101))), &st),
             Judgement::End(UpEnd::Violation(ViolationKind::Gap))
@@ -950,10 +974,23 @@ mod tests {
                 &creq,
                 &lr,
                 &head(false, 199, 199, Some(pos(100))),
-                |_| true,
+                |_| Lacks::Data,
                 |_| false
             ),
             Judgement::End(UpEnd::Violation(ViolationKind::MissingField))
+        );
+        // A missing block is no violation: the result is forwarded and
+        // flagged, unless another check fails first.
+        let blockless = |h: &ResultHead, st: &LinkState| {
+            judge(&c, st, &creq, &lr, h, |_| Lacks::Block, |_| false)
+        };
+        assert!(matches!(
+            blockless(&head(false, 199, 199, Some(pos(100))), &st),
+            Judgement::Forward(Forward { no_block: true, .. })
+        ));
+        assert_eq!(
+            blockless(&head(false, 199, 199, Some(pos(101))), &st),
+            Judgement::End(UpEnd::Violation(ViolationKind::Gap))
         );
         st.up_cursor = UpCursor::Exact(100);
         let mut ahead = client_at(150, 100, false);
@@ -965,7 +1002,7 @@ mod tests {
                 &creq,
                 &lr,
                 &head(false, 199, 199, Some(pos(120))),
-                |_| false,
+                |_| Lacks::Nothing,
                 |_| false
             ),
             Judgement::End(UpEnd::Violation(ViolationKind::Rewind))

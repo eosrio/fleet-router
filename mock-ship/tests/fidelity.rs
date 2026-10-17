@@ -472,6 +472,46 @@ async fn frozen_holds_open_at_its_end_and_takes_a_new_request() {
 }
 
 #[tokio::test]
+async fn an_archive_without_a_block_log_sends_no_block_and_no_first_prev() {
+    let (_mock, url) = start(MockShipConfig {
+        no_block_log: true,
+        ..MockShipConfig::frozen(100, 111)
+    })
+    .await;
+    let mut c = Client::connect(&url).await;
+    c.send(blocks(&BlocksReq {
+        fetch_block: true,
+        fetch_traces: true,
+        fetch_deltas: true,
+        ..req(100, 111, 50)
+    }))
+    .await;
+    let first = c.block().await;
+    assert_eq!(first.this, Some((100, fake_block_id(100))));
+    assert_eq!(
+        first.prev, None,
+        "the id before the range needs a block log"
+    );
+    let second = c.block().await;
+    assert_eq!(second.prev, Some((100, fake_block_id(100))));
+    for b in [&first, &second] {
+        assert!(b.block.is_none(), "no block log, no block");
+        assert!(b.traces.is_some() && b.deltas.is_some());
+    }
+    assert_eq!(c.nums(9).await, some(102..=110));
+    c.quiet().await;
+    // A request that starts inside the range still gets prev_block.
+    c.send(blocks(&BlocksReq {
+        fetch_block: true,
+        ..req(105, 106, 1)
+    }))
+    .await;
+    let mid = c.block().await;
+    assert_eq!(mid.prev, Some((104, fake_block_id(104))));
+    assert!(mid.block.is_none());
+}
+
+#[tokio::test]
 async fn sequence_faults_fire_under_spring() {
     let (_skip, skip_url) = start(MockShipConfig {
         skip_at_block: Some(5),

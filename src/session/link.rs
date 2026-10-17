@@ -173,6 +173,11 @@ pub(super) struct LinkState {
     /// The upstream was online in the last fleet view the session saw, so
     /// the view that shows it offline starts a probe.
     pub upstream_online: bool,
+    /// The fleet view generation in which no upstream that holds blocks
+    /// could serve this link's cursor. Until the view changes, a frozen
+    /// result without the requested `block` is forwarded without asking
+    /// again.
+    pub blockless_checked: Option<u64>,
 }
 
 impl LinkState {
@@ -199,6 +204,7 @@ impl LinkState {
             data_ms: 0,
             pong_ms: None,
             upstream_online: false,
+            blockless_checked: None,
         }
     }
 
@@ -785,6 +791,24 @@ impl Link {
         });
         guard
     }
+}
+
+/// A frozen upstream sent a result without the `block` a session asked for,
+/// for a block it covers: record that it has no block log and publish the
+/// change. Returns whether this call set the flag.
+pub(super) async fn mark_no_block_log(hub: &FleetHub, endpoint: &str) -> bool {
+    let mut db = hub.state.lock().await;
+    let newly = match db.get_mut(endpoint) {
+        Some(state) if state.role == Role::Frozen && !state.no_block_log => {
+            state.no_block_log = true;
+            true
+        }
+        _ => false,
+    };
+    if newly {
+        hub.rebuild(&db);
+    }
+    newly
 }
 
 /// A session failed to dial a live upstream: mark it offline, as the monitor

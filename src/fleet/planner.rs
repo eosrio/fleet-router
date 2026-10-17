@@ -306,11 +306,16 @@ fn breakpoints(v: &FleetView, u: &UpstreamView, now: Instant) -> Vec<u32> {
 /// A frozen upstream's run never goes past its own end (the highest end of
 /// its logs), even where nothing in the fleet covers the blocks after it: it
 /// has nothing to send there, so a request past it would only go silent.
+///
+/// An archive known to have no block log, serving a `fetch_block` request,
+/// also ends its run where another upstream that holds blocks becomes
+/// eligible, so the stream is handed off to it there.
 pub fn run_end(v: &FleetView, u: &UpstreamView, need: Need, from: u32, now: Instant) -> u32 {
     let cap = match u.role {
         Role::Frozen => u.max_end(),
         Role::Live => u32::MAX,
     };
+    let yields = need.block && u.no_block_log;
     let mut bps: Vec<u32> = breakpoints(v, u, now)
         .into_iter()
         .filter(|&b| b > from)
@@ -322,6 +327,12 @@ pub fn run_end(v: &FleetView, u: &UpstreamView, need: Need, from: u32, now: Inst
             return cap;
         }
         if !eligible(v, u, need, b, Union::Sticky, now) {
+            return b;
+        }
+        let holder = |w: &UpstreamView| {
+            w.index != u.index && !w.no_block_log && eligible(v, w, need, b, Union::Sticky, now)
+        };
+        if yields && v.upstreams.iter().any(holder) {
             return b;
         }
     }
@@ -364,12 +375,16 @@ pub fn tip_region(v: &FleetView, from: u32) -> bool {
 /// another archive or closed as a gap.
 ///
 /// Candidates are ranked by: online, fresh and not lagging, under capacity,
-/// role preference, not soft-excluded, lower `priority` tier, the longest
-/// run, fewer connections per unit of `weight` (weighted least-connections),
-/// higher weight, then the rendezvous hash. Priority and weight come after
-/// role preference and capacity, so neither pulls history reads onto a live
-/// node or a session onto a full upstream, and after the soft exclusion, so
-/// a failover leaves a failed upstream for a peer in any tier. Priority comes
+/// for a `fetch_block` request not known to lack a block log, role
+/// preference, not soft-excluded, lower `priority` tier, the longest run,
+/// fewer connections per unit of `weight` (weighted least-connections),
+/// higher weight, then the rendezvous hash. An archive without a block log
+/// still serves a block request, without `block`, when no upstream that
+/// holds blocks can (as a node with a pruned block log would). Priority and
+/// weight come after role preference and capacity, so neither pulls history
+/// reads onto a live node or a session onto a full upstream, and after the
+/// soft exclusion, so a failover leaves a failed upstream for a peer in any
+/// tier. Priority comes
 /// before the longest run so that an operator's tiers hold across upstreams
 /// whose ranges differ. Load comes after it, so with the default priority
 /// and weight the order is the plain longest run, then least connections:
@@ -465,6 +480,7 @@ pub fn next_step(
                 u8::from(!u.online),
                 u8::from(u.stale || lagging_for(v, u, from, lag)),
                 u8::from(full(u)),
+                u8::from(sh.need.block && u.no_block_log),
                 match (pol.history_preference, u.role) {
                     (HistoryPreference::Frozen, Role::Live) => 1,
                     _ => 0,
@@ -528,9 +544,9 @@ pub fn next_step(
 /// A [`next_step`] candidate with its ranking keys.
 struct Ranked<'a> {
     up: &'a UpstreamView,
-    /// Online, fresh, under capacity, role preference, not soft-excluded:
-    /// `0` is better for each.
-    head: [u8; 5],
+    /// Online, fresh, under capacity, holds blocks (for a block request),
+    /// role preference, not soft-excluded: `0` is better for each.
+    head: [u8; 6],
     /// Connections that count as load (the session's own slots do not).
     conns: usize,
     /// The run's end, clamped to the request's end. Longer is better.
@@ -922,6 +938,73 @@ mod tests {
         }
         assert_eq!(rendezvous(7, "a"), rendezvous(7, "a"));
         assert_ne!(rendezvous(7, "a"), rendezvous(8, "a"));
+    }
+
+    #[test]
+    fn block_requests_prefer_upstreams_that_hold_blocks() {
+        let no_blocks = |mut s: ServerState| {
+            s.no_block_log = true;
+            s
+        };
+        let blocks_only = Need {
+            block: true,
+            ..Need::default()
+        };
+        let traces = Need {
+            traces: true,
+            ..Need::default()
+        };
+        // Replicas of one range: whatever the session's rendezvous hash, a
+        // block request goes to the one that holds blocks, even when it is
+        // busier; a request without blocks still splits between both.
+        let a = no_blocks(frozen(0, 2, 1001));
+        let a2 = frozen(1, 2, 1001);
+        a2.connections.store(5, Ordering::Relaxed);
+        let v = view(vec![a, a2]);
+        assert!(v.upstreams[0].no_block_log && !v.upstreams[1].no_block_log);
+        let pick = |need: Need, sid: u64| match next_step(
+            &v,
+            tip_of(&v),
+            &shape(need, u32::MAX),
+            10,
+            &Excludes::default(),
+            &[],
+            sid,
+            &StitchingPolicy::default(),
+            1200,
+            false,
+            now(),
+        ) {
+            Step::Serve(s) => s.up,
+            other => panic!("{other:?}"),
+        };
+        for sid in 0..200 {
+            assert_eq!(pick(blocks_only, sid), 1, "session {sid}");
+            assert_eq!(pick(all(), sid), 1, "session {sid}");
+        }
+        assert_eq!(pick(traces, 1), 0, "fewer connections without blocks");
+
+        // A live node that covers the block holds it: it beats an archive
+        // without a block log despite the history preference.
+        let v = view(vec![no_blocks(frozen(0, 1001, 2001)), live(1, 1900, 2300)]);
+        assert_eq!(served_by(&plan(&v, all(), 1950)), (1, 1950, u32::MAX));
+        assert_eq!(served_by(&plan(&v, traces, 1950)), (0, 1950, 2001));
+
+        // Where only archives without a block log cover the block, they
+        // serve it (without blocks), up to where the live node takes over.
+        let (b, c) = (&v.upstreams[0], &v.upstreams[1]);
+        assert_eq!(served_by(&plan(&v, all(), 1500)), (0, 1500, 1900));
+        assert_eq!(run_end(&v, b, all(), 1500, now()), 1900);
+        assert_eq!(run_end(&v, b, traces, 1500, now()), 2001);
+        assert_eq!(run_end(&v, c, all(), 1950, now()), u32::MAX);
+        // A full archive that holds blocks still loses to a free one that
+        // does not: capacity comes first.
+        let a = no_blocks(frozen(0, 2, 1001));
+        let mut a2 = frozen(1, 2, 1001);
+        a2.max_sessions = Some(1);
+        a2.connections.store(1, Ordering::Relaxed);
+        let v = view(vec![a, a2]);
+        assert_eq!(served_by(&plan(&v, all(), 10)).0, 0);
     }
 
     #[test]

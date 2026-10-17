@@ -723,6 +723,31 @@ pub(crate) async fn apply_status_update(
         if let Some(cid) = reported_chain_id {
             state.chain_id = Some(cid);
         }
+        // An upstream that comes back, or reports another status, may have
+        // a block log now: sessions try it for blocks again.
+        let reported = (
+            (trace_begin, trace_end),
+            (chain_begin, chain_end),
+            finality.unwrap_or((0, 0)),
+            (Some(head), Some(lib)),
+        );
+        let stored = (
+            (state.trace_begin_block, state.trace_end_block),
+            (state.chain_state_begin_block, state.chain_state_end_block),
+            (
+                state.finality_data_begin_block,
+                state.finality_data_end_block,
+            ),
+            (state.head, state.lib),
+        );
+        if state.no_block_log && (!state.online || reported != stored) {
+            state.no_block_log = false;
+            tracing::info!(
+                name = %server.name,
+                upstream = %server.endpoint,
+                "upstream reconnected or reported a new status; trying it for fetch_block requests again"
+            );
+        }
         let previous_end = state.ranges_known.then(|| state.reported_end());
         state.enabled = true;
         state.online = true;

@@ -1347,6 +1347,12 @@ pub struct ServerState {
     /// When the monitor marked this upstream offline. `None` while online and
     /// before the first verdict.
     pub offline_since: Option<Instant>,
+    /// A frozen upstream sent a client session a result without the `block`
+    /// it asked for, for a block it covers: it has no block log there.
+    /// Stitched sessions then prefer other upstreams for `fetch_block`
+    /// requests. Set by a session; cleared when the upstream reconnects or
+    /// reports a different status.
+    pub no_block_log: bool,
     /// One-time monitor warnings already logged for this upstream.
     pub warned: MonitorWarnings,
 }
@@ -1412,6 +1418,7 @@ impl ServerState {
             status_v1: None,
             abi: None,
             offline_since: None,
+            no_block_log: false,
             warned: MonitorWarnings::default(),
         }
     }

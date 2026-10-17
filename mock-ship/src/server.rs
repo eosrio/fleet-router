@@ -182,6 +182,10 @@ pub struct MockShipConfig {
     /// Pace the server's socket writes to this many bytes per second
     /// (transport-level slowness).
     pub throttle_bytes_per_sec: Option<u32>,
+    /// Spring/Eosio2: an archive without a block log. `block` is never sent,
+    /// even when requested, and the first block whose id the server knows
+    /// has no `prev_block` (only a block log holds the id before it).
+    pub no_block_log: bool,
 }
 
 /// How the mock treats `get_status` requests. Used to exercise monitor limits.
@@ -234,6 +238,7 @@ impl Default for MockShipConfig {
             abi_text: None,
             fork: None,
             throttle_bytes_per_sec: None,
+            no_block_log: false,
         }
     }
 }
@@ -1281,7 +1286,7 @@ impl<'a> SpringSession<'a> {
         let payload = |offset: u32, wanted: bool| {
             (known && wanted).then(|| generate_fake_data(num.wrapping_add(offset), size))
         };
-        let block = payload(0, current.fetch_block);
+        let block = payload(0, current.fetch_block && !config.no_block_log);
         let traces = payload(
             1000,
             current.fetch_traces
@@ -1301,7 +1306,8 @@ impl<'a> SpringSession<'a> {
             head: (head, clock.id(head)),
             lib: (lib, clock.id(lib)),
             this_block: known.then(|| (num, clock.id(num))),
-            prev_block: (known && num > 1).then(|| (num - 1, clock.id(num - 1))),
+            prev_block: (known && num > 1 && !(config.no_block_log && num == ranges.id_begin()))
+                .then(|| (num - 1, clock.id(num - 1))),
             block: block.as_deref(),
             traces: traces.as_deref(),
             deltas: deltas.as_deref(),

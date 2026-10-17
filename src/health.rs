@@ -469,6 +469,8 @@ struct MetricSnapshot {
     /// Fingerprint (16 hex) and compatibility of the monitor's ABI, if seen.
     abi: Option<(String, bool)>,
     range_mismatch: bool,
+    /// A frozen upstream known to have no block log.
+    no_block_log: bool,
     /// Whether the ABI equals the listener's canonical ABI (stitched, once
     /// both are known).
     abi_match: Option<bool>,
@@ -536,6 +538,7 @@ pub(crate) async fn render_metrics(listeners: &[ListenerHealthState]) -> String 
                 ranges_known: state.ranges_usable(),
                 abi: state.abi.as_ref().map(|abi| (abi.fp_hex(), abi.compatible)),
                 range_mismatch: state.range_mismatch(),
+                no_block_log: state.no_block_log,
             });
         }
     }
@@ -841,6 +844,34 @@ fn render_upstream_session_series(out: &mut String, snapshots: &[MetricSnapshot]
                 kind.as_str()
             ));
         }
+    }
+
+    header(
+        out,
+        "fleet_router_upstream_no_block_log",
+        "gauge",
+        "Whether a frozen upstream sent a result without the requested block for a block it covers, so it has no block log (1) or not (0). Sessions prefer upstreams that hold blocks for fetch_block requests. Cleared when it reconnects or reports another status.",
+    );
+    for s in snapshots.iter().filter(|s| s.role == Role::Frozen) {
+        out.push_str(&format!(
+            "fleet_router_upstream_no_block_log{{{}}} {}\n",
+            s.labels,
+            u8::from(s.no_block_log)
+        ));
+    }
+
+    header(
+        out,
+        "fleet_router_upstream_results_without_block_total",
+        "counter",
+        "Frozen results forwarded without the requested block, because no upstream that holds blocks could serve them.",
+    );
+    for (s, stats) in with_stats().filter(|(s, _)| s.role == Role::Frozen) {
+        out.push_str(&format!(
+            "fleet_router_upstream_results_without_block_total{{{}}} {}\n",
+            s.labels,
+            stats.results_without_block.load(Ordering::Relaxed)
+        ));
     }
 
     header(
@@ -2154,7 +2185,9 @@ mod tests {
                 )));
                 update(&l, |db| {
                     db.get_mut(LIVE).unwrap().abi = Some(abi.clone());
-                    db.get_mut(ARCHIVE_B).unwrap().abi = Some(Arc::new(AbiEntry::new("{}")));
+                    let archive_b = db.get_mut(ARCHIVE_B).unwrap();
+                    archive_b.abi = Some(Arc::new(AbiEntry::new("{}")));
+                    archive_b.no_block_log = true;
                 })
                 .await;
                 let hub = l.hub.clone().unwrap();
@@ -2178,6 +2211,12 @@ mod tests {
                     .unwrap()
                     .sequence_jumps
                     .fetch_add(4, Ordering::Relaxed);
+                stats
+                    .upstream(1)
+                    .unwrap()
+                    .results_without_block
+                    .fetch_add(3, Ordering::Relaxed);
+                stats.failovers.inc(FailoverReason::NoBlockLog);
 
                 let metrics = render_metrics(std::slice::from_ref(&l)).await;
                 let lab = |extra: &str| listener_labels(name, extra);
@@ -2283,6 +2322,22 @@ mod tests {
                         up(LIVE, "live-1", "")
                     ),
                     format!(
+                        "fleet_router_upstream_no_block_log{} 1\n",
+                        up(ARCHIVE_B, "archive-b", "")
+                    ),
+                    format!(
+                        "fleet_router_upstream_no_block_log{} 0\n",
+                        up(ARCHIVE_A, "archive-a", "")
+                    ),
+                    format!(
+                        "fleet_router_upstream_results_without_block_total{} 3\n",
+                        up(ARCHIVE_B, "archive-b", "")
+                    ),
+                    format!(
+                        "fleet_router_failovers_total{} 1\n",
+                        lab("reason=\"no_block_log\"")
+                    ),
+                    format!(
                         "fleet_router_upstream_stalls_total{} 0\n",
                         up(ARCHIVE_A, "archive-a", "")
                     ),
@@ -2305,6 +2360,15 @@ mod tests {
                     )),
                     "violations are frozen-only"
                 );
+                for series in [
+                    "fleet_router_upstream_no_block_log",
+                    "fleet_router_upstream_results_without_block_total",
+                ] {
+                    assert!(
+                        !metrics.contains(&format!("{series}{}", up(LIVE, "live-1", ""))),
+                        "{series} is frozen-only"
+                    );
+                }
                 assert!(
                     !metrics.contains(&format!(
                         "fleet_router_upstream_abi_match{}",
@@ -2326,6 +2390,11 @@ mod tests {
                     ("fleet_router_patched_results_total", "counter"),
                     ("fleet_router_upstream_links_total", "counter"),
                     ("fleet_router_upstream_abi_match", "gauge"),
+                    ("fleet_router_upstream_no_block_log", "gauge"),
+                    (
+                        "fleet_router_upstream_results_without_block_total",
+                        "counter",
+                    ),
                 ] {
                     assert_eq!(
                         metrics.matches(&format!("# TYPE {name} {kind}\n")).count(),

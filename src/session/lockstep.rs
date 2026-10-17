@@ -35,7 +35,7 @@ use crate::models::{ResolvedTopology, Role};
 use crate::ship::wire::{BlocksRequest, ResultHead};
 use crate::ship::BlockPos;
 
-use super::client::{commit, head_lib_for, judge, ClientSide, Judgement, ResultKind};
+use super::client::{commit, head_lib_for, judge, ClientSide, Judgement, Lacks, ResultKind};
 use super::failover::UpEnd;
 use super::link::{build_request, quiescent, LinkState, Purpose, Target, UpCursor};
 
@@ -546,7 +546,7 @@ impl Sim {
         };
         let creq = self.c.req.clone().expect("a request");
         let lr = st.req.clone().expect("a link request");
-        let judgement = judge(&self.c, st, &creq, &lr, &f.h, |_| false, |_| true);
+        let judgement = judge(&self.c, st, &creq, &lr, &f.h, |_| Lacks::Nothing, |_| true);
         match judgement {
             Judgement::End(UpEnd::Uncovered) => {
                 self.failover(step);

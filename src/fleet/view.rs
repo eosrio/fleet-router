@@ -186,6 +186,10 @@ pub struct UpstreamView {
     /// The upstream only answers `get_status_request_v0`.
     pub legacy_status: bool,
     pub monitor_offline_since: Option<Instant>,
+    /// A frozen upstream known to have no block log: it omits `block` for
+    /// blocks it covers. Ranked below upstreams that hold blocks for a
+    /// `fetch_block` request.
+    pub no_block_log: bool,
 }
 
 impl UpstreamView {
@@ -294,6 +298,7 @@ impl PartialEq for UpstreamView {
             && self.abi_ok == other.abi_ok
             && self.legacy_status == other.legacy_status
             && self.monitor_offline_since == other.monitor_offline_since
+            && self.no_block_log == other.no_block_log
     }
 }
 
@@ -722,6 +727,7 @@ fn upstream_view(ctx: &BuildCtx<'_>, endpoint: &str, s: &ServerState) -> Upstrea
         abi_ok: true,
         legacy_status: s.status_v1 == Some(false),
         monitor_offline_since: s.offline_since,
+        no_block_log: s.no_block_log,
     }
 }
 
@@ -1088,6 +1094,7 @@ pub(crate) mod fixtures {
             c.abi = self.abi.clone();
             c.connections = self.connections.clone();
             c.counters = self.counters.clone();
+            c.no_block_log = self.no_block_log;
             c
         }
     }

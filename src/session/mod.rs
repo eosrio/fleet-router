@@ -97,7 +97,7 @@ use crate::ship::BlockPos;
 use crate::telemetry::{self, Event, EventKind, Level, SessionRegistration};
 
 use client::{
-    commit, head_lib_for, judge, request_is_empty, ClientSide, Forward, Judgement,
+    commit, head_lib_for, judge, request_is_empty, ClientSide, Forward, Judgement, Lacks,
     PendingClientFrames, ResultKind, MAX_PENDING_CLIENT_BYTES,
 };
 use failover::{
@@ -107,8 +107,9 @@ use failover::{
 };
 pub use link::ConnectionGuard;
 use link::{
-    build_request, mark_offline, owed, quiescent, settled, DialError, DialTarget, DialTask,
-    Established, Link, Purpose, Target, UpCursor, LIVENESS_PING, MAX_DIAL_ATTEMPTS,
+    build_request, mark_no_block_log, mark_offline, owed, quiescent, settled, DialError,
+    DialTarget, DialTask, Established, Link, Purpose, Target, UpCursor, LIVENESS_PING,
+    MAX_DIAL_ATTEMPTS,
 };
 use status::{router_status, status_ready, StatusFlow, StatusStep};
 
@@ -382,26 +383,34 @@ fn lagging_for(view: &FleetView, u: &UpstreamView, n: u32, lag: u32) -> bool {
         && matches!((u.head, view.head), (Some(h), Some(f)) if h.num.saturating_add(lag) < f.num && n > h.num)
 }
 
-/// Whether a block result from `u` lacks a field the request asked for and
-/// `u` advertises at block `n` (the frozen field contract). A result whose
-/// payload fields do not decode counts as missing them.
-fn missing_field(
+/// What a block result from `u` lacks of the fields the request asked for
+/// and `u` advertises at block `n` (the frozen field contract). A result
+/// whose payload fields do not decode lacks data. SHiP status says nothing
+/// about block logs, so a missing `block` is told apart: an archive without
+/// a block log sends none, as Spring does for a block its log lacks.
+fn lacks(
     u: Option<&UpstreamView>,
     creq: &BlocksRequest,
     frame: &[u8],
     h: &ResultHead,
     n: u32,
-) -> bool {
+) -> Lacks {
     let Some(u) = u else {
-        return false;
+        return Lacks::Nothing;
     };
     let Ok(p) = wire::result_presence(frame, h) else {
-        return true;
+        return Lacks::Data;
     };
-    (creq.fetch_traces && u.covers(Log::Trace, n) && !p.traces)
+    if (creq.fetch_traces && u.covers(Log::Trace, n) && !p.traces)
         || (creq.fetch_deltas && u.covers(Log::ChainState, n) && !p.deltas)
         || (creq.v1 && creq.fetch_finality_data && u.covers(Log::Finality, n) && !p.finality)
-        || (creq.fetch_block && u.covers_ids(n) && !p.block)
+    {
+        Lacks::Data
+    } else if creq.fetch_block && u.covers_ids(n) && !p.block {
+        Lacks::Block
+    } else {
+        Lacks::Nothing
+    }
 }
 
 struct Session {
@@ -1419,7 +1428,7 @@ impl Session {
                         creq,
                         lr,
                         &h,
-                        |n| missing_field(u, creq, &frame, &h, n),
+                        |n| lacks(u, creq, &frame, &h, n),
                         |k| self.alternative_for(k, creq, endpoint),
                     ))
                 }
@@ -1442,8 +1451,91 @@ impl Session {
             }
             Some(Judgement::End(end)) => self.on_link_end(end).await,
             Some(Judgement::Duplicate { advance_to }) => self.drop_duplicate(advance_to, &h).await,
+            Some(Judgement::Forward(fw)) if fw.no_block => {
+                self.forward_without_block(frame, h, fw).await
+            }
             Some(Judgement::Forward(fw)) => self.forward_result(frame, h, fw).await,
         }
+    }
+
+    /// A frozen result without the `block` the request asked for, for a block
+    /// its upstream covers: the archive has no block log there. That is no
+    /// contract violation (no strike, no failure count): Spring sends the
+    /// same result when its block log lacks the block.
+    ///
+    /// The upstream is flagged for the listener (warned once), so plans rank
+    /// it below upstreams that hold blocks. When one of those can serve the
+    /// cursor now, the session fails over to it and resumes at this block.
+    /// Otherwise the result is forwarded without `block`, as one node with a
+    /// pruned block log sends it, and counted.
+    async fn forward_without_block(&mut self, frame: Bytes, h: ResultHead, fw: Forward) -> Flow {
+        let Some((up, endpoint, name)) = self
+            .link
+            .as_ref()
+            .map(|l| (l.st.up, l.endpoint.clone(), l.name.clone()))
+        else {
+            return Flow::Continue;
+        };
+        let block = self.c.cursor;
+        if !self.view.up(up).is_some_and(|u| u.no_block_log) {
+            if mark_no_block_log(&self.ctx.hub, &endpoint).await {
+                tracing::warn!(
+                    upstream = %endpoint,
+                    name = %name,
+                    block,
+                    "frozen upstream sent no block for a block it covers (no block log); it is skipped for fetch_block requests while an upstream that holds blocks can serve them"
+                );
+            }
+            self.sync_view();
+        }
+        let generation = self.view.generation;
+        let checked = self
+            .link
+            .as_ref()
+            .is_some_and(|l| l.st.blockless_checked == Some(generation));
+        if !checked {
+            if self.block_holder_for(block, &endpoint) {
+                tracing::info!(
+                    upstream = %endpoint,
+                    block,
+                    "moving to an upstream that holds blocks"
+                );
+                return self.on_link_end(UpEnd::NoBlockLog).await;
+            }
+            if let Some(link) = self.link.as_mut() {
+                link.st.blockless_checked = Some(generation);
+            }
+        }
+        if let Some(u) = self.ctx.hub.stats.upstream(up) {
+            u.results_without_block.fetch_add(1, Ordering::Relaxed);
+        }
+        self.forward_result(frame, h, fw).await
+    }
+
+    /// Stitched: whether an upstream other than `endpoint` that is not known
+    /// to lack a block log would serve block `k` of the current request now.
+    fn block_holder_for(&self, k: u32, endpoint: &str) -> bool {
+        let Some(creq) = self.c.req.as_ref() else {
+            return false;
+        };
+        let now = std_now();
+        let mut ex = self.ex.clone();
+        ex.add_hard(Arc::from(endpoint), Duration::from_secs(60), now);
+        let tip = self.ctx.hub.fresh_tip(&self.view);
+        let step = next_step(
+            &self.view,
+            tip,
+            &Shape::of(creq),
+            k,
+            &ex,
+            &self.own_slots(),
+            self.id,
+            &self.ctx.stitching,
+            self.ctx.live_lag_blocks,
+            false,
+            now,
+        );
+        matches!(step, Step::Serve(st) if self.view.up(st.up).is_some_and(|u| !u.no_block_log))
     }
 
     /// Whether another upstream than `endpoint` could serve block `k` of the
@@ -1763,6 +1855,7 @@ impl Session {
                 | UpEnd::SendFailed
                 | UpEnd::Silent
                 | UpEnd::Moved
+                | UpEnd::NoBlockLog
         );
         if self.ctx.stitched() && finished && quiet {
             tracing::debug!(upstream = %endpoint, ?end, "idle upstream link ended");
@@ -4422,6 +4515,178 @@ mod tests {
         assert_eq!(state[&dead].block_failures, 0, "no strike");
         drop(state);
         dead_task.abort();
+    }
+
+    fn block_request(start: u32, end: u32, max_in_flight: u32) -> Message {
+        Message::binary(mock_ship::client::blocks(&mock_ship::client::BlocksReq {
+            start,
+            end,
+            max_in_flight,
+            fetch_block: true,
+            fetch_traces: true,
+            ..Default::default()
+        }))
+    }
+
+    async fn read_views(client: &mut TestClient, n: usize) -> Vec<BlockView> {
+        let mut views = Vec::new();
+        while views.len() < n {
+            match next_message(client).await {
+                Some(Message::Binary(data)) => {
+                    views.push(BlockView::parse(&data).expect("a block result"));
+                }
+                other => panic!("unexpected frame after {} results: {other:?}", views.len()),
+            }
+        }
+        views
+    }
+
+    fn violations(hub: &FleetHub, up: usize) -> u64 {
+        let stats = hub.stats.upstream(up).unwrap();
+        stats.contract_violations.values().map(|(_, n)| n).sum()
+    }
+
+    /// Stitched: an archive without a block log that sends a result without
+    /// the requested block is no contract violation. It is flagged, and the
+    /// session moves to its twin that holds blocks, resuming at that block.
+    #[tokio::test]
+    async fn a_block_request_moves_off_an_archive_without_a_block_log() {
+        let (bare, _bare_mock) = start_mock(MockShipConfig {
+            no_block_log: true,
+            ..MockShipConfig::frozen(1, 1001)
+        })
+        .await;
+        let (full, full_mock) = start_mock(MockShipConfig::frozen(1, 1001)).await;
+        let harness = start_stitched(&[(&bare, 1, 1001), (&full, 1, 1001)]).await;
+        {
+            // The archive without a block log is tried first.
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&full).unwrap().priority = 5;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        client.send(block_request(10, 20, 100)).await.unwrap();
+        let views = read_views(&mut client, 10).await;
+        assert_eq!(
+            views.iter().filter_map(BlockView::num).collect::<Vec<_>>(),
+            (10..20).collect::<Vec<_>>()
+        );
+        assert!(views.iter().all(|v| v.block.is_some()), "every block");
+        assert_eq!(blocks_requests(&full_mock)[0].1, 10, "resumed at 10");
+        let stats = &harness.hub.stats;
+        assert_eq!(stats.failovers.get(FailoverReason::NoBlockLog), 1);
+        assert_eq!(stats.failovers.get(FailoverReason::Violation), 0);
+        assert_eq!(violations(&harness.hub, 0), 0, "no violation");
+        assert_eq!(
+            stats
+                .upstream(0)
+                .unwrap()
+                .results_without_block
+                .load(Ordering::Relaxed),
+            0
+        );
+        let state = harness.hub.state.lock().await;
+        assert!(state[&bare].no_block_log);
+        assert!(!state[&full].no_block_log);
+        assert_eq!(state[&bare].block_failures, 0, "no strike");
+        assert!(state[&bare].quarantines.is_empty());
+    }
+
+    /// Stitched: when no upstream holds the blocks, results come without
+    /// `block`, as from one node with a pruned block log, and are counted.
+    #[tokio::test]
+    async fn archives_without_a_block_log_serve_block_requests_without_blocks() {
+        let bare = || MockShipConfig {
+            no_block_log: true,
+            ..MockShipConfig::frozen(1, 1001)
+        };
+        let (a, _a_mock) = start_mock(bare()).await;
+        let (a2, _a2_mock) = start_mock(bare()).await;
+        let harness = start_stitched(&[(&a, 1, 1001), (&a2, 1, 1001)]).await;
+        let mut client = connect(&harness.url).await;
+        client.send(block_request(1, 300, 300)).await.unwrap();
+        let views = read_views(&mut client, 299).await;
+        assert_eq!(
+            views.iter().filter_map(BlockView::num).collect::<Vec<_>>(),
+            (1..300).collect::<Vec<_>>()
+        );
+        assert!(views
+            .iter()
+            .all(|v| v.block.is_none() && v.traces.is_some()));
+        for pair in views.windows(2) {
+            assert_eq!(pair[1].prev, pair[0].this, "the chain continues");
+        }
+        let stats = &harness.hub.stats;
+        // The first archive tried moved the session to the other, which
+        // then served everything without blocks.
+        assert_eq!(stats.failovers.get(FailoverReason::NoBlockLog), 1);
+        let without = |up: usize| {
+            stats
+                .upstream(up)
+                .unwrap()
+                .results_without_block
+                .load(Ordering::Relaxed)
+        };
+        assert_eq!(without(0) + without(1), 299);
+        assert!(without(0) == 0 || without(1) == 0, "one archive served");
+        assert_eq!(violations(&harness.hub, 0) + violations(&harness.hub, 1), 0);
+        let state = harness.hub.state.lock().await;
+        for ep in [&a, &a2] {
+            assert!(state[ep].no_block_log);
+            assert_eq!(state[ep].block_failures, 0, "no strike");
+        }
+    }
+
+    /// A status that differs from the last one, or one after the upstream
+    /// came back, clears the flag: the upstream may have a block log now.
+    #[tokio::test]
+    async fn a_reconnect_or_a_new_status_clears_the_no_block_log_flag() {
+        let (archive, _mock) = start_mock(MockShipConfig::frozen(1, 1001)).await;
+        let harness = start_stitched(&[(&archive, 1, 1001)]).await;
+        assert!(link::mark_no_block_log(&harness.hub, &archive).await);
+        assert!(
+            !link::mark_no_block_log(&harness.hub, &archive).await,
+            "once"
+        );
+        assert!(harness.hub.view().upstreams[0].no_block_log);
+        let server = harness.hub.config.lock().await[&archive].clone();
+        let status = |end: u32| {
+            mock_ship::protocol::encode_status(
+                false,
+                &mock_ship::protocol::StatusFields {
+                    head: (end - 1, mock_ship::fake_block_id(end - 1)),
+                    lib: (end - 1, mock_ship::fake_block_id(end - 1)),
+                    trace: (1, end),
+                    chain_state: (1, end),
+                    chain_id: [0; 32],
+                    finality: (0, 0),
+                },
+            )
+        };
+        // The same status keeps it.
+        crate::tasks::apply_status_update(&status(1001), &harness.hub.state, &server)
+            .await
+            .unwrap();
+        assert!(harness.hub.state.lock().await[&archive].no_block_log);
+        // Another status clears it.
+        crate::tasks::apply_status_update(&status(1002), &harness.hub.state, &server)
+            .await
+            .unwrap();
+        assert!(!harness.hub.state.lock().await[&archive].no_block_log);
+        // So does the first status after the upstream was lost.
+        assert!(link::mark_no_block_log(&harness.hub, &archive).await);
+        harness
+            .hub
+            .state
+            .lock()
+            .await
+            .get_mut(&archive)
+            .unwrap()
+            .mark_offline(std::time::Instant::now());
+        crate::tasks::apply_status_update(&status(1002), &harness.hub.state, &server)
+            .await
+            .unwrap();
+        assert!(!harness.hub.state.lock().await[&archive].no_block_log);
     }
 
     /// Stitched: a live node that goes silent while serving the tip is

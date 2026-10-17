@@ -185,6 +185,10 @@ pub(super) enum UpEnd {
     Silent,
     /// An operator moved the session off this upstream.
     Moved,
+    /// A frozen upstream without a block log sent a result without the
+    /// requested `block`, while another upstream that holds blocks can serve
+    /// the cursor.
+    NoBlockLog,
 }
 
 /// Which upstream a session avoids after a link end.
@@ -228,8 +232,9 @@ pub(super) struct EndFacts {
 
 /// The link-end table. Only unclean drops, frozen stalls and frozen contract
 /// violations strike the upstream; a clean close, an idle or live stall, a
-/// busy, uncovered or silent upstream, an operator move, an oversized message
-/// or a client-induced drop never do. `cursor` is the client's next block.
+/// busy, uncovered or silent upstream, an operator move, an archive without
+/// a block log, an oversized message or a client-induced drop never do.
+/// `cursor` is the client's next block.
 pub(super) fn classify(end: UpEnd, facts: &EndFacts, cursor: u32, now: Instant) -> EndAction {
     let failover = |strike: bool, budget: bool, delay: Duration, exclusion: Exclusion, reason| {
         EndAction::Failover {
@@ -339,6 +344,15 @@ pub(super) fn classify(end: UpEnd, facts: &EndFacts, cursor: u32, now: Instant) 
             CLEAN_DELAY,
             Exclusion::Soft,
             FailoverReason::Operator,
+        ),
+        // Nothing is wrong with the archive: it lacks the block log. The
+        // session moves at once to an upstream that holds the blocks.
+        UpEnd::NoBlockLog => failover(
+            false,
+            false,
+            Duration::ZERO,
+            Exclusion::Soft,
+            FailoverReason::NoBlockLog,
         ),
     }
 }
@@ -596,6 +610,17 @@ mod tests {
                     ms(100),
                     Exclusion::Hard(Duration::from_secs(2)),
                     FailoverReason::Send,
+                ),
+            ),
+            (
+                UpEnd::NoBlockLog,
+                frozen,
+                fo(
+                    false,
+                    false,
+                    Duration::ZERO,
+                    Exclusion::Soft,
+                    FailoverReason::NoBlockLog,
                 ),
             ),
         ];

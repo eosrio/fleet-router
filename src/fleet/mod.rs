@@ -91,6 +91,9 @@ metric_label! {
         Silent => "silent",
         /// Moved by an operator through the control API.
         Operator => "operator",
+        /// Left a frozen upstream without a block log for one that holds the
+        /// blocks a `fetch_block` request asks for.
+        NoBlockLog => "no_block_log",
     }
 }
 
@@ -268,6 +271,9 @@ pub struct UpstreamStats {
     pub stalls: AtomicU64,
     /// Live forward jumps that a session adopted.
     pub sequence_jumps: AtomicU64,
+    /// Frozen results forwarded without the `block` the request asked for,
+    /// because no upstream that holds blocks could serve them.
+    pub results_without_block: AtomicU64,
 }
 
 /// Session counters and gauges of one listener (`fleet_router_*` per-listener

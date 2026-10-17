@@ -451,11 +451,17 @@ impl Session {
             }
             self.update_owed();
             let deadline = self.next_deadline();
-            // A new view can answer waiting status requests, and it re-arms
-            // the deadlines of an owed link (the monitor may have marked its
-            // upstream offline).
-            let waits_on_view =
-                self.status.waiting() || self.link.as_ref().is_some_and(|l| l.st.was_owed);
+            // A new view can answer waiting status requests. It also makes
+            // the next pass re-check whether a link with a request and credit
+            // owes blocks: the fleet head may have moved past what a silent
+            // upstream sent (stall), or the monitor may have marked the
+            // upstream offline. Nothing else wakes a session whose link sits
+            // silent at its own tip.
+            let waits_on_view = self.status.waiting()
+                || self
+                    .link
+                    .as_ref()
+                    .is_some_and(|l| l.st.req.is_some() && self.c.credit > 0);
             // Biased: shutdown first, then the client, so its acks, status
             // requests and new requests are applied before more upstream
             // results are forwarded.
@@ -2152,5 +2158,48 @@ mod tests {
         assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Offline), 1);
         let state = harness.hub.state.lock().await;
         assert_eq!(state[&holding].block_failures, 0, "no strike");
+    }
+
+    /// A live link that goes silent at its own tip is failed over once
+    /// another upstream's status moves the fleet head past it, with no client
+    /// traffic to wake the session.
+    #[tokio::test]
+    async fn a_link_silent_at_its_tip_stalls_once_the_fleet_moves_ahead() {
+        let (stuck, _stuck_mock) = start_mock(MockShipConfig::live(1, 1000)).await;
+        let (ahead, _ahead_mock) = start_mock(MockShipConfig::live(1, 1005)).await;
+        let stall = ProxyLimits {
+            stall_timeout_ms: 1000,
+            ..limits(0)
+        };
+        // Only the stuck upstream is online at connect, so the session
+        // starts there.
+        let harness = start_session_with(&[&stuck, &ahead], &[&stuck], stall).await;
+        set_tip(&harness.hub, &stuck, 1000, 990).await;
+        let mut client = connect(&harness.url).await;
+        set_online(&harness.hub, &ahead).await;
+
+        client
+            .send(blocks_request(995, u32::MAX, 100))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 6).await,
+            (995..=1000).collect::<Vec<_>>()
+        );
+        // At its own tip and the fleet's, the link owes nothing yet.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The other upstream's status moves the fleet head ahead.
+        let moved = Instant::now();
+        set_tip(&harness.hub, &ahead, 1005, 995).await;
+        assert_eq!(
+            read_block_nums(&mut client, 5).await,
+            (1001..=1005).collect::<Vec<_>>()
+        );
+        assert!(
+            moved.elapsed() >= Duration::from_millis(900),
+            "failed over after {:?}",
+            moved.elapsed()
+        );
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Stall), 1);
     }
 }

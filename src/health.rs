@@ -380,12 +380,18 @@ fn coverage_json(l: &ListenerHealthState) -> Option<Value> {
                     .iter()
                     .filter_map(|&pos| view.upstreams.get(pos))
                     .map(|u| {
-                        json!({
+                        let mut entry = json!({
                             "server": &*u.name,
                             "role": u.role.as_str(),
                             "online": u.online,
                             "sessions": u.connections.load(Ordering::Relaxed),
-                        })
+                        });
+                        // Why a segment of online upstreams can count as
+                        // offline: an operator took this one out of service.
+                        if u.operator_disabled {
+                            entry["operator_disabled"] = Value::Bool(true);
+                        }
+                        entry
                     })
                     .collect();
                 json!({
@@ -2011,6 +2017,32 @@ mod tests {
             let (status, body) = get(&both, "/ready").await;
             assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
             assert_eq!(body, "not ready: main: no live upstreams online\n");
+        }
+
+        #[tokio::test]
+        async fn coverage_marks_an_operator_disabled_upstream() {
+            let l = stitched(None);
+            update(&l, |db| {
+                report(db.get_mut(ARCHIVE_A).unwrap(), 2, 1001, 1000, 1000);
+                report(db.get_mut(ARCHIVE_B).unwrap(), 1001, 2001, 2000, 2000);
+                report(db.get_mut(LIVE).unwrap(), 1900, 2301, 2300, 2290);
+                db.get_mut(ARCHIVE_A).unwrap().operator_disabled = true;
+            })
+            .await;
+            let (_, body) = get(std::slice::from_ref(&l), "/coverage").await;
+            let doc: Value = serde_json::from_str(&body).unwrap();
+            let trace = &doc["listeners"][0]["logs"]["trace"];
+            assert_eq!(trace["offline_only"], json!([{ "begin": 2, "end": 1001 }]));
+            assert_eq!(
+                trace["segments"][0],
+                json!({ "begin": 2, "end": 1001, "upstreams": [
+                    { "server": "archive-a", "role": "frozen", "online": true,
+                      "operator_disabled": true, "sessions": 0 } ] })
+            );
+            assert_eq!(
+                trace["segments"][1]["upstreams"][0].get("operator_disabled"),
+                None
+            );
         }
 
         #[tokio::test]

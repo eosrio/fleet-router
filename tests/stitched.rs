@@ -27,7 +27,7 @@ use mock_ship::client::{ack, blocks, status_v0, status_v1, BlockView, BlocksReq,
 use mock_ship::{fake_block_id, MockShipConfig, MockShipHandle, MockShipServer, Observed};
 use serde_json::{json, Value};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
@@ -207,17 +207,24 @@ async fn metric(router: &RouterProcess, series: &str) -> f64 {
 
 /// Wait until every upstream is online and its ranges are known.
 async fn wait_ready(router: &RouterProcess, ups: &[&Up]) {
+    wait_ready_within(router, ups, WAIT).await;
+}
+
+/// [`wait_ready`], all upstreams within `within` of the call.
+async fn wait_ready_within(router: &RouterProcess, ups: &[&Up], within: Duration) {
+    let deadline = Instant::now() + within;
+    let left = || deadline.saturating_duration_since(Instant::now());
     for u in ups {
         wait_metric(
             router.metrics(),
             &format!("{} 1", u.series("upstream_up", "")),
-            WAIT,
+            left(),
         )
         .await;
         wait_metric(
             router.metrics(),
             &format!("{} 1", u.series("upstream_ranges_known", "")),
-            WAIT,
+            left(),
         )
         .await;
     }
@@ -897,9 +904,8 @@ async fn s4e_a_client_leaving_during_a_handoff_releases_every_link() {
     let mut cfg = fleet_config(&a, &b, &c);
     cfg["stitching"]["predial_blocks"] = json!(0);
     let router = RouterProcess::start(cfg).await;
-    timeout(Duration::from_secs(8), wait_ready(&router, &[&a, &b, &c]))
-        .await
-        .expect("the fleet comes up");
+    // B's ABI alone takes about three seconds.
+    wait_ready_within(&router, &[&a, &b, &c], Duration::from_secs(8)).await;
     let (mut w, mut r, _) = client(&router).await;
 
     send(&mut w, blocks(&request(990, 1020, 100))).await;
@@ -964,10 +970,15 @@ async fn s6_frozen_upstreams_are_never_stale() {
     cfg["upstream_status_ms"] = json!(200);
     let router = RouterProcess::start(cfg).await;
     wait_ready(&router, &[&a, &b, &c]).await;
-    sleep(Duration::from_secs(3)).await;
+    // Twelve monitor intervals without a new head, plus timer slack.
+    wait_metric(
+        router.metrics(),
+        &format!("{} 1", c.series("upstream_stale", "")),
+        WAIT * 2,
+    )
+    .await;
     assert_eq!(metric(&router, &a.series("upstream_stale", "")).await, 0.0);
     assert_eq!(metric(&router, &b.series("upstream_stale", "")).await, 0.0);
-    assert_eq!(metric(&router, &c.series("upstream_stale", "")).await, 1.0);
 }
 
 // ----------------------------------------------------------------------

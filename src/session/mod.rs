@@ -1992,6 +1992,15 @@ impl Session {
         }
     }
 
+    /// Whether an operator disabled (or drained) the upstream of a dial that
+    /// just finished while it was on its way. A drain moves only the
+    /// sessions already on the upstream, so such a session is left to go
+    /// elsewhere itself.
+    fn disabled_while_dialing(&mut self, target: &DialTarget) -> bool {
+        self.sync_view();
+        !self.view.up(target.up).is_some_and(|u| u.routable())
+    }
+
     /// A failed dial: count it, avoid the upstream for this session for a
     /// moment, and mark a live upstream offline unless it was only busy.
     async fn on_dial_failed(&mut self, target: &DialTarget, error: DialError) {
@@ -2037,6 +2046,22 @@ impl Session {
         }
         match outcome {
             Ok(est) => {
+                if self.disabled_while_dialing(&target) {
+                    let route = self.c.req.as_ref().map(|r| (Need::of(r), self.c.cursor));
+                    if let Some(up) = self.pool_pick_for(route, purpose != Purpose::Initial) {
+                        tracing::info!(
+                            upstream = %target.endpoint,
+                            "upstream disabled while it was being dialed; dialing another"
+                        );
+                        drop(est);
+                        if self.start_dial(up, purpose, None) {
+                            return Flow::Continue;
+                        }
+                        return self.failover_unavailable().await;
+                    }
+                    // Nothing else can take the session: it stays, as on
+                    // any upstream an operator disables.
+                }
                 self.adopt_link(&target, est, purpose.label());
                 if purpose == Purpose::Failover {
                     tracing::info!(upstream = %target.name, "reconnected to upstream after failover");
@@ -2592,6 +2617,19 @@ impl Session {
         let predial = std::mem::take(&mut self.dial_was_predial);
         match outcome {
             Ok(est) => {
+                if self.disabled_while_dialing(&target) && self.c.in_progress() {
+                    let step = self.plan(self.c.cursor, self.hold.is_some());
+                    if matches!(step, Step::Serve(_)) {
+                        tracing::info!(
+                            upstream = %target.endpoint,
+                            "upstream disabled while it was being dialed; serving from another"
+                        );
+                        drop(est);
+                        return self.apply_step(step, purpose, self.c.credit).await;
+                    }
+                    // Nothing else can serve the leg: it stays, as on any
+                    // upstream an operator disables.
+                }
                 let fp = abi_fingerprint(&est.abi);
                 if fp != self.c.abi_fp {
                     self.warn_abi_mismatch(&target, fp);
@@ -4460,6 +4498,110 @@ mod tests {
         assert_eq!(state[&dead].block_failures, 0, "no strike");
         drop(state);
         dead_task.abort();
+    }
+
+    /// Stitched: an operator drains the archive a session is dialing for its
+    /// leg. The dial lands after the drain, so the session serves the leg
+    /// from the twin instead of streaming it from the drained archive.
+    #[tokio::test]
+    async fn a_dial_that_lands_on_a_drained_archive_serves_from_its_twin() {
+        let (slow, mock_slow) = start_mock(MockShipConfig {
+            // The ABI takes about a second.
+            throttle_bytes_per_sec: Some(60_000),
+            ..MockShipConfig::frozen(1, 2001)
+        })
+        .await;
+        let (twin, mock_twin) = start_mock(MockShipConfig::frozen(1, 2001)).await;
+        let harness = start_stitched(&[(&slow, 1, 2001), (&twin, 1, 2001)]).await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&twin).unwrap().priority = 5;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        client.send(blocks_request(10, 30, 100)).await.unwrap();
+        let dialing = timeout(WAIT, async {
+            while mock_slow.sessions_accepted() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            dialing.is_ok(),
+            "the leg is dialed on the preferred archive"
+        );
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&slow).unwrap().operator_disabled = true;
+            harness.hub.rebuild(&db);
+        }
+        assert_eq!(
+            read_block_nums(&mut client, 20).await,
+            (10..30).collect::<Vec<_>>()
+        );
+        assert_eq!(info.upstream(), twin);
+        assert_eq!(mock_twin.sessions_accepted(), 1);
+        assert!(
+            blocks_requests(&mock_slow).is_empty(),
+            "no request on the drained archive"
+        );
+    }
+
+    /// Pool: the upstream an operator move dials is disabled before the dial
+    /// lands. The session goes back to the upstream it left instead.
+    #[tokio::test]
+    async fn a_move_whose_target_is_disabled_while_dialing_returns_to_where_it_was() {
+        let (a, mock_a) = start_mock(MockShipConfig {
+            blocks_to_stream: 0,
+            block_delay: Some(Duration::from_millis(5)),
+            ..Default::default()
+        })
+        .await;
+        let (b, mock_b) = start_mock(MockShipConfig {
+            blocks_to_stream: 0,
+            throttle_bytes_per_sec: Some(60_000),
+            ..Default::default()
+        })
+        .await;
+        let harness = start_session_with(&[&a, &b], &[&a, &b], limits(0)).await;
+        set_tip(&harness.hub, &a, 100_000, 99_000).await;
+        set_tip(&harness.hub, &b, 100_000, 99_000).await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&b).unwrap().priority = 5;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        assert_eq!(info.upstream(), a);
+        client
+            .send(blocks_request(100, 100_000, 100))
+            .await
+            .unwrap();
+        let mut blocks = read_block_nums(&mut client, 5).await;
+
+        info.request_move();
+        let dialing = timeout(WAIT, async {
+            while mock_b.sessions_accepted() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(dialing.is_ok(), "the move dials B");
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&b).unwrap().operator_disabled = true;
+            harness.hub.rebuild(&db);
+        }
+        blocks.extend(read_block_nums(&mut client, 20).await);
+        assert_eq!(blocks, (100..125).collect::<Vec<_>>());
+        assert_eq!(info.upstream(), a);
+        assert_eq!(mock_a.sessions_accepted(), 2);
+        assert!(
+            blocks_requests(&mock_b).is_empty(),
+            "no request on the disabled upstream"
+        );
     }
 
     /// Whether the control API counts a session at `next_block` on `endpoint`

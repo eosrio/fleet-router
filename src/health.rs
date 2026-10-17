@@ -3,20 +3,31 @@
 //!
 //! Routes (GET only):
 //!   - `/health`, `/healthz`           -> 200 while the process is running
-//!   - `/ready`,  `/readyz`            -> 200 if every configured listener has ≥1 upstream online, else 503
-//!   - `/ready/<name>`, `/readyz/<name>` -> 200 if named listener has ≥1 upstream online, 503 if 0, 404 if unknown
-//!   - `/metrics`                      -> Prometheus text exposition of upstream state
+//!   - `/ready`,  `/readyz`            -> 200 if every configured listener can serve the tip, else 503
+//!   - `/ready/<name>`, `/readyz/<name>` -> the same for one listener, 404 if unknown
+//!   - `?scope=history` on either      -> also requires complete, online archive coverage (stitched)
+//!   - `/coverage`, `/coverage/<name>` -> JSON fleet coverage of every listener, or of one
+//!   - `/metrics`                      -> Prometheus text exposition of upstream and listener state
+//!
+//! A pool listener can serve the tip when at least one upstream is online. A
+//! stitched listener needs an online live upstream (any online upstream when
+//! it has no live servers). History readiness is never part of plain `/ready`,
+//! so one archive outage cannot pull the router out of a load balancer.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
-use crate::models::{Role, ServerStateDb};
+use crate::fleet::view::AbiSource;
+use crate::fleet::{FleetHub, FleetView, ListenerStats, Log, MetricLabel, SessionGauge};
+use crate::models::{ResolvedTopology, Role, ServerStateDb};
+use crate::ship::{BlockPos, Range};
 
 /// Health and metrics state for a single ingress listener.
 #[derive(Clone)]
@@ -24,6 +35,34 @@ pub struct ListenerHealthState {
     /// `None` in legacy single-port mode, `Some(name)` in multi-listener mode.
     pub name: Option<String>,
     pub state_db: ServerStateDb,
+    /// The listener's fleet view and statistics. `None` keeps the
+    /// state-map-only behaviour (pool readiness, upstream series).
+    pub hub: Option<Arc<FleetHub>>,
+}
+
+/// What `/ready` checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    /// The listener can serve the chain tip.
+    Tip,
+    /// Tip readiness, plus (stitched) no coverage gap, no archive segment
+    /// without an online upstream, and no unreported frozen upstream.
+    History,
+}
+
+/// `scope=tip` (the default) or `scope=history` from a query string. Other
+/// parameters are ignored; an unknown scope is returned as the error.
+fn parse_scope(query: Option<&str>) -> Result<Scope, String> {
+    for pair in query.unwrap_or("").split('&') {
+        if let Some(value) = pair.strip_prefix("scope=") {
+            return match value {
+                "" | "tip" => Ok(Scope::Tip),
+                "history" => Ok(Scope::History),
+                other => Err(other.to_string()),
+            };
+        }
+    }
+    Ok(Scope::Tip)
 }
 
 /// Run the health/metrics HTTP server until a shutdown signal is received.
@@ -104,7 +143,10 @@ async fn handle_request(
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let raw_path = parts.next().unwrap_or("");
-    let path = raw_path.split('?').next().unwrap_or("");
+    let (path, query) = match raw_path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (raw_path, None),
+    };
 
     let (status, content_type, body) = if method != "GET" {
         (
@@ -113,25 +155,7 @@ async fn handle_request(
             "method not allowed\n".to_string(),
         )
     } else {
-        match path {
-            "/health" | "/healthz" => ("200 OK", "text/plain", "ok\n".to_string()),
-            "/ready" | "/readyz" => evaluate_overall_readiness(listeners).await,
-            "/metrics" => (
-                "200 OK",
-                "text/plain; version=0.0.4",
-                render_metrics(listeners).await,
-            ),
-            _ => {
-                if let Some(target) = path
-                    .strip_prefix("/ready/")
-                    .or_else(|| path.strip_prefix("/readyz/"))
-                {
-                    evaluate_listener_readiness(listeners, target).await
-                } else {
-                    ("404 Not Found", "text/plain", "not found\n".to_string())
-                }
-            }
-        }
+        route(listeners, path, query).await
     };
 
     let response = format!(
@@ -143,33 +167,175 @@ async fn handle_request(
     Ok(())
 }
 
-async fn evaluate_overall_readiness(
-    listeners: &[ListenerHealthState],
-) -> (&'static str, &'static str, String) {
+type Response = (&'static str, &'static str, String);
+
+fn not_found() -> Response {
+    ("404 Not Found", "text/plain", "not found\n".to_string())
+}
+
+async fn route(listeners: &[ListenerHealthState], path: &str, query: Option<&str>) -> Response {
+    match path {
+        "/health" | "/healthz" => ("200 OK", "text/plain", "ok\n".to_string()),
+        "/metrics" => (
+            "200 OK",
+            "text/plain; version=0.0.4",
+            render_metrics(listeners).await,
+        ),
+        "/coverage" => coverage_response(listeners, None),
+        _ => {
+            if let Some(target) = path.strip_prefix("/coverage/") {
+                return coverage_response(listeners, Some(target));
+            }
+            let target = match path {
+                "/ready" | "/readyz" => None,
+                _ => match path
+                    .strip_prefix("/ready/")
+                    .or_else(|| path.strip_prefix("/readyz/"))
+                {
+                    Some(target) => Some(target),
+                    None => return not_found(),
+                },
+            };
+            let scope = match parse_scope(query) {
+                Ok(scope) => scope,
+                Err(other) => {
+                    return (
+                        "400 Bad Request",
+                        "text/plain",
+                        format!("unknown scope '{other}'; use tip or history\n"),
+                    )
+                }
+            };
+            match target {
+                None => evaluate_overall(listeners, scope).await,
+                Some(target) => evaluate_listener(listeners, target, scope).await,
+            }
+        }
+    }
+}
+
+/// One listener's readiness verdict.
+struct Readiness {
+    /// Upstreams online, for the 200 body.
+    online: usize,
+    /// Empty when ready.
+    reasons: Vec<String>,
+    /// The verdict came from the state map alone (pool, or no hub).
+    pool: bool,
+}
+
+impl Readiness {
+    fn ready(&self) -> bool {
+        self.reasons.is_empty()
+    }
+}
+
+const NO_UPSTREAMS_ONLINE: &str = "no upstreams online";
+
+async fn listener_readiness(l: &ListenerHealthState, scope: Scope) -> Readiness {
+    let view = match &l.hub {
+        Some(hub) if hub.topology == ResolvedTopology::Stitched => hub.view(),
+        _ => {
+            // Pool: tip and history readiness are the same.
+            let online = count_online(&l.state_db).await;
+            return Readiness {
+                online,
+                reasons: if online > 0 {
+                    Vec::new()
+                } else {
+                    vec![NO_UPSTREAMS_ONLINE.to_string()]
+                },
+                pool: true,
+            };
+        }
+    };
+    let mut reasons = Vec::new();
+    if view.live_configured && view.live_online == 0 {
+        reasons.push("no live upstreams online".to_string());
+    } else if !view.live_configured && view.online == 0 {
+        reasons.push(NO_UPSTREAMS_ONLINE.to_string());
+    }
+    if scope == Scope::History {
+        reasons.extend(history_reasons(&view));
+    }
+    Readiness {
+        online: view.online,
+        reasons,
+        pool: false,
+    }
+}
+
+/// Why a stitched listener's history is not fully servable: holes and
+/// segments without an online upstream in the trace and chain-state logs, and
+/// frozen upstreams that neither reported nor declared a range.
+fn history_reasons(view: &FleetView) -> Vec<String> {
+    // (problem, logs it applies to), in first-seen order.
+    let mut found: Vec<(String, Vec<&'static str>)> = Vec::new();
+    let mut note = |problem: String, log: Log| match found.iter_mut().find(|(p, _)| *p == problem) {
+        Some((_, logs)) => logs.push(log.as_str()),
+        None => found.push((problem, vec![log.as_str()])),
+    };
+    for log in [Log::Trace, Log::ChainState] {
+        let cov = view.cov(log);
+        for gap in &cov.gaps {
+            note(
+                format!("gap [{},{}) has no upstream", gap.begin, gap.end),
+                log,
+            );
+        }
+        for segment in &cov.offline_only {
+            note(
+                format!(
+                    "segment [{},{}) has no online upstream",
+                    segment.begin, segment.end
+                ),
+                log,
+            );
+        }
+    }
+    let mut out: Vec<String> = found
+        .into_iter()
+        .map(|(problem, logs)| format!("{problem} ({})", logs.join(", ")))
+        .collect();
+    if view.frozen_unknown > 0 {
+        out.push(format!(
+            "{} frozen upstream(s) have neither reported nor declared a range",
+            view.frozen_unknown
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+async fn evaluate_overall_readiness(listeners: &[ListenerHealthState]) -> Response {
+    evaluate_overall(listeners, Scope::Tip).await
+}
+
+async fn evaluate_overall(listeners: &[ListenerHealthState], scope: Scope) -> Response {
     if listeners.len() == 1 && listeners[0].name.is_none() {
-        let online = count_online(&listeners[0].state_db).await;
-        return if online > 0 {
+        let r = listener_readiness(&listeners[0], scope).await;
+        return if r.ready() {
             (
                 "200 OK",
                 "text/plain",
-                format!("ready: {} upstream(s) online\n", online),
+                format!("ready: {} upstream(s) online\n", r.online),
             )
         } else {
             (
                 "503 Service Unavailable",
                 "text/plain",
-                "not ready: no upstreams online\n".to_string(),
+                format!("not ready: {}\n", r.reasons.join("; ")),
             )
         };
     }
 
     let mut total_online = 0usize;
-    let mut unready = Vec::new();
+    let mut unready: Vec<(String, Readiness)> = Vec::new();
     for l in listeners {
-        let online = count_online(&l.state_db).await;
-        total_online += online;
-        if online == 0 {
-            unready.push(l.name.as_deref().unwrap_or("default").to_string());
+        let r = listener_readiness(l, scope).await;
+        total_online += r.online;
+        if !r.ready() {
+            unready.push((l.name.as_deref().unwrap_or("default").to_string(), r));
         }
     }
 
@@ -183,46 +349,190 @@ async fn evaluate_overall_readiness(
                 total_online
             ),
         )
-    } else {
+    } else if unready.iter().all(|(_, r)| r.pool) {
+        let names: Vec<&str> = unready.iter().map(|(name, _)| name.as_str()).collect();
         (
             "503 Service Unavailable",
             "text/plain",
             format!(
                 "not ready: listener(s) with no online upstreams: {}\n",
-                unready.join(", ")
+                names.join(", ")
             ),
+        )
+    } else {
+        let parts: Vec<String> = unready
+            .iter()
+            .map(|(name, r)| format!("{name}: {}", r.reasons.join("; ")))
+            .collect();
+        (
+            "503 Service Unavailable",
+            "text/plain",
+            format!("not ready: {}\n", parts.join(", ")),
         )
     }
 }
 
-async fn evaluate_listener_readiness(
+#[cfg(test)]
+async fn evaluate_listener_readiness(listeners: &[ListenerHealthState], target: &str) -> Response {
+    evaluate_listener(listeners, target, Scope::Tip).await
+}
+
+async fn evaluate_listener(
     listeners: &[ListenerHealthState],
     target: &str,
-) -> (&'static str, &'static str, String) {
+    scope: Scope,
+) -> Response {
     if target.is_empty() {
-        return ("404 Not Found", "text/plain", "not found\n".to_string());
+        return not_found();
     }
     let Some(listener) = listeners.iter().find(|l| l.name.as_deref() == Some(target)) else {
-        return ("404 Not Found", "text/plain", "not found\n".to_string());
+        return not_found();
     };
-    let online = count_online(&listener.state_db).await;
-    if online > 0 {
+    let r = listener_readiness(listener, scope).await;
+    if r.ready() {
         (
             "200 OK",
             "text/plain",
-            format!("ready ({target}): {online} upstream(s) online\n"),
+            format!("ready ({target}): {} upstream(s) online\n", r.online),
         )
     } else {
         (
             "503 Service Unavailable",
             "text/plain",
-            format!("not ready ({target}): no upstreams online\n"),
+            format!("not ready ({target}): {}\n", r.reasons.join("; ")),
         )
     }
 }
 
 async fn count_online(state_db: &ServerStateDb) -> usize {
     state_db.lock().await.values().filter(|s| s.online).count()
+}
+
+/// `GET /coverage` (every listener) or `/coverage/<name>` (one; 404 if
+/// unknown).
+fn coverage_response(listeners: &[ListenerHealthState], target: Option<&str>) -> Response {
+    let selected: Vec<&ListenerHealthState> = match target {
+        None => listeners.iter().collect(),
+        Some(name) => {
+            let found: Vec<&ListenerHealthState> = listeners
+                .iter()
+                .filter(|l| !name.is_empty() && l.name.as_deref() == Some(name))
+                .collect();
+            if found.is_empty() {
+                return not_found();
+            }
+            found
+        }
+    };
+    let body = json!({
+        "listeners": selected.into_iter().filter_map(coverage_json).collect::<Vec<Value>>(),
+    });
+    ("200 OK", "application/json", format!("{body}\n"))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+fn pos_json(p: Option<BlockPos>) -> Value {
+    match p {
+        Some(p) => json!({ "num": p.num, "id": hex(&p.id) }),
+        None => Value::Null,
+    }
+}
+
+fn range_json(r: Range) -> Value {
+    json!({ "begin": r.begin, "end": r.end })
+}
+
+/// One listener's entry in `/coverage`. `None` for a listener without a hub.
+fn coverage_json(l: &ListenerHealthState) -> Option<Value> {
+    let hub = l.hub.as_ref()?;
+    let view = hub.view();
+    let (head, lib) = hub.fresh_tip(&view);
+    let abi = view.abi.as_ref().map(|abi| {
+        let source = match view.abi_source {
+            Some(AbiSource::File) => "abi_file".to_string(),
+            Some(AbiSource::Live(i) | AbiSource::Provisional(i)) => view
+                .up(i)
+                .map_or_else(|| i.to_string(), |u| u.name.to_string()),
+            None => String::new(),
+        };
+        let mismatched: Vec<&str> = view
+            .upstreams
+            .iter()
+            .filter(|u| u.abi_fp.is_some_and(|fp| fp != abi.fp))
+            .map(|u| &*u.name)
+            .collect();
+        json!({
+            "fingerprint": abi.fp_hex(),
+            "source": source,
+            "provisional": matches!(view.abi_source, Some(AbiSource::Provisional(_))),
+            "mismatched": mismatched,
+        })
+    });
+    let mut logs = serde_json::Map::new();
+    for log in Log::ALL {
+        let cov = view.cov(log);
+        let segments: Vec<Value> = view
+            .segments(log)
+            .into_iter()
+            .map(|segment| {
+                let upstreams: Vec<Value> = segment
+                    .upstreams
+                    .iter()
+                    .filter_map(|&pos| view.upstreams.get(pos))
+                    .map(|u| {
+                        json!({
+                            "server": &*u.name,
+                            "role": u.role.as_str(),
+                            "online": u.online,
+                            "sessions": u.connections.load(Ordering::Relaxed),
+                        })
+                    })
+                    .collect();
+                json!({
+                    "begin": segment.range.begin,
+                    "end": segment.range.end,
+                    "upstreams": upstreams,
+                })
+            })
+            .collect();
+        logs.insert(
+            log.as_str().to_string(),
+            json!({
+                "reported": range_json(cov.top),
+                "gaps": cov.gaps.iter().copied().map(range_json).collect::<Vec<_>>(),
+                "offline_only": cov.offline_only.iter().copied().map(range_json).collect::<Vec<_>>(),
+                "segments": segments,
+            }),
+        );
+    }
+    Some(json!({
+        "name": l.name,
+        "topology": topology_str(view.topology),
+        "generation": view.generation,
+        "head": pos_json(head),
+        "lib": pos_json(lib),
+        "chain_id": view.chain_id.map(|id| hex(&id)),
+        "status_ready": view.status_ready,
+        "frozen_unreported": view.frozen_unknown,
+        "abi": abi,
+        "logs": logs,
+    }))
+}
+
+fn topology_str(topology: ResolvedTopology) -> &'static str {
+    match topology {
+        ResolvedTopology::Pool => "pool",
+        ResolvedTopology::Stitched => "stitched",
+    }
 }
 
 fn format_labels(listener_name: Option<&str>, endpoint: &str, server_name: &str) -> String {
@@ -259,15 +569,51 @@ struct MetricSnapshot {
     /// Fingerprint (16 hex) and compatibility of the monitor's ABI, if seen.
     abi: Option<(String, bool)>,
     range_mismatch: bool,
+    /// Whether the ABI equals the listener's canonical ABI (stitched, once
+    /// both are known).
+    abi_match: Option<bool>,
+    /// The listener's statistics and this upstream's index in them.
+    stats: Option<(Arc<ListenerStats>, usize)>,
+}
+
+/// What a listener contributes to the per-listener series.
+struct ListenerSnapshot {
+    name: Option<String>,
+    hub: Arc<FleetHub>,
+    view: Arc<FleetView>,
+    head: Option<BlockPos>,
+    lib: Option<BlockPos>,
+    head_age: Duration,
 }
 
 async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
     let now = Instant::now();
     let mut snapshots = Vec::new();
+    let mut fleets = Vec::new();
     for l in listeners {
+        let view = l.hub.as_ref().map(|hub| hub.view());
+        if let (Some(hub), Some(view)) = (&l.hub, &view) {
+            let (head, lib) = hub.fresh_tip(view);
+            fleets.push(ListenerSnapshot {
+                name: l.name.clone(),
+                hub: hub.clone(),
+                view: view.clone(),
+                head,
+                lib,
+                head_age: hub.head_age(now),
+            });
+        }
+        let canonical = view
+            .as_ref()
+            .filter(|v| v.topology == ResolvedTopology::Stitched)
+            .and_then(|v| v.abi.as_ref().map(|abi| abi.fp));
         let mut db = l.state_db.lock().await;
         for (endpoint, state) in db.iter_mut() {
             snapshots.push(MetricSnapshot {
+                abi_match: canonical
+                    .zip(state.abi.as_ref())
+                    .map(|(canonical, abi)| abi.fp == canonical),
+                stats: l.hub.as_ref().map(|hub| (hub.stats.clone(), state.index)),
                 labels: format_labels(l.name.as_deref(), endpoint, &state.name),
                 online: state.online,
                 stale: state.stale,
@@ -483,7 +829,454 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
         }
     }
 
+    render_upstream_session_series(&mut out, &snapshots);
+    render_listener_series(&mut out, &fleets);
+
     out
+}
+
+fn header(out: &mut String, name: &str, kind: &str, help: &str) {
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+}
+
+/// Per-upstream series fed by the listener's sessions and fleet view.
+fn render_upstream_session_series(out: &mut String, snapshots: &[MetricSnapshot]) {
+    header(
+        out,
+        "fleet_router_upstream_abi_match",
+        "gauge",
+        "Whether an upstream's ABI equals the ABI its stitched listener serves (1) or not (0). Absent for pool listeners and until both are known.",
+    );
+    for s in snapshots {
+        if let Some(matches) = s.abi_match {
+            out.push_str(&format!(
+                "fleet_router_upstream_abi_match{{{}}} {}\n",
+                s.labels,
+                u8::from(matches)
+            ));
+        }
+    }
+
+    let with_stats = || {
+        snapshots.iter().filter_map(|s| {
+            let (stats, index) = s.stats.as_ref()?;
+            Some((s, stats.upstream(*index)?))
+        })
+    };
+
+    header(
+        out,
+        "fleet_router_upstream_links_total",
+        "counter",
+        "Upstream links opened by client sessions, by purpose.",
+    );
+    for (s, stats) in with_stats() {
+        for (purpose, n) in stats.links.values() {
+            out.push_str(&format!(
+                "fleet_router_upstream_links_total{{{},purpose=\"{}\"}} {n}\n",
+                s.labels,
+                purpose.as_str()
+            ));
+        }
+    }
+
+    header(
+        out,
+        "fleet_router_upstream_dial_failures_total",
+        "counter",
+        "Failed session dials to an upstream, by reason (busy is an HTTP 503 at the upgrade).",
+    );
+    for (s, stats) in with_stats() {
+        for (reason, n) in stats.dial_failures.values() {
+            out.push_str(&format!(
+                "fleet_router_upstream_dial_failures_total{{{},reason=\"{}\"}} {n}\n",
+                s.labels,
+                reason.as_str()
+            ));
+        }
+    }
+
+    header(
+        out,
+        "fleet_router_upstream_contract_violations_total",
+        "counter",
+        "Archive contract violations by a frozen upstream, by kind.",
+    );
+    for (s, stats) in with_stats().filter(|(s, _)| s.role == Role::Frozen) {
+        for (kind, n) in stats.contract_violations.values() {
+            out.push_str(&format!(
+                "fleet_router_upstream_contract_violations_total{{{},kind=\"{}\"}} {n}\n",
+                s.labels,
+                kind.as_str()
+            ));
+        }
+    }
+
+    header(
+        out,
+        "fleet_router_upstream_stalls_total",
+        "counter",
+        "Session links to an upstream that went silent while blocks were owed.",
+    );
+    for (s, stats) in with_stats() {
+        out.push_str(&format!(
+            "fleet_router_upstream_stalls_total{{{}}} {}\n",
+            s.labels,
+            stats.stalls.load(Ordering::Relaxed)
+        ));
+    }
+
+    header(
+        out,
+        "fleet_router_upstream_sequence_jumps_total",
+        "counter",
+        "Forward block jumps from a live upstream that sessions adopted.",
+    );
+    for (s, stats) in with_stats() {
+        out.push_str(&format!(
+            "fleet_router_upstream_sequence_jumps_total{{{}}} {}\n",
+            s.labels,
+            stats.sequence_jumps.load(Ordering::Relaxed)
+        ));
+    }
+}
+
+/// `{listener="x",<extra>}`, `{<extra>}`, or nothing in single-listener mode
+/// without extra labels.
+fn listener_labels(name: Option<&str>, extra: &str) -> String {
+    match (name, extra.is_empty()) {
+        (Some(name), true) => format!("{{listener=\"{}\"}}", escape(name)),
+        (Some(name), false) => format!("{{listener=\"{}\",{extra}}}", escape(name)),
+        (None, true) => String::new(),
+        (None, false) => format!("{{{extra}}}"),
+    }
+}
+
+/// One line per listener: `metric{labels} value`.
+fn per_listener(
+    out: &mut String,
+    fleets: &[ListenerSnapshot],
+    metric: &str,
+    extra: &str,
+    value: impl Fn(&ListenerSnapshot) -> Option<String>,
+) {
+    for f in fleets {
+        if let Some(v) = value(f) {
+            out.push_str(&format!(
+                "{metric}{} {v}\n",
+                listener_labels(f.name.as_deref(), extra)
+            ));
+        }
+    }
+}
+
+/// A counter family with one fixed label, for every listener.
+fn labeled_counter<L: MetricLabel>(
+    out: &mut String,
+    fleets: &[ListenerSnapshot],
+    metric: &str,
+    label: &str,
+    help: &str,
+    counter: impl Fn(&ListenerStats) -> &crate::fleet::LabeledCounter<L>,
+) {
+    header(out, metric, "counter", help);
+    for f in fleets {
+        for (value, n) in counter(&f.hub.stats).values() {
+            let extra = format!("{label}=\"{}\"", value.as_str());
+            out.push_str(&format!(
+                "{metric}{} {n}\n",
+                listener_labels(f.name.as_deref(), &extra)
+            ));
+        }
+    }
+}
+
+/// A plain counter for every listener.
+fn plain_counter(
+    out: &mut String,
+    fleets: &[ListenerSnapshot],
+    metric: &str,
+    help: &str,
+    counter: impl Fn(&ListenerStats) -> &std::sync::atomic::AtomicU64,
+) {
+    header(out, metric, "counter", help);
+    per_listener(out, fleets, metric, "", |f| {
+        Some(counter(&f.hub.stats).load(Ordering::Relaxed).to_string())
+    });
+}
+
+/// Per-listener series: the fleet tip and coverage, session states and the
+/// session counters.
+fn render_listener_series(out: &mut String, fleets: &[ListenerSnapshot]) {
+    header(
+        out,
+        "fleet_router_fleet_head_block",
+        "gauge",
+        "Fleet head block: what a stitched listener's status reports (0 until known).",
+    );
+    per_listener(out, fleets, "fleet_router_fleet_head_block", "", |f| {
+        Some(f.head.map_or(0, |p| p.num).to_string())
+    });
+    header(
+        out,
+        "fleet_router_fleet_lib_block",
+        "gauge",
+        "Fleet last irreversible block (0 until known). Never decreases.",
+    );
+    per_listener(out, fleets, "fleet_router_fleet_lib_block", "", |f| {
+        Some(f.lib.map_or(0, |p| p.num).to_string())
+    });
+    header(
+        out,
+        "fleet_router_fleet_head_age_seconds",
+        "gauge",
+        "Seconds since the fleet head last advanced (since startup while no head is known).",
+    );
+    per_listener(
+        out,
+        fleets,
+        "fleet_router_fleet_head_age_seconds",
+        "",
+        |f| Some(format!("{:.3}", f.head_age.as_secs_f64())),
+    );
+
+    let per_log = |out: &mut String,
+                   metric: &str,
+                   help: &str,
+                   logs: &[Log],
+                   value: &dyn Fn(&FleetView, Log) -> Option<String>| {
+        header(out, metric, "gauge", help);
+        for f in fleets {
+            for &log in logs {
+                if let Some(v) = value(&f.view, log) {
+                    let extra = format!("log=\"{}\"", log.as_str());
+                    out.push_str(&format!(
+                        "{metric}{} {v}\n",
+                        listener_labels(f.name.as_deref(), &extra)
+                    ));
+                }
+            }
+        }
+    };
+    per_log(
+        out,
+        "fleet_router_fleet_coverage_begin_block",
+        "First block of the top coverage component of a log (what status reports; 0 if none).",
+        &Log::ALL,
+        &|v, log| Some(v.cov(log).top.begin.to_string()),
+    );
+    per_log(
+        out,
+        "fleet_router_fleet_coverage_end_block",
+        "One past the last block of the top coverage component of a log (0 if none).",
+        &Log::ALL,
+        &|v, log| Some(v.cov(log).top.end.to_string()),
+    );
+    per_log(
+        out,
+        "fleet_router_fleet_coverage_gaps",
+        "Holes in a log's coverage below its top component.",
+        &Log::ALL,
+        &|v, log| Some(v.cov(log).gaps.len().to_string()),
+    );
+    per_log(
+        out,
+        "fleet_router_fleet_offline_coverage_blocks",
+        "Blocks of a log's top coverage component that no online upstream covers.",
+        &Log::ALL,
+        &|v, log| Some(v.cov(log).offline_blocks().to_string()),
+    );
+    per_log(
+        out,
+        "fleet_router_fleet_live_overlap_blocks",
+        "Highest frozen end minus lowest online live begin. Negative means a hole between the archives and the live tier.",
+        &[Log::Trace, Log::ChainState],
+        &|v, log| {
+            let slot = usize::from(log == Log::ChainState);
+            v.live_overlap[slot].map(|n| n.to_string())
+        },
+    );
+
+    header(
+        out,
+        "fleet_router_fleet_frozen_unreported",
+        "gauge",
+        "Enabled frozen upstreams that have neither reported nor declared a range.",
+    );
+    per_listener(
+        out,
+        fleets,
+        "fleet_router_fleet_frozen_unreported",
+        "",
+        |f| Some(f.view.frozen_unknown.to_string()),
+    );
+
+    header(
+        out,
+        "fleet_router_sessions",
+        "gauge",
+        "Client sessions by state.",
+    );
+    for f in fleets {
+        for &state in SessionGauge::ALL {
+            let extra = format!("state=\"{}\"", state.as_str());
+            out.push_str(&format!(
+                "fleet_router_sessions{} {}\n",
+                listener_labels(f.name.as_deref(), &extra),
+                f.hub.stats.sessions(state)
+            ));
+        }
+    }
+
+    header(
+        out,
+        "fleet_router_status_replies_total",
+        "counter",
+        "Status replies sent to clients, by request version and by who encoded them.",
+    );
+    for f in fleets {
+        for (v1, version) in [(false, "v0"), (true, "v1")] {
+            for (from_router, source) in [(true, "router"), (false, "upstream")] {
+                let extra = format!("version=\"{version}\",source=\"{source}\"");
+                out.push_str(&format!(
+                    "fleet_router_status_replies_total{} {}\n",
+                    listener_labels(f.name.as_deref(), &extra),
+                    f.hub.stats.status_replies(v1, from_router)
+                ));
+            }
+        }
+    }
+
+    plain_counter(
+        out,
+        fleets,
+        "fleet_router_handoffs_total",
+        "Planned handoffs from one upstream to the next at a range boundary.",
+        |s| &s.handoffs,
+    );
+
+    let metric = "fleet_router_handoff_latency_seconds";
+    header(
+        out,
+        metric,
+        "histogram",
+        "Time from the last frame of the old link to the first frame of the new link at a handoff.",
+    );
+    for f in fleets {
+        let snap = f.hub.stats.handoff_latency.snapshot();
+        let name = f.name.as_deref();
+        for (le, n) in &snap.cumulative {
+            out.push_str(&format!(
+                "{metric}_bucket{} {n}\n",
+                listener_labels(name, &format!("le=\"{le}\""))
+            ));
+        }
+        out.push_str(&format!(
+            "{metric}_bucket{} {}\n",
+            listener_labels(name, "le=\"+Inf\""),
+            snap.count
+        ));
+        out.push_str(&format!(
+            "{metric}_sum{} {}\n",
+            listener_labels(name, ""),
+            snap.sum_seconds
+        ));
+        out.push_str(&format!(
+            "{metric}_count{} {}\n",
+            listener_labels(name, ""),
+            snap.count
+        ));
+    }
+
+    labeled_counter(
+        out,
+        fleets,
+        "fleet_router_failovers_total",
+        "reason",
+        "Session failovers to another upstream link, by reason.",
+        |s| &s.failovers,
+    );
+    plain_counter(
+        out,
+        fleets,
+        "fleet_router_reroutes_total",
+        "Pool sessions moved to another upstream before forwarding a get_blocks request.",
+        |s| &s.reroutes,
+    );
+    plain_counter(
+        out,
+        fleets,
+        "fleet_router_duplicates_dropped_total",
+        "Replayed results dropped after a failover (each refunded upstream with an ack).",
+        |s| &s.duplicates_dropped,
+    );
+    plain_counter(
+        out,
+        fleets,
+        "fleet_router_fork_redeliveries_total",
+        "Results for an already delivered block number with a new id (fork switch), forwarded.",
+        |s| &s.fork_redeliveries,
+    );
+    plain_counter(
+        out,
+        fleets,
+        "fleet_router_keepalives_total",
+        "Head-only keep-alive results from legacy upstreams forwarded to clients.",
+        |s| &s.keepalives,
+    );
+    plain_counter(
+        out,
+        fleets,
+        "fleet_router_credit_overruns_total",
+        "Results forwarded while the client had no credit left. Stays 0 with Spring upstreams.",
+        |s| &s.credit_overruns,
+    );
+    plain_counter(
+        out,
+        fleets,
+        "fleet_router_patched_results_total",
+        "Results whose head or LIB the router rewrote.",
+        |s| &s.patched_results,
+    );
+    labeled_counter(
+        out,
+        fleets,
+        "fleet_router_holds_total",
+        "why",
+        "Sessions that started holding for a block no upstream could serve yet, by reason.",
+        |s| &s.holds,
+    );
+    labeled_counter(
+        out,
+        fleets,
+        "fleet_router_hold_closes_total",
+        "why",
+        "Sessions closed with 1011 after holding for gap_wait_ms, by reason.",
+        |s| &s.hold_closes,
+    );
+    labeled_counter(
+        out,
+        fleets,
+        "fleet_router_predials_total",
+        "result",
+        "Standby links opened ahead of a handoff, by outcome.",
+        |s| &s.predials,
+    );
+    labeled_counter(
+        out,
+        fleets,
+        "fleet_router_client_protocol_errors_total",
+        "kind",
+        "Client frames that were not a valid SHiP request, by kind.",
+        |s| &s.client_protocol_errors,
+    );
+    plain_counter(
+        out,
+        fleets,
+        "fleet_router_too_large_closes_total",
+        "Clients closed because an upstream message exceeded max_message_bytes.",
+        |s| &s.too_large_closes,
+    );
 }
 
 /// Prometheus text-format label value. Backslash is replaced first so the
@@ -512,6 +1305,7 @@ mod tests {
         let listeners = vec![ListenerHealthState {
             name: None,
             state_db: db.clone(),
+            hub: None,
         }];
 
         let (status, _, body) = evaluate_overall_readiness(&listeners).await;
@@ -563,10 +1357,12 @@ mod tests {
             ListenerHealthState {
                 name: Some("eos".to_string()),
                 state_db: db_eos.clone(),
+                hub: None,
             },
             ListenerHealthState {
                 name: Some("wax".to_string()),
                 state_db: db_wax.clone(),
+                hub: None,
             },
         ];
 
@@ -647,10 +1443,12 @@ mod tests {
             ListenerHealthState {
                 name: None,
                 state_db: legacy,
+                hub: None,
             },
             ListenerHealthState {
                 name: Some("wax\"main".to_string()),
                 state_db: named,
+                hub: None,
             },
         ];
         let metrics = render_metrics(&listeners).await;
@@ -696,6 +1494,7 @@ mod tests {
         let listeners = vec![ListenerHealthState {
             name: Some("eos".to_string()),
             state_db: db_eos,
+            hub: None,
         }];
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -772,10 +1571,12 @@ mod tests {
             ListenerHealthState {
                 name: None,
                 state_db: legacy,
+                hub: None,
             },
             ListenerHealthState {
                 name: Some("wax".to_string()),
                 state_db: named,
+                hub: None,
             },
         ];
         let metrics = render_metrics(&listeners).await;
@@ -909,6 +1710,7 @@ mod tests {
         let listeners = vec![ListenerHealthState {
             name: Some("eos".to_string()),
             state_db: db,
+            hub: None,
         }];
         let metrics = render_metrics(&listeners).await;
         {
@@ -1000,6 +1802,7 @@ mod tests {
             vec![ListenerHealthState {
                 name: name.map(str::to_string),
                 state_db: db.clone(),
+                hub: None,
             }]
         };
 
@@ -1067,5 +1870,598 @@ mod tests {
         assert!(metrics.contains(
             "fleet_router_upstream_range_mismatch{endpoint=\"127.0.0.1:18081\",server=\"archive\"} 1\n"
         ));
+    }
+
+    mod fleet {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        use super::*;
+        use crate::abi::AbiEntry;
+        use crate::fleet::{FailoverReason, HoldWhy, LinkPurpose};
+        use crate::models::{build_config_db, ResolvedListener, ServerState, StitchingPolicy};
+
+        const ARCHIVE_A: &str = "127.0.0.1:19000";
+        const ARCHIVE_B: &str = "127.0.0.1:19001";
+        const LIVE: &str = "127.0.0.1:19002";
+
+        fn frozen(name: &str, endpoint: &str, range: Option<(u32, u32)>) -> Server {
+            Server {
+                name: name.to_string(),
+                endpoint: endpoint.to_string(),
+                enabled: true,
+                role: Role::Frozen,
+                range: range.map(|(begin, end)| Range { begin, end }),
+                ..Default::default()
+            }
+        }
+
+        fn live(name: &str, endpoint: &str) -> Server {
+            Server {
+                name: name.to_string(),
+                endpoint: endpoint.to_string(),
+                enabled: true,
+                ..Default::default()
+            }
+        }
+
+        fn listener_state(
+            name: Option<&str>,
+            topology: ResolvedTopology,
+            servers: Vec<Server>,
+        ) -> ListenerHealthState {
+            let db = build_state_db(servers.clone());
+            let resolved = ResolvedListener {
+                name: name.map(str::to_string),
+                listen_address: "127.0.0.1".to_string(),
+                listen_port: 17000,
+                max_connections: 10,
+                expected_chain_id: Some([7; 32]),
+                require_chain_id: false,
+                block_failure_quarantine: None,
+                servers: servers.clone(),
+                topology,
+                stitching: StitchingPolicy::default(),
+                abi_pin: None,
+            };
+            let hub = FleetHub::new(&resolved, db.clone(), build_config_db(servers));
+            ListenerHealthState {
+                name: name.map(str::to_string),
+                state_db: db,
+                hub: Some(hub),
+            }
+        }
+
+        fn pos(num: u32) -> BlockPos {
+            BlockPos {
+                num,
+                id: [num as u8; 32],
+            }
+        }
+
+        fn report(state: &mut ServerState, begin: u32, end: u32, head: u32, lib: u32) {
+            state.online = true;
+            state.ranges_known = true;
+            state.trace_begin_block = begin;
+            state.trace_end_block = end;
+            state.chain_state_begin_block = begin;
+            state.chain_state_end_block = end;
+            state.head = Some(pos(head));
+            state.lib = Some(pos(lib));
+            state.offline_since = None;
+        }
+
+        /// Apply `f` to the listener's state map, then rebuild its view.
+        async fn update(
+            l: &ListenerHealthState,
+            f: impl FnOnce(&mut HashMap<String, ServerState>),
+        ) {
+            let mut db = l.state_db.lock().await;
+            f(&mut db);
+            l.hub.as_ref().unwrap().rebuild(&db);
+        }
+
+        /// A = frozen [2,1001), B = frozen [1001,2001), both declared; C live.
+        fn stitched(name: Option<&str>) -> ListenerHealthState {
+            listener_state(
+                name,
+                ResolvedTopology::Stitched,
+                vec![
+                    frozen("archive-a", ARCHIVE_A, Some((2, 1001))),
+                    frozen("archive-b", ARCHIVE_B, Some((1001, 2001))),
+                    live("live-1", LIVE),
+                ],
+            )
+        }
+
+        /// B and C report; A stays down (declared only).
+        async fn archive_a_down(l: &ListenerHealthState) {
+            update(l, |db| {
+                report(db.get_mut(ARCHIVE_B).unwrap(), 1001, 2001, 2000, 2000);
+                report(db.get_mut(LIVE).unwrap(), 1900, 2301, 2300, 2290);
+            })
+            .await;
+        }
+
+        async fn get(listeners: &[ListenerHealthState], path: &str) -> (String, String) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let pools = listeners.to_vec();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                handle_request(stream, &pools).await.unwrap();
+            });
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut resp = String::new();
+            client.read_to_string(&mut resp).await.unwrap();
+            server.await.unwrap();
+            let (head, body) = resp.split_once("\r\n\r\n").unwrap();
+            (head.lines().next().unwrap().to_string(), body.to_string())
+        }
+
+        #[tokio::test]
+        async fn readiness_matrix_for_pool_stitched_and_archive_only_listeners() {
+            // HE1, pool: unchanged, and history readiness is tip readiness.
+            let pool = listener_state(
+                Some("pool"),
+                ResolvedTopology::Pool,
+                vec![live("a", "127.0.0.1:18080")],
+            );
+            let pools = vec![pool.clone()];
+            for path in ["/ready/pool", "/ready/pool?scope=history"] {
+                let (status, body) = get(&pools, path).await;
+                assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+                assert_eq!(body, "not ready (pool): no upstreams online\n");
+            }
+            update(&pool, |db| {
+                db.get_mut("127.0.0.1:18080").unwrap().online = true;
+            })
+            .await;
+            for path in [
+                "/ready/pool",
+                "/ready/pool?scope=history",
+                "/ready?scope=tip",
+            ] {
+                assert_eq!(get(&pools, path).await.0, "HTTP/1.1 200 OK", "{path}");
+            }
+
+            // Stitched: the tip is servable with live online and an archive down,
+            // history is not, and the body names the archive's segment.
+            let main = stitched(Some("main"));
+            let listeners = vec![main.clone()];
+            let (status, body) = get(&listeners, "/ready/main").await;
+            assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+            assert_eq!(body, "not ready (main): no live upstreams online\n");
+            archive_a_down(&main).await;
+            let (status, body) = get(&listeners, "/ready/main").await;
+            assert_eq!(status, "HTTP/1.1 200 OK");
+            assert_eq!(body, "ready (main): 2 upstream(s) online\n");
+            assert_eq!(get(&listeners, "/ready").await.0, "HTTP/1.1 200 OK");
+            let (status, body) = get(&listeners, "/ready/main?scope=history").await;
+            assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+            assert_eq!(
+                body,
+                "not ready (main): segment [2,1001) has no online upstream (trace, chain_state)\n"
+            );
+            let (status, body) = get(&listeners, "/readyz?scope=history").await;
+            assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+            assert_eq!(
+                body,
+                "not ready: main: segment [2,1001) has no online upstream (trace, chain_state)\n"
+            );
+            let (status, _) = get(&listeners, "/ready?scope=everything").await;
+            assert_eq!(status, "HTTP/1.1 400 Bad Request");
+
+            // A returns: history is complete.
+            update(&main, |db| {
+                report(db.get_mut(ARCHIVE_A).unwrap(), 2, 1001, 1000, 1000);
+            })
+            .await;
+            assert_eq!(
+                get(&listeners, "/ready/main?scope=history").await.0,
+                "HTTP/1.1 200 OK"
+            );
+
+            // The live tier goes down: archives alone do not make the tip ready.
+            update(&main, |db| {
+                db.get_mut(LIVE).unwrap().mark_offline(Instant::now());
+            })
+            .await;
+            let (status, body) = get(&listeners, "/ready/main").await;
+            assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+            assert_eq!(body, "not ready (main): no live upstreams online\n");
+
+            // A hole and an unreported, undeclared archive.
+            let holes = listener_state(
+                Some("holes"),
+                ResolvedTopology::Stitched,
+                vec![
+                    frozen("archive-a", ARCHIVE_A, Some((2, 1001))),
+                    frozen("archive-b", ARCHIVE_B, Some((1101, 2001))),
+                    frozen("archive-c", "127.0.0.1:19003", None),
+                    live("live-1", LIVE),
+                ],
+            );
+            update(&holes, |db| {
+                report(db.get_mut(ARCHIVE_A).unwrap(), 2, 1001, 1000, 1000);
+                report(db.get_mut(ARCHIVE_B).unwrap(), 1101, 2001, 2000, 2000);
+                report(db.get_mut(LIVE).unwrap(), 1900, 2301, 2300, 2290);
+            })
+            .await;
+            let (status, body) = get(&[holes], "/ready/holes?scope=history").await;
+            assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+            assert_eq!(
+                body,
+                "not ready (holes): gap [1001,1101) has no upstream (trace, chain_state); \
+                 1 frozen upstream(s) have neither reported nor declared a range\n"
+            );
+
+            // Archive-only: any online upstream makes the tip ready.
+            let archive = listener_state(
+                None,
+                ResolvedTopology::Stitched,
+                vec![frozen("archive-a", ARCHIVE_A, Some((2, 1001)))],
+            );
+            let only = vec![archive.clone()];
+            let (status, body) = get(&only, "/ready").await;
+            assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+            assert_eq!(body, "not ready: no upstreams online\n");
+            update(&archive, |db| {
+                report(db.get_mut(ARCHIVE_A).unwrap(), 2, 1001, 1000, 1000);
+            })
+            .await;
+            assert_eq!(
+                get(&only, "/ready").await,
+                (
+                    "HTTP/1.1 200 OK".to_string(),
+                    "ready: 1 upstream(s) online\n".to_string()
+                )
+            );
+            assert_eq!(
+                get(&only, "/ready?scope=history").await.0,
+                "HTTP/1.1 200 OK"
+            );
+
+            // Overall readiness is the AND of every listener's tip readiness.
+            let both = vec![pool, main];
+            let (status, body) = get(&both, "/ready").await;
+            assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+            assert_eq!(body, "not ready: main: no live upstreams online\n");
+        }
+
+        #[tokio::test]
+        async fn coverage_endpoint_reports_segments_tip_and_abi() {
+            // HE2
+            let main = stitched(Some("main"));
+            archive_a_down(&main).await;
+            let abi = Arc::new(AbiEntry::new(include_str!(
+                "../mock-ship/src/ship_abi.json"
+            )));
+            update(&main, |db| {
+                db.get_mut(LIVE).unwrap().abi = Some(abi.clone());
+                db.get_mut(ARCHIVE_B).unwrap().abi = Some(Arc::new(AbiEntry::new("{}")));
+                db.get_mut(LIVE)
+                    .unwrap()
+                    .connections
+                    .store(3, Ordering::Relaxed);
+            })
+            .await;
+            let listeners = vec![main, stitched(Some("other"))];
+
+            let (status, body) = get(&listeners, "/coverage").await;
+            assert_eq!(status, "HTTP/1.1 200 OK");
+            let all: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(all["listeners"].as_array().unwrap().len(), 2);
+
+            let (status, body) = get(&listeners, "/coverage/main").await;
+            assert_eq!(status, "HTTP/1.1 200 OK");
+            let doc: Value = serde_json::from_str(&body).unwrap();
+            let l = &doc["listeners"][0];
+            assert_eq!(doc["listeners"].as_array().unwrap().len(), 1);
+            assert_eq!(l["name"], "main");
+            assert_eq!(l["topology"], "stitched");
+            assert!(l["generation"].as_u64().unwrap() >= 2);
+            assert_eq!(l["head"]["num"], 2300);
+            assert_eq!(l["head"]["id"].as_str().unwrap().len(), 64);
+            assert_eq!(l["lib"]["num"], 2290);
+            assert_eq!(l["chain_id"], "07".repeat(32));
+            assert_eq!(l["status_ready"], true);
+            assert_eq!(l["frozen_unreported"], 0);
+            assert_eq!(l["abi"]["fingerprint"], abi.fp_hex());
+            assert_eq!(l["abi"]["source"], "live-1");
+            assert_eq!(l["abi"]["mismatched"], json!(["archive-b"]));
+
+            let trace = &l["logs"]["trace"];
+            assert_eq!(trace["reported"], json!({ "begin": 2, "end": 2301 }));
+            assert_eq!(trace["gaps"], json!([]));
+            assert_eq!(trace["offline_only"], json!([{ "begin": 2, "end": 1001 }]));
+            assert_eq!(
+                trace["segments"],
+                json!([
+                    { "begin": 2, "end": 1001, "upstreams": [
+                        { "server": "archive-a", "role": "frozen", "online": false, "sessions": 0 } ] },
+                    { "begin": 1001, "end": 1900, "upstreams": [
+                        { "server": "archive-b", "role": "frozen", "online": true, "sessions": 0 } ] },
+                    { "begin": 1900, "end": 2001, "upstreams": [
+                        { "server": "archive-b", "role": "frozen", "online": true, "sessions": 0 },
+                        { "server": "live-1", "role": "live", "online": true, "sessions": 3 } ] },
+                    { "begin": 2001, "end": 2301, "upstreams": [
+                        { "server": "live-1", "role": "live", "online": true, "sessions": 3 } ] },
+                ])
+            );
+            assert_eq!(
+                l["logs"]["chain_state"]["reported"],
+                json!({ "begin": 2, "end": 2301 })
+            );
+            assert_eq!(
+                l["logs"]["finality"]["reported"],
+                json!({ "begin": 0, "end": 0 })
+            );
+            assert_eq!(l["logs"]["finality"]["segments"], json!([]));
+
+            // The other listener has seen nothing yet.
+            let (_, body) = get(&listeners, "/coverage/other").await;
+            let other: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(other["listeners"][0]["head"], Value::Null);
+            assert_eq!(other["listeners"][0]["status_ready"], false);
+            assert_eq!(other["listeners"][0]["abi"], Value::Null);
+
+            assert_eq!(
+                get(&listeners, "/coverage/missing").await.0,
+                "HTTP/1.1 404 Not Found"
+            );
+            assert_eq!(
+                get(&listeners, "/coverage/").await.0,
+                "HTTP/1.1 404 Not Found"
+            );
+
+            // Single-listener mode: no name, and pool topology.
+            let pool = listener_state(
+                None,
+                ResolvedTopology::Pool,
+                vec![live("a", "127.0.0.1:18080")],
+            );
+            let (_, body) = get(&[pool], "/coverage").await;
+            let doc: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(doc["listeners"][0]["name"], Value::Null);
+            assert_eq!(doc["listeners"][0]["topology"], "pool");
+        }
+
+        #[tokio::test]
+        async fn listener_series_render_with_and_without_the_listener_label() {
+            // HE3
+            for name in [None, Some("main")] {
+                let l = stitched(name);
+                archive_a_down(&l).await;
+                let abi = Arc::new(AbiEntry::new(include_str!(
+                    "../mock-ship/src/ship_abi.json"
+                )));
+                update(&l, |db| {
+                    db.get_mut(LIVE).unwrap().abi = Some(abi.clone());
+                    db.get_mut(ARCHIVE_B).unwrap().abi = Some(Arc::new(AbiEntry::new("{}")));
+                })
+                .await;
+                let hub = l.hub.clone().unwrap();
+                let stats = &hub.stats;
+                stats.session_moved(None, Some(SessionGauge::Streaming));
+                stats.failovers.inc(FailoverReason::Clean);
+                stats.holds.add(HoldWhy::AtCapacity, 2);
+                stats.status_reply(true, true);
+                stats.handoffs.fetch_add(1, Ordering::Relaxed);
+                stats.handoff_latency.observe(Duration::from_micros(500));
+                stats.handoff_latency.observe(Duration::from_millis(30));
+                stats.handoff_latency.observe(Duration::from_secs(20));
+                stats.upstream(1).unwrap().links.inc(LinkPurpose::Handoff);
+                stats
+                    .upstream(1)
+                    .unwrap()
+                    .contract_violations
+                    .inc(crate::fleet::ContractViolation::Gap);
+                stats
+                    .upstream(2)
+                    .unwrap()
+                    .sequence_jumps
+                    .fetch_add(4, Ordering::Relaxed);
+
+                let metrics = render_metrics(std::slice::from_ref(&l)).await;
+                let lab = |extra: &str| listener_labels(name, extra);
+                let up = |endpoint: &str, server: &str, extra: &str| {
+                    let base = format_labels(name, endpoint, server);
+                    if extra.is_empty() {
+                        format!("{{{base}}}")
+                    } else {
+                        format!("{{{base},{extra}}}")
+                    }
+                };
+                let expected = [
+                    format!("fleet_router_fleet_head_block{} 2300\n", lab("")),
+                    format!("fleet_router_fleet_lib_block{} 2290\n", lab("")),
+                    format!(
+                        "fleet_router_fleet_coverage_begin_block{} 2\n",
+                        lab("log=\"trace\"")
+                    ),
+                    format!(
+                        "fleet_router_fleet_coverage_end_block{} 2301\n",
+                        lab("log=\"chain_state\"")
+                    ),
+                    format!(
+                        "fleet_router_fleet_coverage_end_block{} 0\n",
+                        lab("log=\"finality\"")
+                    ),
+                    format!(
+                        "fleet_router_fleet_coverage_gaps{} 0\n",
+                        lab("log=\"trace\"")
+                    ),
+                    format!(
+                        "fleet_router_fleet_offline_coverage_blocks{} 999\n",
+                        lab("log=\"trace\"")
+                    ),
+                    format!(
+                        "fleet_router_fleet_live_overlap_blocks{} 101\n",
+                        lab("log=\"chain_state\"")
+                    ),
+                    format!("fleet_router_fleet_frozen_unreported{} 0\n", lab("")),
+                    format!("fleet_router_sessions{} 1\n", lab("state=\"streaming\"")),
+                    format!("fleet_router_sessions{} 0\n", lab("state=\"holding\"")),
+                    format!(
+                        "fleet_router_status_replies_total{} 1\n",
+                        lab("version=\"v1\",source=\"router\"")
+                    ),
+                    format!(
+                        "fleet_router_status_replies_total{} 0\n",
+                        lab("version=\"v0\",source=\"upstream\"")
+                    ),
+                    format!("fleet_router_handoffs_total{} 1\n", lab("")),
+                    format!(
+                        "fleet_router_handoff_latency_seconds_bucket{} 1\n",
+                        lab("le=\"0.001\"")
+                    ),
+                    format!(
+                        "fleet_router_handoff_latency_seconds_bucket{} 2\n",
+                        lab("le=\"0.05\"")
+                    ),
+                    format!(
+                        "fleet_router_handoff_latency_seconds_bucket{} 2\n",
+                        lab("le=\"10\"")
+                    ),
+                    format!(
+                        "fleet_router_handoff_latency_seconds_bucket{} 3\n",
+                        lab("le=\"+Inf\"")
+                    ),
+                    format!(
+                        "fleet_router_handoff_latency_seconds_sum{} 20.0305\n",
+                        lab("")
+                    ),
+                    format!("fleet_router_handoff_latency_seconds_count{} 3\n", lab("")),
+                    format!(
+                        "fleet_router_failovers_total{} 1\n",
+                        lab("reason=\"clean\"")
+                    ),
+                    format!("fleet_router_failovers_total{} 0\n", lab("reason=\"send\"")),
+                    format!("fleet_router_holds_total{} 2\n", lab("why=\"at_capacity\"")),
+                    format!("fleet_router_hold_closes_total{} 0\n", lab("why=\"busy\"")),
+                    format!(
+                        "fleet_router_predials_total{} 0\n",
+                        lab("result=\"discarded\"")
+                    ),
+                    format!(
+                        "fleet_router_client_protocol_errors_total{} 0\n",
+                        lab("kind=\"unknown_variant\"")
+                    ),
+                    format!("fleet_router_too_large_closes_total{} 0\n", lab("")),
+                    format!("fleet_router_credit_overruns_total{} 0\n", lab("")),
+                    format!(
+                        "fleet_router_upstream_links_total{} 1\n",
+                        up(ARCHIVE_B, "archive-b", "purpose=\"handoff\"")
+                    ),
+                    format!(
+                        "fleet_router_upstream_dial_failures_total{} 0\n",
+                        up(LIVE, "live-1", "reason=\"busy\"")
+                    ),
+                    format!(
+                        "fleet_router_upstream_contract_violations_total{} 1\n",
+                        up(ARCHIVE_B, "archive-b", "kind=\"gap\"")
+                    ),
+                    format!(
+                        "fleet_router_upstream_sequence_jumps_total{} 4\n",
+                        up(LIVE, "live-1", "")
+                    ),
+                    format!(
+                        "fleet_router_upstream_stalls_total{} 0\n",
+                        up(ARCHIVE_A, "archive-a", "")
+                    ),
+                    format!(
+                        "fleet_router_upstream_abi_match{} 1\n",
+                        up(LIVE, "live-1", "")
+                    ),
+                    format!(
+                        "fleet_router_upstream_abi_match{} 0\n",
+                        up(ARCHIVE_B, "archive-b", "")
+                    ),
+                ];
+                for line in expected {
+                    assert!(metrics.contains(&line), "missing {line:?} in:\n{metrics}");
+                }
+                assert!(
+                    !metrics.contains(&format!(
+                        "fleet_router_upstream_contract_violations_total{}",
+                        up(LIVE, "live-1", "kind=\"gap\"")
+                    )),
+                    "violations are frozen-only"
+                );
+                assert!(
+                    !metrics.contains(&format!(
+                        "fleet_router_upstream_abi_match{}",
+                        up(ARCHIVE_A, "archive-a", "")
+                    )),
+                    "no ABI seen for archive-a"
+                );
+                for (name, kind) in [
+                    ("fleet_router_fleet_head_block", "gauge"),
+                    ("fleet_router_fleet_head_age_seconds", "gauge"),
+                    ("fleet_router_fleet_live_overlap_blocks", "gauge"),
+                    ("fleet_router_sessions", "gauge"),
+                    ("fleet_router_handoff_latency_seconds", "histogram"),
+                    ("fleet_router_failovers_total", "counter"),
+                    ("fleet_router_reroutes_total", "counter"),
+                    ("fleet_router_duplicates_dropped_total", "counter"),
+                    ("fleet_router_fork_redeliveries_total", "counter"),
+                    ("fleet_router_keepalives_total", "counter"),
+                    ("fleet_router_patched_results_total", "counter"),
+                    ("fleet_router_upstream_links_total", "counter"),
+                    ("fleet_router_upstream_abi_match", "gauge"),
+                ] {
+                    assert_eq!(
+                        metrics.matches(&format!("# TYPE {name} {kind}\n")).count(),
+                        1,
+                        "one TYPE line for {name}"
+                    );
+                }
+                let age = metrics
+                    .lines()
+                    .find(|line| line.starts_with("fleet_router_fleet_head_age_seconds"))
+                    .unwrap();
+                let secs: f64 = age.rsplit(' ').next().unwrap().parse().unwrap();
+                assert!(secs < 5.0, "{age}");
+                if name.is_none() {
+                    assert!(metrics.contains("fleet_router_fleet_head_block 2300\n"));
+                    assert!(!metrics.contains("fleet_router_fleet_head_block{"));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn pool_listeners_have_no_abi_match_series() {
+            let pool = listener_state(
+                None,
+                ResolvedTopology::Pool,
+                vec![live("a", "127.0.0.1:18080")],
+            );
+            update(&pool, |db| {
+                let s = db.get_mut("127.0.0.1:18080").unwrap();
+                s.online = true;
+                s.abi = Some(Arc::new(AbiEntry::new("{}")));
+            })
+            .await;
+            let metrics = render_metrics(&[pool]).await;
+            assert!(!metrics.contains("fleet_router_upstream_abi_match{"));
+            assert!(metrics.contains(
+                "fleet_router_upstream_links_total{endpoint=\"127.0.0.1:18080\",server=\"a\",purpose=\"initial\"} 0\n"
+            ));
+            assert!(metrics.contains("fleet_router_fleet_coverage_gaps{log=\"trace\"} 0\n"));
+        }
+
+        #[test]
+        fn scope_parsing() {
+            assert_eq!(parse_scope(None), Ok(Scope::Tip));
+            assert_eq!(parse_scope(Some("probe=k8s&v=1")), Ok(Scope::Tip));
+            assert_eq!(parse_scope(Some("scope=tip")), Ok(Scope::Tip));
+            assert_eq!(parse_scope(Some("v=1&scope=history")), Ok(Scope::History));
+            assert_eq!(parse_scope(Some("scope=all")), Err("all".to_string()));
+        }
     }
 }

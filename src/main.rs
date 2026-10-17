@@ -30,6 +30,7 @@ use tracing::Instrument;
 
 use crate::config_sample::CONFIG_SAMPLE;
 use crate::connection_handler::handle_client;
+use crate::fleet::FleetHub;
 use crate::models::{
     build_config_db, build_state_db_with_chain_id, format_bind_addr, ServerConfig, ServerConfigDb,
     ServerStateDb, StaticConfig,
@@ -136,10 +137,18 @@ async fn main() -> Result<()> {
             listener_cfg.expected_chain_id,
             listener_cfg.require_chain_id,
         );
+        // The listener's fleet view: monitors publish into it, the metrics
+        // endpoint reads it.
+        let hub = FleetHub::new(
+            &listener_cfg,
+            server_state_db.clone(),
+            server_config_db.clone(),
+        );
 
         health_states.push(health::ListenerHealthState {
             name: listener_cfg.name.clone(),
             state_db: server_state_db.clone(),
+            hub: Some(hub.clone()),
         });
 
         // Per-upstream monitoring loops for this listener's pool.
@@ -164,14 +173,14 @@ async fn main() -> Result<()> {
             spawn(monitoring_connection(
                 server,
                 static_config.clone(),
-                server_state_db.clone(),
+                hub.clone(),
                 shutdown_tx.subscribe(),
             ));
         }
 
         // Periodic block-progress / staleness monitor for this listener's pool.
         spawn(state_monitoring_loop(
-            server_state_db.clone(),
+            hub,
             static_config.upstream_monitoring_ms,
             shutdown_tx.subscribe(),
         ));

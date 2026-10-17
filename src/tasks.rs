@@ -15,6 +15,7 @@ use tokio_tungstenite::{
 use tungstenite::protocol::WebSocketConfig;
 
 use crate::abi::{accept_upstream_abi, AbiEntry};
+use crate::fleet::FleetHub;
 use crate::models::{Role, Server, ServerState, ServerStateDb, StaticConfig};
 use crate::ship::BlockPos;
 use crate::zcd;
@@ -34,7 +35,7 @@ const STATUS_V1_MISS_LIMIT: u32 = 2;
 
 /// Periodically log per-upstream block progress and flag stale upstreams.
 pub async fn state_monitoring_loop(
-    server_state_db: ServerStateDb,
+    hub: Arc<FleetHub>,
     interval_ms: u64,
     mut shutdown: broadcast::Receiver<()>,
 ) {
@@ -46,8 +47,10 @@ pub async fn state_monitoring_loop(
             _ = sleep(Duration::from_millis(interval_ms)) => {}
         }
 
-        let mut db = server_state_db.lock().await;
+        let mut db = hub.state.lock().await;
         let updated = tracker.tick(&mut db);
+        // Publishes stale flips. An unchanged view is not republished.
+        hub.rebuild(&db);
 
         if updated > 0 {
             tracing::debug!(last_block = ?tracker.last_block, "upstream block progress");
@@ -192,6 +195,12 @@ async fn mark_offline(server_state_db: &ServerStateDb, endpoint: &str) {
     }
 }
 
+/// [`mark_offline`], then publish the change to the listener's fleet view.
+async fn mark_offline_published(hub: &FleetHub, endpoint: &str) {
+    mark_offline(&hub.state, endpoint).await;
+    hub.refresh().await;
+}
+
 /// Record that the monitor now polls this upstream with
 /// `get_status_request_v0` only.
 async fn mark_status_v0_only(server_state_db: &ServerStateDb, endpoint: &str) {
@@ -290,10 +299,12 @@ async fn send_status(sender: &mut WsSink, endpoint: &str, variant: u8) -> bool {
 /// within `upstream_status_ms` or the upstream is marked offline and the session
 /// is dropped. Connects and the wait for the ABI frame are bounded, and the
 /// socket uses the configured message size.
+///
+/// Every state change is published to `hub`'s fleet view.
 pub async fn monitoring_connection(
     server: Server,
     static_config: StaticConfig,
-    server_state_db: ServerStateDb,
+    hub: Arc<FleetHub>,
     mut shutdown: broadcast::Receiver<()>,
 ) {
     let mut backoff_attempts: u32 = 0;
@@ -314,7 +325,7 @@ pub async fn monitoring_connection(
             res = timeout(connect_timeout, connect) => match res {
                 Ok(Ok((websocket, _))) => websocket,
                 Ok(Err(e)) => {
-                    mark_offline(&server_state_db, &server.endpoint).await;
+                    mark_offline_published(&hub, &server.endpoint).await;
                     let backoff = backoff_delay(static_config.upstream_reconnect_ms, &mut backoff_attempts);
                     tracing::warn!(upstream = %server.endpoint, error = %e, retry_in_ms = backoff, "upstream connect failed");
                     tokio::select! {
@@ -323,7 +334,7 @@ pub async fn monitoring_connection(
                     }
                 }
                 Err(_) => {
-                    mark_offline(&server_state_db, &server.endpoint).await;
+                    mark_offline_published(&hub, &server.endpoint).await;
                     let backoff = backoff_delay(static_config.upstream_reconnect_ms, &mut backoff_attempts);
                     tracing::warn!(
                         upstream = %server.endpoint,
@@ -346,7 +357,7 @@ pub async fn monitoring_connection(
             websocket,
             &server,
             &static_config,
-            &server_state_db,
+            &hub,
             &mut shutdown,
             &mut status_request,
         )
@@ -365,7 +376,8 @@ pub async fn monitoring_connection(
                     unanswered_v1_sessions = unanswered_v1_sessions.saturating_add(1);
                     if unanswered_v1_sessions >= STATUS_V1_MISS_LIMIT {
                         status_request = STATUS_REQUEST_V0;
-                        mark_status_v0_only(&server_state_db, &server.endpoint).await;
+                        mark_status_v0_only(&hub.state, &server.endpoint).await;
+                        hub.refresh().await;
                         tracing::info!(
                             upstream = %server.endpoint,
                             "no reply to get_status_request_v1; falling back to get_status_request_v0"
@@ -400,7 +412,7 @@ async fn run_monitor_session(
     websocket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     server: &Server,
     static_config: &StaticConfig,
-    server_state_db: &ServerStateDb,
+    hub: &FleetHub,
     shutdown: &mut broadcast::Receiver<()>,
     status_request: &mut u8,
 ) -> SessionEnd {
@@ -432,12 +444,19 @@ async fn run_monitor_session(
             _ = shutdown.recv() => return SessionEnd::Stop,
             next = receiver.next() => match next {
                 Some(Ok(msg)) => {
-                    match handle_monitoring_msg(msg, &mut ship_abi, server_state_db, server).await {
+                    let inbound = handle_monitoring_msg(msg, &mut ship_abi, &hub.state, server).await;
+                    // A stored ABI or status (or a chain_id rejection) changed
+                    // the state; the other outcomes publish through
+                    // mark_offline_published below.
+                    if matches!(inbound, Inbound::AbiAccepted | Inbound::Status(_)) {
+                        hub.refresh().await;
+                    }
+                    match inbound {
                         Inbound::AbiAccepted => {
                             abi_ready = true;
                             let variant = *status_request;
                             if !send_status(&mut sender, &server.endpoint, variant).await {
-                                mark_offline(server_state_db, &server.endpoint).await;
+                                mark_offline_published(hub, &server.endpoint).await;
                                 return session_reconnect(sent_v1, saw_status);
                             }
                             if variant == STATUS_REQUEST_V1 {
@@ -458,11 +477,11 @@ async fn run_monitor_session(
                             };
                         }
                         Inbound::AbiRejected => {
-                            mark_offline(server_state_db, &server.endpoint).await;
+                            mark_offline_published(hub, &server.endpoint).await;
                             return session_reconnect(sent_v1, saw_status);
                         }
                         Inbound::Close => {
-                            mark_offline(server_state_db, &server.endpoint).await;
+                            mark_offline_published(hub, &server.endpoint).await;
                             // A node that does not understand v1 often closes the
                             // socket. Reconnect so the miss counter can fall back
                             // to v0. A close after a real status result still stops.
@@ -476,12 +495,12 @@ async fn run_monitor_session(
                 }
                 None => {
                     tracing::info!(upstream = %server.endpoint, "upstream disconnected");
-                    mark_offline(server_state_db, &server.endpoint).await;
+                    mark_offline_published(hub, &server.endpoint).await;
                     return session_reconnect(sent_v1, saw_status);
                 }
                 Some(Err(e)) => {
                     tracing::warn!(upstream = %server.endpoint, error = %e, "error reading from upstream");
-                    mark_offline(server_state_db, &server.endpoint).await;
+                    mark_offline_published(hub, &server.endpoint).await;
                     return session_reconnect(sent_v1, saw_status);
                 }
             },
@@ -492,7 +511,7 @@ async fn run_monitor_session(
                         timeout_ms = static_config.connect_timeout_ms,
                         "timed out waiting for upstream ABI; marking upstream offline"
                     );
-                    mark_offline(server_state_db, &server.endpoint).await;
+                    mark_offline_published(hub, &server.endpoint).await;
                     return session_reconnect(sent_v1, saw_status);
                 }
                 if status_in_flight {
@@ -501,12 +520,12 @@ async fn run_monitor_session(
                         timeout_ms = static_config.upstream_status_ms,
                         "status reply timed out; marking upstream offline"
                     );
-                    mark_offline(server_state_db, &server.endpoint).await;
+                    mark_offline_published(hub, &server.endpoint).await;
                     return session_reconnect(sent_v1, saw_status);
                 }
                 let variant = *status_request;
                 if !send_status(&mut sender, &server.endpoint, variant).await {
-                    mark_offline(server_state_db, &server.endpoint).await;
+                    mark_offline_published(hub, &server.endpoint).await;
                     return session_reconnect(sent_v1, saw_status);
                 }
                 if variant == STATUS_REQUEST_V1 {

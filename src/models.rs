@@ -1266,6 +1266,9 @@ pub struct UpstreamCounters {
     /// it can check their socket right away instead of waiting for their own
     /// liveness timeout.
     pub went_offline: Notify,
+    /// Woken when a client session's dial to the upstream succeeds, so a
+    /// monitor waiting out a long reconnect backoff reconnects at once.
+    pub dial_succeeded: Notify,
 }
 
 /// Live state tracked per upstream by the monitoring loop and the proxy.

@@ -581,7 +581,9 @@ pub(super) struct DialTask {
 
 impl DialTask {
     /// Start dialing `target`, holding `guard` on its connection counter. The
-    /// task runs in the caller's tracing span.
+    /// task runs in the caller's tracing span. A dial that gets through wakes
+    /// the upstream's monitor if it is waiting to reconnect
+    /// ([`UpstreamCounters::dial_succeeded`]).
     pub fn spawn(
         target: DialTarget,
         limits: ProxyLimits,
@@ -589,7 +591,17 @@ impl DialTask {
         epoch: Instant,
     ) -> Self {
         let url = target.url.clone();
-        let handle = tokio::spawn(dial(url, limits, guard, epoch).in_current_span());
+        let counters = target.counters.clone();
+        let handle = tokio::spawn(
+            async move {
+                let outcome = dial(url, limits, guard, epoch).await;
+                if outcome.is_ok() {
+                    counters.dial_succeeded.notify_waiters();
+                }
+                outcome
+            }
+            .in_current_span(),
+        );
         Self { target, handle }
     }
 
@@ -893,6 +905,32 @@ mod tests {
         assert_eq!(slots(&counter), 1, "a closed link hands over its slot");
         drop(guard);
         assert_eq!(slots(&counter), 0);
+    }
+
+    /// A dial that gets through wakes the upstream's monitor (waiting to
+    /// reconnect); a failed one does not.
+    #[tokio::test]
+    async fn a_dial_that_gets_through_wakes_the_monitor() {
+        for (first, gets_through) in [
+            (Message::text(ABI), true),
+            (Message::binary(vec![0u8; 4]), false),
+        ] {
+            let endpoint = upstream_sending(first).await;
+            let target = target(&endpoint);
+            let counters = target.counters.clone();
+            let woken = counters.dial_succeeded.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            let guard = ConnectionGuard::acquire(Arc::new(AtomicUsize::new(0)));
+            let mut task = DialTask::spawn(target, limits(), guard, Instant::now());
+            assert_eq!(task.outcome().await.is_ok(), gets_through);
+            let wait = Duration::from_millis(if gets_through { 1_000 } else { 100 });
+            assert_eq!(
+                timeout(wait, woken).await.is_ok(),
+                gets_through,
+                "gets through: {gets_through}"
+            );
+        }
     }
 
     #[tokio::test]

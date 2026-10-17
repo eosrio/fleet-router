@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,6 +7,7 @@ use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
+use tokio::sync::futures::Notified;
 use tokio::time::{sleep, sleep_until, timeout, Instant};
 use tokio_tungstenite::{
     connect_async_with_config,
@@ -284,6 +286,34 @@ fn backoff_delay(reconnect_ms: u64, attempts: &mut u32) -> u64 {
     backoff
 }
 
+/// Wait out a reconnect backoff of `delay` after a failed connect. A client
+/// session that dials the upstream successfully meanwhile (`reachable`)
+/// cuts it short: the monitor then reconnects `floor` (the base reconnect
+/// interval) after the failure at the latest, so it never lags far behind
+/// the sessions once the upstream is back. Returns `false` on shutdown.
+async fn reconnect_pause(
+    delay: Duration,
+    floor: Duration,
+    reachable: Pin<&mut Notified<'_>>,
+    shutdown: &mut broadcast::Receiver<()>,
+    endpoint: &str,
+) -> bool {
+    let failed = Instant::now();
+    tokio::select! {
+        _ = shutdown.recv() => return false,
+        _ = sleep(delay) => return true,
+        () = reachable => {}
+    }
+    tracing::info!(
+        upstream = %endpoint,
+        "a client session reached the upstream; reconnecting the monitor"
+    );
+    tokio::select! {
+        _ = shutdown.recv() => false,
+        _ = sleep_until(failed + floor.min(delay)) => true,
+    }
+}
+
 async fn send_status(sender: &mut WsSink, endpoint: &str, variant: u8) -> bool {
     if let Err(e) = sender.send(Message::Binary(vec![variant].into())).await {
         tracing::warn!(upstream = %endpoint, error = %e, "failed to send status request");
@@ -301,6 +331,11 @@ async fn send_status(sender: &mut WsSink, endpoint: &str, variant: u8) -> bool {
 /// is dropped. Connects and the wait for the ABI frame are bounded, and the
 /// socket uses the configured message size.
 ///
+/// The backoff after failed connects grows, but a client session that dials
+/// the upstream successfully ends it (see [`reconnect_pause`]): sessions
+/// re-dial a returning upstream directly, and the monitor follows within
+/// the base reconnect interval.
+///
 /// Every state change is published to `hub`'s fleet view.
 pub async fn monitoring_connection(
     server: Server,
@@ -314,8 +349,21 @@ pub async fn monitoring_connection(
     // when the upstream answers with v0, or never answers a v1 probe.
     let mut status_request = STATUS_REQUEST_V1;
     let connect_timeout = Duration::from_millis(static_config.connect_timeout_ms);
+    let reconnect = Duration::from_millis(static_config.upstream_reconnect_ms);
+    let counters = hub
+        .state
+        .lock()
+        .await
+        .get(&server.endpoint)
+        .map(|state| state.counters.clone())
+        .unwrap_or_default();
 
     loop {
+        // Registered before the connect attempt, so a session dial that gets
+        // through while it fails is not missed.
+        let reachable = counters.dial_succeeded.notified();
+        tokio::pin!(reachable);
+        reachable.as_mut().enable();
         let connect = connect_async_with_config(
             server.ws_url(),
             Some(upstream_ws_config(static_config.max_message_bytes)),
@@ -329,10 +377,11 @@ pub async fn monitoring_connection(
                     mark_offline_published(&hub, &server.endpoint).await;
                     let backoff = backoff_delay(static_config.upstream_reconnect_ms, &mut backoff_attempts);
                     tracing::warn!(upstream = %server.endpoint, error = %e, retry_in_ms = backoff, "upstream connect failed");
-                    tokio::select! {
-                        _ = shutdown.recv() => break,
-                        _ = sleep(Duration::from_millis(backoff)) => continue,
+                    let delay = Duration::from_millis(backoff);
+                    if reconnect_pause(delay, reconnect, reachable.as_mut(), &mut shutdown, &server.endpoint).await {
+                        continue;
                     }
+                    break;
                 }
                 Err(_) => {
                     mark_offline_published(&hub, &server.endpoint).await;
@@ -343,10 +392,11 @@ pub async fn monitoring_connection(
                         retry_in_ms = backoff,
                         "upstream connect timed out"
                     );
-                    tokio::select! {
-                        _ = shutdown.recv() => break,
-                        _ = sleep(Duration::from_millis(backoff)) => continue,
+                    let delay = Duration::from_millis(backoff);
+                    if reconnect_pause(delay, reconnect, reachable.as_mut(), &mut shutdown, &server.endpoint).await {
+                        continue;
                     }
+                    break;
                 }
             }
         };
@@ -1834,5 +1884,171 @@ mod tests {
         );
         assert!(!state.range_mismatch());
         assert!(!state.warned.range_mismatch, "not warned");
+    }
+
+    /// A reconnect pause runs its whole delay, unless a session dial gets
+    /// through: then it ends at the floor after the failure, even when the
+    /// dial came before the pause began (the waiter was registered first).
+    #[tokio::test]
+    async fn a_session_dial_ends_a_reconnect_pause_at_its_floor() {
+        use std::time::Duration;
+
+        use tokio::sync::{broadcast, Notify};
+        use tokio::time::Instant;
+
+        let (_tx, mut shutdown) = broadcast::channel::<()>(1);
+        let notify = Notify::new();
+        let floor = Duration::from_millis(150);
+
+        let started = Instant::now();
+        let reachable = notify.notified();
+        tokio::pin!(reachable);
+        reachable.as_mut().enable();
+        assert!(
+            super::reconnect_pause(
+                Duration::from_millis(300),
+                floor,
+                reachable.as_mut(),
+                &mut shutdown,
+                "a"
+            )
+            .await
+        );
+        assert!(started.elapsed() >= Duration::from_millis(300), "the delay");
+
+        for early in [false, true] {
+            let reachable = notify.notified();
+            tokio::pin!(reachable);
+            reachable.as_mut().enable();
+            if early {
+                notify.notify_waiters();
+            }
+            let started = Instant::now();
+            let pause = super::reconnect_pause(
+                Duration::from_secs(30),
+                floor,
+                reachable.as_mut(),
+                &mut shutdown,
+                "a",
+            );
+            let woke = async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                notify.notify_waiters();
+            };
+            let (resumed, ()) = tokio::join!(pause, woke);
+            assert!(resumed);
+            let took = started.elapsed();
+            assert!(
+                took >= floor - Duration::from_millis(20) && took < Duration::from_secs(2),
+                "early = {early}: {took:?}"
+            );
+        }
+    }
+
+    /// A monitor deep in its reconnect backoff (3.2 s after six failed
+    /// connects) reconnects right after a client session's dial gets
+    /// through, instead of at the end of the backoff.
+    #[tokio::test]
+    async fn a_session_dial_reconnects_a_monitor_in_backoff() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use tokio::net::TcpListener;
+        use tokio::sync::broadcast;
+        use tokio::time::{sleep, Instant};
+
+        use crate::fleet::FleetHub;
+        use crate::models::{
+            build_config_db, ResolvedListener, ResolvedTopology, StaticConfig, StitchingPolicy,
+        };
+
+        // Drops every connection until `serving`, then serves an archive.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let serving = Arc::new(AtomicBool::new(false));
+        let upstream = {
+            let (attempts, serving) = (attempts.clone(), serving.clone());
+            tokio::spawn(async move {
+                loop {
+                    let Ok((tcp, _)) = listener.accept().await else {
+                        return;
+                    };
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    if serving.load(Ordering::SeqCst) {
+                        tokio::spawn(async move {
+                            if let Ok(ws) = tokio_tungstenite::accept_async(tcp).await {
+                                let config = mock_ship::MockShipConfig::frozen(1, 1001);
+                                mock_ship::serve_websocket(config, ws).await;
+                            }
+                        });
+                    }
+                }
+            })
+        };
+
+        let server = Server {
+            name: "archive".to_string(),
+            endpoint: endpoint.clone(),
+            enabled: true,
+            role: Role::Frozen,
+            ..Default::default()
+        };
+        let resolved = ResolvedListener {
+            name: None,
+            listen_address: "127.0.0.1".to_string(),
+            listen_port: 0,
+            max_connections: 10,
+            expected_chain_id: None,
+            require_chain_id: false,
+            block_failure_quarantine: None,
+            topology: ResolvedTopology::Stitched,
+            stitching: StitchingPolicy::default(),
+            abi_pin: None,
+            servers: vec![server.clone()],
+        };
+        let hub = FleetHub::new(
+            &resolved,
+            build_state_db(vec![server.clone()]),
+            build_config_db(vec![server.clone()]),
+        );
+        let counters = hub.state.lock().await[&endpoint].counters.clone();
+        let static_config = StaticConfig {
+            upstream_reconnect_ms: 100,
+            upstream_monitoring_ms: 100,
+            upstream_status_ms: 1_000,
+            connect_timeout_ms: 1_000,
+            max_message_bytes: 1 << 20,
+        };
+        let (stop, shutdown) = broadcast::channel(1);
+        let monitor = tokio::spawn(super::monitoring_connection(
+            server,
+            static_config,
+            hub.clone(),
+            shutdown,
+        ));
+
+        // Backoffs of 0.1, 0.2, 0.4, 0.8 and 1.6 s: the sixth failed connect
+        // is followed by 3.2 s.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while attempts.load(Ordering::SeqCst) < 6 {
+            assert!(Instant::now() < deadline, "the monitor stopped retrying");
+            sleep(Duration::from_millis(5)).await;
+        }
+        serving.store(true, Ordering::SeqCst);
+        let dialed = Instant::now();
+        // What a session's dial that gets through does.
+        counters.dial_succeeded.notify_waiters();
+        while !hub.state.lock().await[&endpoint].online {
+            assert!(
+                dialed.elapsed() < Duration::from_millis(1_500),
+                "the monitor waited out its backoff"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+        stop.send(()).unwrap();
+        monitor.await.unwrap();
+        upstream.abort();
     }
 }

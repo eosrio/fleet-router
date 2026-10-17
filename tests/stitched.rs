@@ -2324,6 +2324,135 @@ async fn s22_history_readiness_names_the_missing_segment() {
     drop((b, c));
 }
 
+/// An archive on a fixed port that can go down (dropping its sessions and
+/// every new connection) and come back, counting the connections it gets.
+struct Flaky {
+    ep: String,
+    up: Arc<std::sync::atomic::AtomicBool>,
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+    sessions: Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
+    accept: JoinHandle<()>,
+}
+
+impl Flaky {
+    async fn start(config: MockShipConfig) -> Flaky {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ep = listener.local_addr().unwrap().to_string();
+        let up = Arc::new(AtomicBool::new(true));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let sessions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accept = {
+            let (up, connections, sessions) = (up.clone(), connections.clone(), sessions.clone());
+            tokio::spawn(async move {
+                while let Ok((tcp, _)) = listener.accept().await {
+                    connections.fetch_add(1, Ordering::SeqCst);
+                    if !up.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let config = config.clone();
+                    let session = tokio::spawn(async move {
+                        if let Ok(ws) = tokio_tungstenite::accept_async(tcp).await {
+                            mock_ship::serve_websocket(config, ws).await;
+                        }
+                    });
+                    sessions.lock().unwrap().push(session);
+                }
+            })
+        };
+        Flaky {
+            ep,
+            up,
+            connections,
+            sessions,
+            accept,
+        }
+    }
+
+    fn connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn take_down(&self) {
+        self.up.store(false, std::sync::atomic::Ordering::SeqCst);
+        for session in self.sessions.lock().unwrap().drain(..) {
+            session.abort();
+        }
+    }
+
+    fn bring_up(&self) {
+        self.up.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for Flaky {
+    fn drop(&mut self) {
+        self.take_down();
+        self.accept.abort();
+    }
+}
+
+/// An archive that comes back is ready for history again (`/ready?scope=
+/// history`) about one reconnect interval after a client session reaches
+/// it, not when the monitor's grown reconnect backoff runs out.
+#[tokio::test]
+async fn a_returning_archive_is_history_ready_soon_after_a_session_reaches_it() {
+    let a = Flaky::start(frozen_mock(A_RANGE)).await;
+    let (b, c) = (
+        up("b", frozen_mock(B_RANGE)).await,
+        up("c", live_mock(C_BEGIN, C_HEAD)).await,
+    );
+    let mut cfg = config(vec![
+        frozen("a", &a.ep, None),
+        frozen_server(&b),
+        live_server(&c),
+    ]);
+    cfg["upstream_reconnect_ms"] = json!(100);
+    cfg["stitching"]["gap_wait_ms"] = json!(8000);
+    let router = RouterProcess::start(cfg).await;
+    let a_up = format!("fleet_router_upstream_up{{{}}}", labels(&a.ep, "a"));
+    wait_metric(router.metrics(), &format!("{a_up} 1"), WAIT).await;
+    wait_ready(&router, &[&b, &c]).await;
+
+    a.take_down();
+    wait_metric(router.metrics(), &format!("{a_up} 0"), WAIT).await;
+    // Reconnects after 0.1, 0.1, 0.2, 0.4, 0.8 and 1.6 s fail: the monitor
+    // now waits 3.2 s before its next try.
+    let before = a.connections();
+    wait_for("six failed reconnects", Duration::from_secs(8), || {
+        a.connections() >= before + 6
+    })
+    .await;
+    a.bring_up();
+
+    let (mut w, mut r, _) = client(&router).await;
+    send(&mut w, blocks(&request(500, 600, 100))).await;
+    let (first, _) = read_blocks(&mut r, 1, WAIT).await;
+    assert_eq!(
+        nums(&first),
+        vec![500],
+        "the held request reached the archive"
+    );
+    let reached = Instant::now();
+    loop {
+        let (status, body) = http_get(router.metrics(), "/ready?scope=history")
+            .await
+            .unwrap();
+        if status == 200 {
+            break;
+        }
+        assert!(
+            reached.elapsed() < Duration::from_millis(1500),
+            "still not history-ready: {body}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+    let (rest, close) = read_blocks(&mut r, 99, WAIT).await;
+    assert!(close.is_none(), "{close:?}");
+    assert_eq!(nums(&rest), (501..600).collect::<Vec<_>>());
+}
+
 // ----------------------------------------------------------------------
 // S23, S24: socket reuse
 // ----------------------------------------------------------------------

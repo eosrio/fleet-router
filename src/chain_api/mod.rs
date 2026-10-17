@@ -1014,7 +1014,7 @@ impl ChainApiCtx {
         self.stats.retries.inc(reason);
         if reason.marks_down() && slot.mark_down() {
             tracing::warn!(
-                listener = self.listener.as_deref().unwrap_or_default(),
+                listener = self.listener.as_deref().unwrap_or("default"),
                 server = %slot.name,
                 api = %slot.base,
                 reason = reason.as_str(),

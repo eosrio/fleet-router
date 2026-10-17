@@ -417,6 +417,22 @@ async fn shutdown_finishes_requests_in_progress_and_drains_connections() {
     assert!(!served.ctx.stats.bound());
 }
 
+// In single-port mode the chain API's log lines name the listener
+// `default`, as every other log line does.
+#[tokio::test]
+async fn chain_api_logs_name_the_default_listener() {
+    let (logs, _guard) = crate::test_log::capture();
+    let api = live_api().await;
+    let _served = serve(
+        &api,
+        serde_json::json!({ "listen_port": 1, "probe_ms": 100 }),
+    )
+    .await;
+    let up = logs.lines_with("chain API up");
+    assert_eq!(up.len(), 1, "{up:?}");
+    assert!(up[0].contains(r#"listener="default""#), "{}", up[0]);
+}
+
 // HEAD reaches the upstream as HEAD; the client gets the head (its
 // Content-Length included) and no body, and the connections stay sound
 // although nodeos writes a body after the head.

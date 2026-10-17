@@ -1524,10 +1524,10 @@ impl Session {
             .blockless_moved_at
             .is_none_or(|at| now >= at + blockless_move_backoff(self.blockless_moves));
         if due && may_move {
-            if self.block_holder_for(block, &endpoint) {
+            if let Some(holder) = self.block_holder_for(block, &endpoint) {
                 tracing::info!(
-                    upstream = %endpoint,
-                    name = %name,
+                    from = %name,
+                    to = %self.view.up(holder).map_or("", |u| &*u.name),
                     block,
                     "moving to an upstream that holds blocks"
                 );
@@ -1550,17 +1550,15 @@ impl Session {
         self.forward_result(frame, h, fw).await
     }
 
-    /// Stitched: whether the failover that leaves the archive `endpoint` at
-    /// block `k` ([`UpEnd::NoBlockLog`]: `endpoint` soft-excluded, the other
-    /// exclusions kept) would serve the current request from an upstream not
-    /// known to lack a block log. This is the plan that failover makes, so a
-    /// session leaves only for the blocks: an upstream that holds them but
-    /// ranks below the archive (stale, behind the block, full) would only
-    /// send it back, again and again.
-    fn block_holder_for(&self, k: u32, endpoint: &str) -> bool {
-        let Some(creq) = self.c.req.as_ref() else {
-            return false;
-        };
+    /// Stitched: the upstream (by index), not known to lack a block log,
+    /// from which the failover that leaves the archive `endpoint` at block
+    /// `k` ([`UpEnd::NoBlockLog`]: `endpoint` soft-excluded, the other
+    /// exclusions kept) would serve the current request, if any. This is the
+    /// plan that failover makes, so a session leaves only for the blocks: an
+    /// upstream that holds them but ranks below the archive (stale, behind
+    /// the block, full) would only send it back, again and again.
+    fn block_holder_for(&self, k: u32, endpoint: &str) -> Option<usize> {
+        let creq = self.c.req.as_ref()?;
         let mut ex = self.ex.clone();
         ex.soft = Some(Arc::from(endpoint));
         let tip = self.ctx.hub.fresh_tip(&self.view);
@@ -1577,12 +1575,15 @@ impl Session {
             false,
             std_now(),
         );
-        matches!(
-            step,
+        match step {
             Step::Serve(st)
                 if *st.endpoint != *endpoint
-                    && self.view.up(st.up).is_some_and(|u| !u.no_block_log)
-        )
+                    && self.view.up(st.up).is_some_and(|u| !u.no_block_log) =>
+            {
+                Some(st.up)
+            }
+            _ => None,
+        }
     }
 
     /// Stitched: where the run of archive `up` for the current request,
@@ -4705,6 +4706,36 @@ mod tests {
         assert!(!state[&full].no_block_log);
         assert_eq!(state[&bare].block_failures, 0, "no strike");
         assert!(state[&bare].quarantines.is_empty());
+    }
+
+    /// Stitched: the info line of a move off an archive without a block log
+    /// names the archive it leaves and the upstream it moves to.
+    #[tokio::test]
+    async fn a_move_to_an_upstream_that_holds_blocks_logs_both_upstreams() {
+        let (logs, _guard) = crate::test_log::capture();
+        let (bare, _bare_mock) = start_mock(MockShipConfig {
+            no_block_log: true,
+            ..MockShipConfig::frozen(1, 1001)
+        })
+        .await;
+        let (full, _full_mock) = start_mock(MockShipConfig::frozen(1, 1001)).await;
+        let harness = start_stitched(&[(&bare, 1, 1001), (&full, 1, 1001)]).await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&full).unwrap().priority = 5;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        client.send(block_request(10, 20, 100)).await.unwrap();
+        let views = read_views(&mut client, 10).await;
+        assert!(views.iter().all(|v| v.block.is_some()));
+        let moves = logs.lines_with("moving to an upstream that holds blocks");
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        assert!(
+            moves[0].contains("from=archive-0") && moves[0].contains("to=archive-1"),
+            "{}",
+            moves[0]
+        );
     }
 
     /// Stitched: when no upstream holds the blocks, results come without

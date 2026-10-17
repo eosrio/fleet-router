@@ -58,6 +58,8 @@ mod session;
 mod ship;
 mod tasks;
 mod telemetry;
+#[cfg(test)]
+mod test_log;
 mod zcd;
 
 #[tokio::main]
@@ -147,7 +149,7 @@ async fn main() -> Result<()> {
                     anyhow::anyhow!("error binding the chain API to {}: {}", api.bind, e)
                 })?;
                 tracing::info!(
-                    listener = listener_cfg.name.as_deref().unwrap_or_default(),
+                    listener = listener_cfg.name.as_deref().unwrap_or("default"),
                     address = %api.bind,
                     upstreams = api.upstreams.len(),
                     "chain API listening"

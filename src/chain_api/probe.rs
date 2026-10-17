@@ -197,7 +197,7 @@ impl Prober {
         let went_down = ApiSlot::probe_failed(&mut slot.state());
         if went_down {
             tracing::warn!(
-                listener = self.listener.as_deref().unwrap_or_default(),
+                listener = self.listener.as_deref().unwrap_or("default"),
                 server = %slot.name,
                 api = %slot.base,
                 "chain API down: it does not answer its probes"
@@ -207,7 +207,7 @@ impl Prober {
 
     fn came_up(&self, slot: &ApiSlot) {
         tracing::info!(
-            listener = self.listener.as_deref().unwrap_or_default(),
+            listener = self.listener.as_deref().unwrap_or("default"),
             server = %slot.name,
             api = %slot.base,
             role = slot.role.as_str(),
@@ -226,7 +226,7 @@ impl Prober {
         };
         if first {
             tracing::warn!(
-                listener = self.listener.as_deref().unwrap_or_default(),
+                listener = self.listener.as_deref().unwrap_or("default"),
                 server = %slot.name,
                 api = %slot.base,
                 reported = %hex(&reported),
@@ -378,7 +378,7 @@ impl Prober {
             self.verification_lost(slot);
         } else if was_logged {
             tracing::info!(
-                listener = self.listener.as_deref().unwrap_or_default(),
+                listener = self.listener.as_deref().unwrap_or("default"),
                 server = %slot.name,
                 api = %slot.base,
                 block = pos.num,
@@ -398,7 +398,7 @@ impl Prober {
         let first = !std::mem::replace(&mut slot.state().mismatch_logged, true);
         if first {
             tracing::warn!(
-                listener = self.listener.as_deref().unwrap_or_default(),
+                listener = self.listener.as_deref().unwrap_or("default"),
                 server = %slot.name,
                 api = %slot.base,
                 "chain API serves different blocks than its SHiP endpoint; not used until they match"

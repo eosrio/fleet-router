@@ -285,7 +285,14 @@ async fn listener_view(ctx: &ListenerContext, now: Instant) -> ListenerView {
         chain_id: ctx.chain_id.as_ref().map(hex_32),
         ready,
         max_connections: ctx.max_connections,
-        sessions: upstreams.iter().map(|upstream| upstream.sessions).sum(),
+        // Client sessions, as `max_connections` counts them. An upstream's
+        // `sessions` are its connection slots: a stitched session can hold
+        // two (a standby link, a pre-dial) or none (holding, waiting).
+        sessions: telemetry::global()
+            .sessions()
+            .iter()
+            .filter(|session| &*session.listener == ctx.name())
+            .count(),
         accepted_total: ctx.stats.accepted_total.load(Ordering::Relaxed),
         rejected_total: ctx.stats.rejected_total.load(Ordering::Relaxed),
         upstreams,
@@ -990,6 +997,68 @@ mod tests {
         assert!(!listener_view(&ctx, Instant::now()).await.ready);
         set_online(live).await;
         assert!(listener_view(&ctx, Instant::now()).await.ready);
+    }
+
+    /// A listener's session count is its client sessions, not the slots its
+    /// upstreams hold: a stitched session with a standby link holds two, and
+    /// one that holds or waits holds none.
+    #[tokio::test]
+    async fn listener_sessions_count_clients_not_upstream_slots() {
+        let servers = vec![
+            Server {
+                name: "a".to_string(),
+                endpoint: "127.0.0.1:18083".to_string(),
+                enabled: true,
+                ..Default::default()
+            },
+            Server {
+                name: "b".to_string(),
+                endpoint: "127.0.0.1:18084".to_string(),
+                enabled: true,
+                ..Default::default()
+            },
+        ];
+        let state_db = crate::models::build_state_db(servers.clone());
+        {
+            let db = state_db.lock().await;
+            db["127.0.0.1:18083"]
+                .connections
+                .store(1, Ordering::Relaxed);
+            db["127.0.0.1:18084"]
+                .connections
+                .store(1, Ordering::Relaxed);
+        }
+        let ctx = ListenerContext {
+            health: ListenerHealthState {
+                name: Some("slot-count".to_string()),
+                state_db,
+                hub: None,
+            },
+            config_db: crate::models::build_config_db(servers),
+            order: vec!["127.0.0.1:18083".to_string(), "127.0.0.1:18084".to_string()],
+            port: 0,
+            chain_id: None,
+            max_connections: 10,
+            stats: Arc::new(ListenerStats::default()),
+        };
+        // One client: its link to a and its standby link to b.
+        let client = "127.0.0.1:5002".parse().unwrap();
+        let session = telemetry::global().register_session(
+            Arc::from("slot-count"),
+            client,
+            "127.0.0.1:18083",
+        );
+        let view = listener_view(&ctx, Instant::now()).await;
+        assert_eq!(view.sessions, 1);
+        assert_eq!(
+            view.upstreams
+                .iter()
+                .map(|u| u.sessions)
+                .collect::<Vec<_>>(),
+            [1, 1]
+        );
+        drop(session);
+        assert_eq!(listener_view(&ctx, Instant::now()).await.sessions, 0);
     }
 
     #[test]

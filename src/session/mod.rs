@@ -1722,6 +1722,9 @@ impl Session {
             let guard = link.close_quietly();
             self.retired = keep_slot.then_some(guard);
             self.status.link_ended(Instant::now(), self.status_wait());
+            // No upstream carries the session until its next link is up: a
+            // drain of the old one must not count it, nor a move pick it.
+            self.registry.info.set_upstream("");
         }
     }
 
@@ -3996,6 +3999,44 @@ mod tests {
             0,
             "the holding upstream answers pings"
         );
+    }
+
+    /// Stitched: a session whose leg on A ended and that holds for a full B
+    /// has no link. The registry shows no upstream for it, so a drain of A
+    /// does not count it as moving and a move of it is refused, and its next
+    /// block is the one it waits for.
+    #[tokio::test]
+    async fn the_registry_shows_no_upstream_while_a_session_holds_without_a_link() {
+        let leg = |begin, end| MockShipConfig {
+            block_delay: Some(Duration::from_millis(5)),
+            ..MockShipConfig::frozen(begin, end)
+        };
+        let (a, _mock_a) = start_mock(leg(1, 1001)).await;
+        let (b, _mock_b) = start_mock(leg(1001, 2001)).await;
+        let harness = start_stitched(&[(&a, 1, 1001), (&b, 1001, 2001)]).await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            let state = db.get_mut(&b).unwrap();
+            state.max_sessions = Some(1);
+            state.connections.fetch_add(1, Ordering::Relaxed);
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        client.send(blocks_request(990, 1100, 1000)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 11).await,
+            (990..1001).collect::<Vec<_>>()
+        );
+        let held = timeout(WAIT, async {
+            while harness.hub.stats.holds.get(HoldWhy::AtCapacity) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(held.is_ok(), "the session should hold for B");
+        assert_eq!(info.upstream(), "", "the link to A is gone");
+        assert_eq!(info.next_block(), Some(1001));
     }
 
     /// Pool: a request for blocks far above a lagging upstream's head is

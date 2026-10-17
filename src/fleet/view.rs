@@ -684,6 +684,7 @@ fn upstream_view(ctx: &BuildCtx<'_>, endpoint: &str, s: &ServerState) -> Upstrea
                 max_sessions: s.max_sessions,
                 priority: s.priority,
                 weight: s.weight,
+                api_endpoint: None,
             };
             (
                 Arc::from(endpoint),

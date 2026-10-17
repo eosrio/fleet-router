@@ -11,7 +11,11 @@
 // `MockShipConfig::live` and `MockShipConfig::frozen` give Spring-faithful
 // live nodes and frozen range servers. `client` builds requests and parses
 // results for tests.
+//
+// `chain_api::MockChainApi::live` and `::frozen` give the HTTP chain API of
+// a nodeos live node and of a frozen range server.
 
+pub mod chain_api;
 pub mod client;
 pub mod protocol;
 

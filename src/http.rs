@@ -5,6 +5,7 @@
 //!   - `/ready`,  `/readyz`            -> 200 if every listener can serve the tip, else 503
 //!   - `/ready/<name>`, `/readyz/<name>` -> the same for one listener, 404 if unknown
 //!   - `?scope=history` on either      -> also requires complete, online archive coverage (stitched)
+//!   - `?scope=api` on either          -> whether the chain API can answer (listeners with one)
 //!   - `/coverage`, `/coverage/<name>` -> JSON fleet coverage of every listener, or of one
 //!   - `/metrics`                      -> Prometheus text exposition
 //!
@@ -452,6 +453,7 @@ mod tests {
             name: Some("eos".to_string()),
             state_db,
             hub: None,
+            chain_api: None,
         };
         Arc::new(AppState {
             listeners: vec![ListenerContext {

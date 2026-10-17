@@ -476,6 +476,7 @@ dependencies = [
  "color-print",
  "futures 0.3.34",
  "http",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "mock-ship",
@@ -1135,6 +1136,9 @@ name = "mock-ship"
 version = "0.1.0"
 dependencies = [
  "futures 0.3.34",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "tokio",
  "tokio-tungstenite",
 ]

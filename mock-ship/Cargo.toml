@@ -7,9 +7,15 @@ license = "MIT"
 publish = false
 
 [dependencies]
-tokio = { version = "1", features = ["net", "sync", "rt", "macros", "time"] }
+# io-util: the raw HTTP client of the mock chain API reads and writes sockets.
+tokio = { version = "1", features = ["net", "sync", "rt", "macros", "time", "io-util"] }
 tokio-tungstenite = "0.30.0"
 futures = "0.3"
+# The mock chain API serves HTTP/1.1 on the same hyper the router uses, so it
+# frames responses the way the router's listener does (no Date, title case).
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "signal"] }

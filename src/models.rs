@@ -152,8 +152,8 @@ pub enum HistoryPreference {
     /// Prefer frozen upstreams, keeping history reads off the live nodes.
     #[default]
     Frozen,
-    /// No role preference; among upstreams of equal `priority` and load per
-    /// `weight`, the longest run wins.
+    /// No role preference; among upstreams of equal `priority`, the longest
+    /// run wins, and load per `weight` only splits equal runs.
     Any,
 }
 

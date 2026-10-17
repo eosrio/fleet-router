@@ -354,17 +354,19 @@ pub fn tip_region(v: &FleetView, from: u32) -> bool {
 /// another archive or closed as a gap.
 ///
 /// Candidates are ranked by: online, fresh and not lagging, under capacity,
-/// role preference, not soft-excluded, then the operator preference (lower
-/// `priority` tier, fewer connections per unit of `weight`, higher weight),
-/// then the longest run, then the rendezvous hash. Priority and weight come
-/// after role preference and capacity, so neither pulls history reads onto
-/// a live node or a session onto a full upstream, and after the soft
-/// exclusion, so a failover leaves a failed upstream for a peer in any tier.
-/// They come before the longest run so that an operator's tiers and weights
-/// hold across upstreams whose ranges differ, not only among replicas; with
-/// equal preference the longest run still keeps handoffs few. The session's
-/// own slots do not count as load on their upstream, so a session is not
-/// pushed off the upstream it already holds by its own connection.
+/// role preference, not soft-excluded, lower `priority` tier, the longest
+/// run, fewer connections per unit of `weight` (weighted least-connections),
+/// higher weight, then the rendezvous hash. Priority and weight come after
+/// role preference and capacity, so neither pulls history reads onto a live
+/// node or a session onto a full upstream, and after the soft exclusion, so
+/// a failover leaves a failed upstream for a peer in any tier. Priority comes
+/// before the longest run so that an operator's tiers hold across upstreams
+/// whose ranges differ. Load comes after it, so with the default priority
+/// and weight the order is the plain longest run, then least connections:
+/// a busier upstream with a longer run still saves a handoff, and weights
+/// split sessions among upstreams whose runs are equal (replicas). The
+/// session's own slots do not count as load on their upstream, so a session
+/// is not pushed off the upstream it already holds by its own connection.
 #[allow(clippy::too_many_arguments)]
 pub fn next_step(
     v: &FleetView,
@@ -470,10 +472,12 @@ pub fn next_step(
     let chosen = ranked
         .iter()
         .min_by(|a, b| {
+            // `preference` compares priority again; it is equal by then.
             a.head
                 .cmp(&b.head)
-                .then_with(|| preference(a.up, a.conns, b.up, b.conns))
+                .then_with(|| a.up.priority.cmp(&b.up.priority))
                 .then_with(|| b.run.cmp(&a.run))
+                .then_with(|| preference(a.up, a.conns, b.up, b.conns))
                 .then_with(|| a.hash.cmp(&b.hash))
         })
         .expect("cands is not empty");
@@ -2022,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn stitched_priority_and_weight_rank_after_role_and_capacity_before_the_longest_run() {
+    fn stitched_priority_ranks_after_role_and_capacity_before_the_longest_run() {
         let pol = StitchingPolicy::default();
         let none = Excludes::default();
         // Priority beats fewer connections among replicas.
@@ -2073,7 +2077,7 @@ mod tests {
             (1, 1950, 2001),
             "the preferred tier serves although the live run is longer"
         );
-        // ...and with equal preference the longest run still wins (PL3).
+        // ...and at equal priority the longest run still wins (PL3).
         let v = view(vec![
             frozen(0, 2, 1001),
             frozen(1, 1001, 2001),
@@ -2099,6 +2103,43 @@ mod tests {
         };
         assert_eq!(served_by(&plan_with(&v, 10, &pol, &none, &[])).0, 0);
         assert_eq!(served_by(&plan_with(&v, 10, &pol, &soft, &[])).0, 1);
+    }
+
+    #[test]
+    fn stitched_the_longest_run_outranks_load_and_weight_within_a_tier() {
+        let none = Excludes::default();
+        let pol = StitchingPolicy::default();
+        // Overlapping archives: B's longer run saves a handoff at 1001 although
+        // B is the busier one.
+        let overlap = || vec![frozen(0, 2, 1001), frozen(1, 2, 2001), live(2, 1900, 2300)];
+        let v = view(overlap());
+        v.upstreams[1].connections.store(1, Ordering::Relaxed);
+        assert_eq!(
+            served_by(&plan_with(&v, 10, &pol, &none, &[])),
+            (1, 10, 2001)
+        );
+        // Nor does a higher weight pull the session onto the shorter run.
+        let mut weighted = overlap();
+        weighted[0].weight = 10;
+        let v = view(weighted);
+        v.upstreams[1].connections.store(5, Ordering::Relaxed);
+        assert_eq!(
+            served_by(&plan_with(&v, 10, &pol, &none, &[])),
+            (1, 10, 2001)
+        );
+
+        // PL3: without a role preference the longest run wins although the
+        // live node already has a tip reader.
+        let any = StitchingPolicy {
+            history_preference: HistoryPreference::Any,
+            ..Default::default()
+        };
+        let v = view(fleet());
+        v.upstreams[2].connections.store(1, Ordering::Relaxed);
+        assert_eq!(
+            served_by(&plan_with(&v, 1950, &any, &none, &[])),
+            (2, 1950, u32::MAX)
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::fmt::Display;
 use ZCDType::{Bytes, Checksum256, U32, U8};
 
 use crate::functions::buffer_to_hex;
-use crate::zcd::ZCDType::{Array, Bool};
+use crate::zcd::ZCDType::Array;
 
 /// Failure while decoding an untrusted SHiP frame.
 ///
@@ -278,20 +278,6 @@ impl ZCD<'_> {
     }
 }
 
-pub const GET_BLOCKS_REQUEST_V0_FIELDS: [(&ZCDType, &str, usize); 8] = [
-    (&U32, "start_block_num", 4),
-    (&U32, "end_block_num", 4),
-    (&U32, "max_messages_in_flight", 4),
-    (&Array, "have_positions", 4 + 32),
-    (&Bool, "irreversible_only", 1),
-    (&Bool, "fetch_block", 1),
-    (&Bool, "fetch_traces", 1),
-    (&Bool, "fetch_deltas", 1),
-];
-
-pub const GET_BLOCKS_ACK_REQUEST_V0_FIELDS: [(&ZCDType, &str, usize); 1] =
-    [(&U32, "num_messages", 4)];
-
 // Field Name, Field Size, is bounded
 pub const RESULT_V0_FIELDS: [(&ZCDType, &str, usize); 2] =
     [(&U8, "variant", 1), (&Bytes, "data", 0)];
@@ -335,7 +321,9 @@ fn zcd_builder<'a>(buffer: &'a [u8], fields: &'a [(&ZCDType, &str, usize)]) -> Z
             Array => {
                 // Count byte plus `size` bytes per element. A truncated frame,
                 // or a count whose span does not fit in `usize`, leaves the
-                // field absent instead of panicking.
+                // field absent instead of panicking. The count is one byte,
+                // not fc's varuint32, so SHiP requests are decoded by
+                // `ship::wire` instead.
                 let Some(&elements) = buffer.get(offset) else {
                     break;
                 };
@@ -878,95 +866,16 @@ mod tests {
         );
     }
 
-    /// `get_blocks_request_v0` body. `positions` is the `have_positions` count.
-    fn blocks_request(positions: u8, payload_bytes: usize, trailing: usize) -> Vec<u8> {
-        let mut buf = Vec::new();
-        push_u32(&mut buf, 10);
-        push_u32(&mut buf, 20);
-        push_u32(&mut buf, 3);
-        buf.push(positions);
-        buf.resize(buf.len() + payload_bytes, 0x44);
-        buf.resize(buf.len() + trailing, 0x01);
-        buf
-    }
-
-    fn expect_bool(parsed: &ZCD<'_>, field: &str) -> bool {
-        match parsed.get(field).expect("field width") {
-            Some(ZCDValues::Bool(value)) => value,
-            other => panic!("expected bool {field}, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn valid_have_positions_array_parses() {
-        // Two positions, 36 bytes each, then the four request flags.
-        let buf = blocks_request(2, 36 * 2, 4);
-        let parsed = deserialize_with(&GET_BLOCKS_REQUEST_V0_FIELDS, &buf);
-        assert_eq!(expect_u32(&parsed, "start_block_num"), 10);
-        assert_eq!(expect_u32(&parsed, "end_block_num"), 20);
-        assert_eq!(expect_u32(&parsed, "max_messages_in_flight"), 3);
-        let positions = parsed
-            .hash_map
-            .get("have_positions")
-            .expect("positions present");
-        assert_eq!(positions.slice.len(), 1 + 36 * 2);
-        assert_eq!(positions.slice[0], 2);
-        assert!(expect_bool(&parsed, "irreversible_only"));
-        assert!(expect_bool(&parsed, "fetch_block"));
-        assert!(expect_bool(&parsed, "fetch_traces"));
-        assert!(expect_bool(&parsed, "fetch_deltas"));
-        assert!(matches!(
-            parsed.get_type("have_positions"),
-            Some(ZCDType::Array)
-        ));
-
-        // An empty position list is one count byte, and the flags still follow it.
-        let empty = blocks_request(0, 0, 4);
-        let parsed = deserialize_with(&GET_BLOCKS_REQUEST_V0_FIELDS, &empty);
-        let positions = parsed
-            .hash_map
-            .get("have_positions")
-            .expect("empty positions present");
-        assert_eq!(positions.slice, &[0]);
-        assert!(expect_bool(&parsed, "irreversible_only"));
-    }
-
-    #[test]
-    fn truncated_array_frame_omits_the_field() {
-        // Count says two positions, but only ten payload bytes follow.
-        let buf = blocks_request(2, 10, 0);
-        let parsed = deserialize_with(&GET_BLOCKS_REQUEST_V0_FIELDS, &buf);
-        assert_eq!(expect_u32(&parsed, "start_block_num"), 10);
-        assert!(parsed.get("have_positions").expect("lookup").is_none());
-        assert!(parsed.get_type("have_positions").is_none());
-        assert!(parsed.get("fetch_deltas").expect("lookup").is_none());
-    }
-
-    #[test]
-    fn oversized_array_frame_keeps_the_declared_span() {
-        let mut buf = blocks_request(1, 36, 4);
-        let declared = buf.len();
-        buf.extend_from_slice(&[0xFF; 64]);
-        let parsed = deserialize_with(&GET_BLOCKS_REQUEST_V0_FIELDS, &buf);
-        let positions = parsed
-            .hash_map
-            .get("have_positions")
-            .expect("positions present");
-        assert_eq!(positions.slice.len(), 1 + 36);
-        assert_eq!(expect_u32(&parsed, "start_block_num"), 10);
-        assert!(expect_bool(&parsed, "fetch_deltas"));
-        // Trailing bytes past the last field stay outside every slice.
-        let consumed: usize = parsed.hash_map.values().map(|field| field.size).sum();
-        assert_eq!(consumed, declared);
-    }
-
     #[test]
     fn huge_element_counts_do_not_panic() {
-        // 255 elements of the real 36-byte position, with almost no payload.
-        let short = blocks_request(255, 4, 0);
-        let parsed = deserialize_with(&GET_BLOCKS_REQUEST_V0_FIELDS, &short);
-        assert!(parsed.get("have_positions").expect("lookup").is_none());
-        assert_eq!(expect_u32(&parsed, "max_messages_in_flight"), 3);
+        // 255 elements of 36 bytes each, with almost no payload.
+        let table: [(&ZCDType, &str, usize); 2] =
+            [(&U32, "prefix", 4), (&ZCDType::Array, "items", 36)];
+        let mut short = 3u32.to_le_bytes().to_vec();
+        short.extend_from_slice(&[255, 0, 0, 0, 0]);
+        let parsed = deserialize_with(&table, &short);
+        assert!(parsed.get("items").expect("lookup").is_none());
+        assert_eq!(expect_u32(&parsed, "prefix"), 3);
 
         // Per-element size that overflows `size * elements` and `1 + payload`.
         let overflowing: [(&ZCDType, &str, usize); 1] =
@@ -1020,12 +929,7 @@ mod tests {
     }
 
     fn exercise_decoder(buf: &[u8]) {
-        let tables: [&[(&ZCDType, &str, usize)]; 4] = [
-            &GET_BLOCKS_REQUEST_V0_FIELDS,
-            &GET_BLOCKS_ACK_REQUEST_V0_FIELDS,
-            &RESULT_V0_FIELDS,
-            &STATUS_RESULT_V0_FIELDS,
-        ];
+        let tables: [&[(&ZCDType, &str, usize)]; 2] = [&RESULT_V0_FIELDS, &STATUS_RESULT_V0_FIELDS];
         for fields in tables {
             let parsed = deserialize_with(fields, buf);
             for (_, name, _) in fields {

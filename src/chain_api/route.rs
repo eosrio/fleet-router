@@ -155,6 +155,13 @@ const CHAIN_PREFIX: &str = "/v1/chain/";
 /// "Illegal request-target": the target must be origin-form (no scheme, no
 /// authority, so `*` and absolute-form fail), start with `/` and contain no
 /// `..` anywhere.
+///
+/// One difference remains: `http::Uri` drops a `#fragment` while parsing
+/// the request line, and hyper keeps no raw target. nodeos matches the raw
+/// target, so it answers 404 for `/v1/chain/get_info#x` (and 400 for a `..`
+/// inside the fragment), where the router sees `/v1/chain/get_info`. A
+/// fragment never belongs in a request-target (RFC 9112), so clients do not
+/// send one.
 pub fn origin_target(uri: &Uri) -> Option<&str> {
     if uri.scheme().is_some() || uri.authority().is_some() {
         return None;
@@ -351,6 +358,16 @@ mod tests {
         assert_eq!(
             origin_target(&uri("/v1/chain/get_info?a=b")),
             Some("/v1/chain/get_info?a=b")
+        );
+        // The parsed target has lost its fragment (a documented difference:
+        // nodeos would match the raw target and answer 404 or 400).
+        assert_eq!(
+            origin_target(&uri("/v1/chain/get_info#x")),
+            Some("/v1/chain/get_info")
+        );
+        assert_eq!(
+            origin_target(&uri("/v1/chain/get_info#..")),
+            Some("/v1/chain/get_info")
         );
     }
 

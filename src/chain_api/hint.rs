@@ -62,12 +62,14 @@ pub fn hint(ep: BlockEndpoint, body: &[u8]) -> Option<u32> {
     }
 }
 
-/// A JSON integer >= 0, or a string of 1 to 20 ASCII digits whose value
-/// fits in u64. Truncated to u32, as nodeos looks the block up.
+/// A JSON integer >= 0, or a string of 1 to 64 ASCII digits whose value
+/// fits in u64. fc reads such a string as a number whatever its length
+/// (boost `lexical_cast` skips leading zeros), so `"0000000000000000000005"`
+/// is block 5, not an id. Truncated to u32, as nodeos looks the block up.
 fn decimal(value: &Value) -> Option<u32> {
     match value {
         Value::UInt(v) => Some(*v as u32),
-        Value::Str(s) if (1..=20).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()) => {
+        Value::Str(s) if (1..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()) => {
             s.parse::<u64>().ok().map(|v| v as u32)
         }
         _ => None,
@@ -101,13 +103,22 @@ enum Value {
 
 /// The value of top-level `key` in a strict JSON object, or `None` when the
 /// body is not one, repeats a top-level key, holds a non-integer number
-/// anywhere, or has no `key`.
+/// anywhere, nests deeper than fc parses, or has no `key`.
 fn top_level_value(body: &[u8], key: &'static str) -> Option<Value> {
     let mut de = serde_json::Deserializer::from_slice(body);
     let value = TopLevel { key }.deserialize(&mut de).ok()?;
     de.end().ok()?;
     value
 }
+
+/// The nesting level (the top-level object is level 1) at which a container
+/// may no longer hold anything. fc's legacy parser starts with a depth
+/// budget of 200 and spends two units per level: `variant_from_stream`
+/// passes `max_depth - 1` to the container parser, which passes
+/// `max_depth - 1` again to each member or element. So the values inside a
+/// level-100 container are parsed with a budget of 0, which fails. An empty
+/// container at that level parses.
+const FC_FULL_LEVEL: u32 = 100;
 
 /// Reads the top-level object.
 struct TopLevel {
@@ -138,111 +149,150 @@ impl<'de> Visitor<'de> for TopLevel {
             if !seen.insert(key) {
                 return Err(de::Error::custom("repeated top-level key"));
             }
+            // A member value that is a container opens level 2.
             if key == self.key {
-                found = Some(map.next_value::<HintValue>()?.0);
+                found = Some(map.next_value_seed(HintValue { level: 2 })?);
             } else {
-                map.next_value::<NoFloat>()?;
+                map.next_value_seed(Nested { level: 2 })?;
             }
         }
         Ok(found)
     }
 }
 
-/// Any JSON value with no non-integer number in it. Integers that do not
-/// fit u64 or i64 (and `-0`) also arrive as floats and are refused.
-struct NoFloat;
+/// Any JSON value with no non-integer number in it and no deeper nesting
+/// than fc parses. `level` is the nesting level the value has if it is a
+/// container. Integers that do not fit u64 or i64 (and `-0`) also arrive as
+/// floats and are refused.
+#[derive(Clone, Copy)]
+struct Nested {
+    level: u32,
+}
 
-impl<'de> de::Deserialize<'de> for NoFloat {
-    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        d.deserialize_any(NoFloatVisitor)
+impl Nested {
+    fn too_deep<E: de::Error>() -> E {
+        E::custom("nested deeper than fc parses")
     }
 }
 
-struct NoFloatVisitor;
+impl<'de> DeserializeSeed<'de> for Nested {
+    type Value = ();
 
-impl<'de> Visitor<'de> for NoFloatVisitor {
-    type Value = NoFloat;
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Nested {
+    type Value = ();
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a JSON value without non-integer numbers")
     }
 
-    fn visit_bool<E: de::Error>(self, _: bool) -> Result<NoFloat, E> {
-        Ok(NoFloat)
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
     }
-    fn visit_i64<E: de::Error>(self, _: i64) -> Result<NoFloat, E> {
-        Ok(NoFloat)
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
     }
-    fn visit_u64<E: de::Error>(self, _: u64) -> Result<NoFloat, E> {
-        Ok(NoFloat)
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
     }
-    fn visit_f64<E: de::Error>(self, _: f64) -> Result<NoFloat, E> {
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<(), E> {
         Err(E::custom("non-integer number"))
     }
-    fn visit_str<E: de::Error>(self, _: &str) -> Result<NoFloat, E> {
-        Ok(NoFloat)
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<(), E> {
+        Ok(())
     }
-    fn visit_unit<E: de::Error>(self) -> Result<NoFloat, E> {
-        Ok(NoFloat)
+    fn visit_unit<E: de::Error>(self) -> Result<(), E> {
+        Ok(())
     }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<NoFloat, A::Error> {
-        while seq.next_element::<NoFloat>()?.is_some() {}
-        Ok(NoFloat)
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        if self.level >= FC_FULL_LEVEL {
+            return match seq.next_element::<IgnoredAny>()? {
+                Some(_) => Err(Self::too_deep()),
+                None => Ok(()),
+            };
+        }
+        let inner = Nested {
+            level: self.level + 1,
+        };
+        while seq.next_element_seed(inner)?.is_some() {}
+        Ok(())
     }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<NoFloat, A::Error> {
-        while map.next_entry::<IgnoredAny, NoFloat>()?.is_some() {}
-        Ok(NoFloat)
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        if self.level >= FC_FULL_LEVEL {
+            return match map.next_key::<IgnoredAny>()? {
+                Some(_) => Err(Self::too_deep()),
+                None => Ok(()),
+            };
+        }
+        let inner = Nested {
+            level: self.level + 1,
+        };
+        while map.next_key::<IgnoredAny>()?.is_some() {
+            map.next_value_seed(inner)?;
+        }
+        Ok(())
     }
 }
 
-/// The hint key's value; refuses non-integer numbers like [`NoFloat`].
-struct HintValue(Value);
+/// The hint key's value; refuses what [`Nested`] refuses.
+#[derive(Clone, Copy)]
+struct HintValue {
+    level: u32,
+}
 
-impl<'de> de::Deserialize<'de> for HintValue {
-    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        d.deserialize_any(HintValueVisitor)
+impl<'de> DeserializeSeed<'de> for HintValue {
+    type Value = Value;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+        d.deserialize_any(HintValueVisitor { level: self.level })
     }
 }
 
-struct HintValueVisitor;
+struct HintValueVisitor {
+    level: u32,
+}
 
 impl<'de> Visitor<'de> for HintValueVisitor {
-    type Value = HintValue;
+    type Value = Value;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a JSON value without non-integer numbers")
     }
 
-    fn visit_bool<E: de::Error>(self, _: bool) -> Result<HintValue, E> {
-        Ok(HintValue(Value::Other))
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Value, E> {
+        Ok(Value::Other)
     }
-    fn visit_i64<E: de::Error>(self, v: i64) -> Result<HintValue, E> {
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Value, E> {
         // serde_json reports non-negative integers through `visit_u64`; this
         // is a negative one.
-        Ok(HintValue(match u64::try_from(v) {
+        Ok(match u64::try_from(v) {
             Ok(v) => Value::UInt(v),
             Err(_) => Value::Other,
-        }))
+        })
     }
-    fn visit_u64<E: de::Error>(self, v: u64) -> Result<HintValue, E> {
-        Ok(HintValue(Value::UInt(v)))
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
+        Ok(Value::UInt(v))
     }
-    fn visit_f64<E: de::Error>(self, _: f64) -> Result<HintValue, E> {
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Value, E> {
         Err(E::custom("non-integer number"))
     }
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<HintValue, E> {
-        Ok(HintValue(Value::Str(v.to_owned())))
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Value, E> {
+        Ok(Value::Str(v.to_owned()))
     }
-    fn visit_unit<E: de::Error>(self) -> Result<HintValue, E> {
-        Ok(HintValue(Value::Other))
+    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Other)
     }
-    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<HintValue, A::Error> {
-        NoFloatVisitor.visit_seq(seq)?;
-        Ok(HintValue(Value::Other))
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Value, A::Error> {
+        Nested { level: self.level }.visit_seq(seq)?;
+        Ok(Value::Other)
     }
-    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<HintValue, A::Error> {
-        NoFloatVisitor.visit_map(map)?;
-        Ok(HintValue(Value::Other))
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Value, A::Error> {
+        Nested { level: self.level }.visit_map(map)?;
+        Ok(Value::Other)
     }
 }
 
@@ -358,11 +408,92 @@ mod tests {
             h(RAW, r#"{"block_num_or_id":"99999999999999999999"}"#),
             Some(0x9999_9999)
         );
-        // 22 digits: too long for a number, an even-length id.
+        // 22 digits that do not fit u64: an even-length id.
         assert_eq!(
             h(RAW, r#"{"block_num_or_id":"1234567890123456789012"}"#),
             Some(0x1234_5678)
         );
+    }
+
+    // CU2: fc reads any digit string whose value fits u64 as a number,
+    // however many leading zeros it has (boost `lexical_cast`).
+    #[test]
+    fn zero_padded_digit_strings_are_numbers() {
+        let padded = |len: usize, value: &str| format!("{}{value}", "0".repeat(len - value.len()));
+        for ep in [BlockEndpoint::Block, BlockEndpoint::BlockHeader, RAW, BHS] {
+            for len in [21, 22, 40, 64] {
+                let body = format!(r#"{{"block_num_or_id":"{}"}}"#, padded(len, "5"));
+                assert_eq!(h(ep, &body), Some(5), "{ep:?} {len}");
+            }
+            let max = padded(64, "18446744073709551615");
+            assert_eq!(
+                h(ep, &format!(r#"{{"block_num_or_id":"{max}"}}"#)),
+                Some(u32::MAX),
+                "{ep:?}"
+            );
+            // u32 truncation still applies.
+            let wide = padded(30, "4294967301");
+            assert_eq!(
+                h(ep, &format!(r#"{{"block_num_or_id":"{wide}"}}"#)),
+                Some(5),
+                "{ep:?}"
+            );
+        }
+        assert_eq!(
+            h(INFO, &format!(r#"{{"block_num":"{}"}}"#, padded(64, "7"))),
+            Some(7)
+        );
+        // A value above u64::MAX is not a number: an even-length string is an
+        // id, an odd one is nothing nodeos would find.
+        let over = padded(22, "18446744073709551616");
+        assert_eq!(
+            h(RAW, &format!(r#"{{"block_num_or_id":"{over}"}}"#)),
+            Some(0x0018_4467)
+        );
+        let odd_over = padded(23, "18446744073709551616");
+        assert_eq!(
+            h(RAW, &format!(r#"{{"block_num_or_id":"{odd_over}"}}"#)),
+            None
+        );
+        assert_eq!(h(INFO, &format!(r#"{{"block_num":"{over}"}}"#)), None);
+        // Longer than 64 characters: nodeos refuses the length.
+        let long = padded(65, "5");
+        assert_eq!(h(RAW, &format!(r#"{{"block_num_or_id":"{long}"}}"#)), None);
+    }
+
+    // CU2: fc's depth budget runs out inside a container at level 100.
+    #[test]
+    fn nesting_deeper_than_fc_parses_gets_no_hint() {
+        // `levels` arrays under the top-level object (level 1): the innermost
+        // is at level `levels + 1`.
+        let arrays = |levels: usize, inner: &str| {
+            format!(
+                r#"{{"block_num_or_id":"1","x":{}{inner}{}}}"#,
+                "[".repeat(levels),
+                "]".repeat(levels)
+            )
+        };
+        assert_eq!(h(RAW, &arrays(98, "1")), Some(1), "level 99 holds a value");
+        assert_eq!(h(RAW, &arrays(99, "")), Some(1), "level 100 may be empty");
+        assert_eq!(h(RAW, &arrays(99, "1")), None, "level 100 holds a value");
+        assert_eq!(h(RAW, &arrays(99, "[]")), None);
+        assert_eq!(h(RAW, &arrays(120, "")), None);
+        let objects = |levels: usize, inner: &str| {
+            format!(
+                r#"{{"x":{}{inner}{},"block_num_or_id":"1"}}"#,
+                r#"{"a":"#.repeat(levels - 1) + "{",
+                "}".repeat(levels)
+            )
+        };
+        assert_eq!(h(RAW, &objects(98, r#""a":1"#)), Some(1));
+        assert_eq!(h(RAW, &objects(99, "")), Some(1));
+        assert_eq!(h(RAW, &objects(99, r#""a":1"#)), None);
+        let shallow = format!(
+            r#"{{"other":1,"block_num_or_id":"2","z":{}{}}}"#,
+            "[".repeat(99),
+            "]".repeat(99)
+        );
+        assert_eq!(h(RAW, &shallow), Some(2));
     }
 
     // CU2

@@ -807,19 +807,21 @@ async fn p14_consecutive_ranges_reuse_the_socket_and_busy_ones_do_not() {
     send(&mut w, blocks(&request(300, 1000, 1000))).await;
     let (first, _) = read_blocks(&mut r, 2, WAIT).await;
     assert_eq!(nums(&first), vec![300, 301]);
-    send(&mut w, blocks(&request(500, 600, 5))).await;
+    // The new range lies below the old one, so every frame tells which
+    // request it belongs to, however many old frames were in flight.
+    send(&mut w, blocks(&request(200, 250, 5))).await;
     let mut seq = Vec::new();
-    while seq.last() != Some(&504) {
+    while seq.last() != Some(&204) {
         let (b, close) = read_blocks(&mut r, 1, WAIT).await;
         assert!(close.is_none() && b.len() == 1, "stalled after {seq:?}");
         seq.extend(nums(&b));
     }
     let new_at = seq
         .iter()
-        .position(|&n| n == 500)
+        .position(|&n| n == 200)
         .expect("the new request's first block");
-    assert!(seq[..new_at].iter().all(|&n| n < 500), "{seq:?}");
-    assert_eq!(seq[new_at..], [500, 501, 502, 503, 504], "{seq:?}");
+    assert!(seq[..new_at].iter().all(|&n| n >= 300), "{seq:?}");
+    assert_eq!(seq[new_at..], [200, 201, 202, 203, 204], "{seq:?}");
     assert_eq!(
         client_sessions(&a).len(),
         2,

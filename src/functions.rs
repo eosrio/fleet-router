@@ -1,3 +1,4 @@
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -121,9 +122,11 @@ pub fn should_reroute_for_finality(
 /// 3. does not cover the block but is fresh
 /// 4. does not cover the block and is stale
 ///
-/// Within the same rank, the server with the fewest active connections wins
-/// (least-connections load balancing). Stale servers are deprioritized but never
-/// excluded, so selection never starves when every upstream is stale.
+/// Within the same rank, the lowest configured `priority` tier wins. Inside a
+/// tier, the server with the fewest active connections per unit of `weight`
+/// wins (weighted least-connections); on a tie the higher weight wins. Stale
+/// servers are deprioritized but never excluded, so selection never starves
+/// when every upstream is stale.
 ///
 /// The range check uses an exclusive upper bound (`block < trace_end_block`) because SHiP's
 /// `get_status_result` reports `trace_end_block` as one-past-the-last available block.
@@ -149,9 +152,9 @@ pub fn select_backend_server(
 /// pending-byte cap can run. New sessions keep the online requirement.
 ///
 /// `exclude` is the upstream that just failed at this block. Another upstream
-/// at the same or better rank is preferred. The excluded upstream is still
-/// returned when it is the only one that covers the block, or the only
-/// candidate at all.
+/// at the same or better rank is preferred, even from a lower-priority tier.
+/// The excluded upstream is still returned when it is the only one that covers
+/// the block, or the only candidate at all.
 pub fn select_failover_server(
     servers: &mut HashMap<String, ServerState>,
     route: RouteRequest,
@@ -161,6 +164,43 @@ pub fn select_failover_server(
         return Ok(server);
     }
     select_ranked(servers, route, false, exclude)
+}
+
+/// Coverage and freshness of an upstream for `route`. Lower is better.
+///
+/// 0: covers the block and fresh, 1: covers but stale, 2: does not cover but
+/// fresh, 3: does not cover and stale.
+fn route_rank(state: &ServerState, route: RouteRequest) -> u8 {
+    let covers_range = route.block.is_some_and(|block| trace_covers(state, block));
+    match (covers_range, state.stale) {
+        (true, false) => 0,
+        (true, true) => 1,
+        (false, false) => 2,
+        (false, true) => 3,
+    }
+}
+
+/// Selection key for one eligible upstream.
+#[derive(Clone, Copy)]
+struct Candidate {
+    rank: u8,
+    priority: u32,
+    connections: usize,
+    weight: u32,
+}
+
+impl Candidate {
+    /// `Less` means `self` is the better choice.
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // Weighted least-connections: compare connections / weight without
+        // dividing, as connections * other.weight vs other.connections * weight.
+        let load = |conns: usize, weight: u32| (conns as u128) * u128::from(weight);
+        self.rank
+            .cmp(&other.rank)
+            .then(self.priority.cmp(&other.priority))
+            .then(load(self.connections, other.weight).cmp(&load(other.connections, self.weight)))
+            .then(other.weight.cmp(&self.weight))
+    }
 }
 
 fn select_ranked(
@@ -177,9 +217,8 @@ fn select_ranked(
                 .any(|state| state.enabled && state.online && finality_covers(state, block))
         });
 
-    // Lower (rank, connections) is better.
-    let mut best: Option<(u8, usize, String)> = None;
-    let mut best_other: Option<(u8, usize, String)> = None;
+    let mut best: Option<(Candidate, String)> = None;
+    let mut best_other: Option<(Candidate, String)> = None;
 
     for (server, state) in servers.iter_mut() {
         state.prune_expired_quarantines(now);
@@ -195,53 +234,39 @@ fn select_ranked(
             }
         }
 
-        let conns = state.connections.load(Ordering::Relaxed);
-
-        let covers_range = route.block.is_some_and(|block| trace_covers(state, block));
-
-        let rank = match (covers_range, state.stale) {
-            (true, false) => 0u8,
-            (true, true) => 1,
-            (false, false) => 2,
-            (false, true) => 3,
+        let candidate = Candidate {
+            rank: route_rank(state, route),
+            priority: state.priority,
+            connections: state.connections.load(Ordering::Relaxed),
+            weight: state.weight.max(1),
         };
 
-        if best
-            .as_ref()
-            .is_none_or(|(best_rank, best_conns, _)| (rank, conns) < (*best_rank, *best_conns))
-        {
-            best = Some((rank, conns, server.clone()));
-        }
         if exclude != Some(server.as_str())
             && best_other
                 .as_ref()
-                .is_none_or(|(best_rank, best_conns, _)| (rank, conns) < (*best_rank, *best_conns))
+                .is_none_or(|(other, _)| candidate.cmp(other).is_lt())
         {
-            best_other = Some((rank, conns, server.clone()));
+            best_other = Some((candidate, server.clone()));
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(best, _)| candidate.cmp(best).is_lt())
+        {
+            best = Some((candidate, server.clone()));
         }
     }
 
-    // Prefer a different upstream only when it is as suitable as the best
-    // candidate. A peer that does not cover the block must not replace the
-    // only upstream that does.
-    let chosen = match (exclude, best, best_other) {
-        (Some(_), Some((best_rank, _, _)), Some((other_rank, _, other)))
-            if other_rank <= best_rank =>
-        {
-            other
+    // Prefer a different upstream only when it covers the block as well as
+    // the best candidate. Priority does not keep a session on the upstream
+    // that just failed, but a peer that does not cover the block must not
+    // replace the only upstream that does.
+    let (chosen, rank) = match (exclude, best, best_other) {
+        (Some(_), Some((best, _)), Some((other, server))) if other.rank <= best.rank => {
+            (server, other.rank)
         }
-        (_, Some((_, _, server)), _) => server,
+        (_, Some((best, server)), _) => (server, best.rank),
         _ => return Err(errors::NO_SERVERS_AVAILABLE),
     };
-    let rank = servers.get(&chosen).map_or(0, |state| {
-        let covers_range = route.block.is_some_and(|block| trace_covers(state, block));
-        match (covers_range, state.stale) {
-            (true, false) => 0,
-            (true, true) => 1,
-            (false, false) => 2,
-            (false, true) => 3,
-        }
-    });
     if let Some(block) = route.block {
         if rank >= 2 && !restrict_finality {
             tracing::warn!(
@@ -572,5 +597,100 @@ mod tests {
             select_backend_server(&mut servers, route_at(117)).unwrap(),
             "only"
         );
+    }
+
+    fn tiered(conns: usize, priority: u32, weight: u32) -> ServerState {
+        let mut state = server(conns, (1, 500), (0, 0));
+        state.priority = priority;
+        state.weight = weight;
+        state
+    }
+
+    #[test]
+    fn lower_priority_tier_wins_over_fewer_connections() {
+        let mut servers = HashMap::new();
+        servers.insert("primary".to_string(), tiered(9, 0, 1));
+        servers.insert("backup".to_string(), tiered(0, 1, 1));
+        assert_eq!(
+            select_backend_server(&mut servers, route_at(100)).unwrap(),
+            "primary"
+        );
+        assert_eq!(
+            select_backend_server(&mut servers, RouteRequest::default()).unwrap(),
+            "primary",
+            "priority also applies on initial connect, before any block is known"
+        );
+    }
+
+    #[test]
+    fn backup_tier_serves_when_the_preferred_tier_is_offline() {
+        let mut servers = HashMap::new();
+        let mut primary = tiered(0, 0, 1);
+        primary.online = false;
+        servers.insert("primary".to_string(), primary);
+        servers.insert("backup".to_string(), tiered(3, 100, 1));
+        assert_eq!(
+            select_backend_server(&mut servers, route_at(100)).unwrap(),
+            "backup"
+        );
+    }
+
+    #[test]
+    fn coverage_and_freshness_outrank_priority() {
+        let mut servers = HashMap::new();
+        let mut short = tiered(0, 0, 1);
+        short.trace_end_block = 50;
+        servers.insert("preferred-short".to_string(), short);
+        servers.insert("backup-covers".to_string(), tiered(0, 5, 1));
+        assert_eq!(
+            select_backend_server(&mut servers, route_at(100)).unwrap(),
+            "backup-covers"
+        );
+
+        let mut servers = HashMap::new();
+        let mut stale = tiered(0, 0, 1);
+        stale.stale = true;
+        servers.insert("preferred-stale".to_string(), stale);
+        servers.insert("backup-fresh".to_string(), tiered(0, 5, 1));
+        assert_eq!(
+            select_backend_server(&mut servers, route_at(100)).unwrap(),
+            "backup-fresh"
+        );
+    }
+
+    #[test]
+    fn weight_splits_sessions_within_a_tier() {
+        let mut servers = HashMap::new();
+        servers.insert("big".to_string(), tiered(0, 0, 2));
+        servers.insert("small".to_string(), tiered(0, 0, 1));
+        servers.insert("backup".to_string(), tiered(0, 1, 10));
+        for _ in 0..30 {
+            let picked = select_backend_server(&mut servers, route_at(100)).unwrap();
+            servers[&picked].connections.fetch_add(1, Ordering::Relaxed);
+        }
+        let conns = |name: &str| servers[name].connections.load(Ordering::Relaxed);
+        assert_eq!(conns("big"), 20);
+        assert_eq!(conns("small"), 10);
+        assert_eq!(conns("backup"), 0);
+    }
+
+    #[test]
+    fn equal_load_prefers_the_higher_weight() {
+        let mut servers = HashMap::new();
+        servers.insert("small".to_string(), tiered(1, 0, 1));
+        servers.insert("big".to_string(), tiered(2, 0, 2));
+        assert_eq!(
+            select_backend_server(&mut servers, route_at(100)).unwrap(),
+            "big"
+        );
+    }
+
+    #[test]
+    fn retry_leaves_a_failed_preferred_upstream_for_a_backup() {
+        let mut servers = HashMap::new();
+        servers.insert("primary".to_string(), tiered(0, 0, 1));
+        servers.insert("backup".to_string(), tiered(0, 5, 1));
+        let picked = select_failover_server(&mut servers, route_at(100), Some("primary")).unwrap();
+        assert_eq!(picked, "backup");
     }
 }

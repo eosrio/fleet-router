@@ -12,6 +12,7 @@ All `*_ms` fields are in **milliseconds**.
 - [Minimal example](#minimal-example)
 - [Top-level fields](#top-level-fields)
 - [Upstream servers](#upstream-servers)
+  - [Upstream preference](#upstream-preference)
 - [Upstream TLS (`wss://`)](#upstream-tls-wss)
 - [Client message limits](#client-message-limits)
 - [Multiple networks](#multiple-networks)
@@ -93,8 +94,40 @@ Each entry in `servers` is an object:
 - **`name`** *(string, required)* — Human-readable name used in logs and as the `server` label on each `/metrics` series for this upstream.
 - **`endpoint`** *(string, required)* — Upstream as `host:port`, `ws://host:port`, or `wss://host:port`. A bare `host:port` is dialed as `ws://`. Endpoints must be unique within a listener's pool.
 - **`enabled`** *(bool, required)* — Whether the router may use this upstream. At least one enabled server is required.
+- **`priority`** *(u32, optional, default `0`)* — Preference tier. Lower is preferred. See [Upstream preference](#upstream-preference).
+- **`weight`** *(u32, optional, default `1`, `≥ 1`)* — Relative share of sessions within the same priority tier. See [Upstream preference](#upstream-preference).
 
 Uniqueness is the dial target: `127.0.0.1:8080` and `ws://127.0.0.1:8080` are the same upstream, and so are `ws://host` and `ws://host:80`. `ws://` and `wss://` to the same host are different. Unknown schemes (`https://`, `http://`, …) are rejected.
+
+### Upstream preference
+
+By default every upstream is equal and new sessions go to the one with the fewest active connections. Use `priority` and `weight` to change that.
+
+- **`priority`** sorts upstreams into tiers. The router uses the lowest tier that can serve the request and moves to the next tier only when nothing in the better tier can. A large value (for example `100`) makes an upstream a **last resort**: it takes sessions only when every preferred upstream is offline, stale, quarantined for the block, or does not have the block.
+- **`weight`** splits sessions inside one tier. The router picks the upstream with the fewest active connections per unit of weight, so a node with `"weight": 2` carries about twice the sessions of a node with `"weight": 1`. On a tie, the higher weight wins.
+
+Preference never overrides whether an upstream can serve the request. For each new session and each failover, the router ranks candidates in this order:
+
+1. Online, enabled, and not quarantined for the requested block (always required).
+2. Trace range covers the requested block and the node is advancing, then covers but stale, then does not cover but advancing, then neither.
+3. Lowest `priority`.
+4. Fewest connections per unit of `weight`, then the higher `weight`.
+
+So a preferred node that is stale or missing the requested block loses to a backup node that has it. When the upstream serving a session fails, failover moves to another upstream that covers the block as well, even if that upstream is in a lower-preference tier.
+
+Priority is applied when a session is placed. Sessions already on a backup upstream stay there when a preferred upstream comes back; new sessions go to the preferred one.
+
+```json
+"servers": [
+  { "name": "local-1",  "endpoint": "10.0.0.10:8080",         "enabled": true, "weight": 2 },
+  { "name": "local-2",  "endpoint": "10.0.0.11:8080",         "enabled": true },
+  { "name": "provider", "endpoint": "wss://ship.example:443", "enabled": true, "priority": 100 }
+]
+```
+
+Here `local-1` and `local-2` share all traffic about 2:1, and `provider` is used only when neither local node can serve a request.
+
+`/metrics` reports each upstream's settings as `fleet_router_upstream_priority` and `fleet_router_upstream_weight`.
 
 ## Upstream TLS (`wss://`)
 

@@ -32,6 +32,8 @@ Each per-upstream series carries `server="<name>"` from the configured server na
 fleet_router_up
 fleet_router_upstream_up{endpoint,server}
 fleet_router_upstream_stale{endpoint,server}
+fleet_router_upstream_priority{endpoint,server}
+fleet_router_upstream_weight{endpoint,server}
 fleet_router_active_connections{endpoint,server}
 fleet_router_upstream_trace_begin_block{endpoint,server}
 fleet_router_upstream_chain_state_begin_block{endpoint,server}

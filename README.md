@@ -69,6 +69,8 @@ fleet-router config test ./config.json   # 3. validate and test upstream connect
 fleet-router run --config ./config.json  # 4. start the proxy
 ```
 
+To start fleet-router at boot and restart it after a crash, run it as a service: [systemd, Docker, launchd or Windows](docs/operations.md#run-as-a-service).
+
 A minimal config with two SHiP nodes:
 
 ```json
@@ -111,9 +113,9 @@ fleet-router --help                 Print help.
 ## Documentation
 
 - **[Configuration reference](docs/configuration.md)**: every field and default, upstream TLS, and multi-network `listeners`.
-- **[Running in production](docs/operations.md)**: security, systemd, Docker, graceful shutdown, corrupted SHiP logs, and tuning.
+- **[Running in production](docs/operations.md)**: security, running as a service (systemd, Docker, launchd, Windows), graceful shutdown, corrupted SHiP logs, and tuning.
 - **[Observability](docs/observability.md)**: logging, health and readiness endpoints, and the Prometheus metrics.
-- **Deployment samples**: [`deploy/fleet-router@.service`](deploy/fleet-router@.service) and [`deploy/docker-compose.multi-network.yml`](deploy/docker-compose.multi-network.yml).
+- **Deployment samples**: [`deploy/fleet-router.service`](deploy/fleet-router.service), [`deploy/fleet-router@.service`](deploy/fleet-router@.service), and [`deploy/docker-compose.multi-network.yml`](deploy/docker-compose.multi-network.yml).
 
 ## Security
 

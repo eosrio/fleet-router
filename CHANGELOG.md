@@ -18,12 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fleet_router_upstream_priority` and `fleet_router_upstream_weight`.
   Requested by @Rossco99.
 - Static landing page under `site/` for GitHub Pages.
+- `deploy/fleet-router.service`, a systemd unit for one process and one config
+  file, next to the per-network `fleet-router@.service` template.
+- "Run as a service" section in `docs/operations.md`: step-by-step systemd
+  install, Docker restart policy, a launchd plist for macOS, and running the
+  Windows build under a service wrapper.
 
 ### Changed
 
 - Shorten `README.md` to an overview, install, and quick start. The full
   configuration reference, production notes, and metrics moved to
   `docs/configuration.md`, `docs/operations.md`, and `docs/observability.md`.
+- Both systemd units set `LimitNOFILE=65536` (the systemd default of 1024
+  open files capped the router at about 500 clients), `RestartSec=2`, and
+  basic sandboxing (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
+  `PrivateTmp`).
 
 ## [0.5.0] - 2026-10-15
 

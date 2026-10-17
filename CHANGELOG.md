@@ -7,8 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A session on an upstream that went silent without closing the connection
+  (cable pulled, VM frozen, firewall dropping packets) waited until the
+  operating system gave up on the TCP connection, often around 15 minutes,
+  and the client saw a stalled stream. Sessions now ping a quiet upstream and
+  fail over when nothing comes back within `upstream_liveness_timeout_ms`
+  (default 4 s), or within 1 s once the monitor has marked that upstream
+  offline. The client keeps its connection and resumes at the next block.
+  Reported by @Rossco99.
+- The upstream monitor stopped for good when an upstream closed its WebSocket
+  cleanly, as nodeos does on a normal shutdown or restart. That upstream then
+  stayed offline until fleet-router restarted. The monitor now reconnects.
+
 ### Added
 
+- `upstream_liveness_timeout_ms` (default `4000`, `0` disables). See Fixed.
 - Opt-in live dashboard at `/ui/`, a plain `/status` page, and a JSON API
   under `/api/v1` (status, sessions, 15-minute history, events, and a
   server-sent events stream), served on `metrics_port` when

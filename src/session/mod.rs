@@ -444,6 +444,9 @@ struct Session {
     /// [`MOVE_EXCLUSION`]) until the next link is up or nothing else can take
     /// the session.
     moved_off: Option<Arc<str>>,
+    /// A handler took a new view with [`Session::sync_view`]; the loop has
+    /// not acted on it yet (see [`Session::on_view_change`]).
+    view_unseen: bool,
 }
 
 impl Session {
@@ -493,6 +496,7 @@ impl Session {
             registry,
             moved_from: None,
             moved_off: None,
+            view_unseen: false,
         }
     }
 
@@ -503,10 +507,13 @@ impl Session {
         self.phase = phase;
     }
 
-    /// Take the latest published fleet view, if a new one exists.
+    /// Take the latest published fleet view, if a new one exists. The loop
+    /// acts on it next (a probe, a waiting status request, a standby, a wait
+    /// or hold), as if it had seen the change itself.
     fn sync_view(&mut self) {
         if self.view_rx.has_changed().unwrap_or(false) {
             self.view = self.view_rx.borrow_and_update().clone();
+            self.view_unseen = true;
         }
     }
 
@@ -642,8 +649,8 @@ impl Session {
         // The idle timer starts once the ABI has been forwarded.
         self.client_seen = Instant::now();
         loop {
-            if self.view_rx.has_changed().unwrap_or(false) {
-                self.view = self.view_rx.borrow_and_update().clone();
+            if self.view_unseen || self.view_rx.has_changed().unwrap_or(false) {
+                self.sync_view();
                 if let Flow::Stop = self.on_view_change().await {
                     break;
                 }
@@ -749,6 +756,7 @@ impl Session {
     }
 
     async fn on_view_change(&mut self) -> Flow {
+        self.view_unseen = false;
         self.probe_if_lost().await;
         if let Flow::Stop = self.drive_status().await {
             return Flow::Stop;
@@ -2692,6 +2700,10 @@ impl Session {
     /// session could not read for a while (a standby taken over, or a long
     /// write to a slow client) is not failed over before the upstream had a
     /// chance to answer.
+    ///
+    /// A probe ends the link after [`OFFLINE_PROBE`] without a byte from the
+    /// upstream: bytes still arriving (a large message on its way, which the
+    /// pong cannot overtake) keep it going, as they do for the timeout.
     fn liveness_deadline(&self, link: &Link) -> Option<Instant> {
         let limit = self.liveness_timeout()?;
         let last_read = self.epoch + Duration::from_millis(link.read_ms());
@@ -2699,7 +2711,11 @@ impl Session {
             None => last_read + limit / 2,
             Some(ping) => (last_read + limit).max(ping + limit / 2),
         };
-        Some(link.st.probe_until.map_or(at, |probe| probe.min(at)))
+        let probe = link
+            .st
+            .probe_until
+            .map(|probe| probe.max(last_read + OFFLINE_PROBE));
+        Some(probe.map_or(at, |probe| probe.min(at)))
     }
 
     /// A view shows the link's upstream gone offline since the last one the
@@ -3766,6 +3782,133 @@ mod tests {
         );
         assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Silent), 1);
         assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Offline), 0);
+        dead_task.abort();
+    }
+
+    /// A TCP proxy to `target` that passes the upstream's bytes on in
+    /// `chunk`-sized pieces with `pause` between them (requests pass
+    /// freely): a slow link on which a large message takes seconds.
+    async fn throttled(target: String, chunk: usize, pause: Duration) -> (String, JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = tcp.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            while let Ok((inbound, _)) = tcp.accept().await {
+                let Ok(outbound) = TcpStream::connect(&target).await else {
+                    continue;
+                };
+                let (mut in_r, mut in_w) = inbound.into_split();
+                let (mut out_r, mut out_w) = outbound.into_split();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    while let Ok(n @ 1..) = in_r.read(&mut buf).await {
+                        if out_w.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; chunk];
+                    while let Ok(n @ 1..) = out_r.read(&mut buf).await {
+                        if in_w.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(pause).await;
+                    }
+                });
+            }
+        });
+        (endpoint, task)
+    }
+
+    /// The monitor loses an upstream while a 3 MB block is on its way over a
+    /// slow link (about 2 s). Bytes keep arriving, so the 1 s probe does not
+    /// fail the link over as silent, and the block arrives whole.
+    #[tokio::test]
+    async fn a_probe_spares_a_link_whose_large_block_is_still_arriving() {
+        let (up, _mock) = start_mock(MockShipConfig {
+            blocks_to_stream: 0,
+            block_data_size: 3_000_000,
+            ..Default::default()
+        })
+        .await;
+        let (slow, proxy) = throttled(up, 16 * 1024, Duration::from_millis(10)).await;
+        let (healthy, healthy_mock) = start_mock(MockShipConfig {
+            blocks_to_stream: 0,
+            ..Default::default()
+        })
+        .await;
+        let limits = ProxyLimits {
+            upstream_liveness_timeout_ms: 20_000,
+            max_message_bytes: 64 << 20,
+            ..limits(0)
+        };
+        let harness = start_session_with(&[&slow, &healthy], &[&slow], limits).await;
+        let mut client = connect(&harness.url).await;
+        set_online(&harness.hub, &healthy).await;
+        let request = mock_ship::client::BlocksReq {
+            start: 100,
+            end: 101,
+            max_in_flight: 1,
+            fetch_block: true,
+            ..Default::default()
+        };
+        client
+            .send(Message::binary(mock_ship::client::blocks(&request)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&slow)
+                .unwrap()
+                .mark_offline(std::time::Instant::now());
+            harness.hub.rebuild(&db);
+        }
+        let frame = match timeout(Duration::from_secs(10), client.next()).await {
+            Ok(Some(Ok(Message::Binary(frame)))) => frame,
+            other => panic!("expected the block, got {other:?}"),
+        };
+        assert!(frame.len() > 3_000_000, "{} bytes", frame.len());
+        assert_eq!(BlockView::parse(&frame).and_then(|v| v.num()), Some(100));
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Silent), 0);
+        assert_eq!(healthy_mock.sessions_accepted(), 0);
+        proxy.abort();
+    }
+
+    /// The view that shows the link's upstream offline arrives without the
+    /// monitor's wake (it was missed), and a client request takes it first.
+    /// The loop still probes the link: the session fails over after about a
+    /// second, not after its liveness timeout.
+    #[tokio::test]
+    async fn a_view_taken_by_a_request_still_probes_a_lost_upstream() {
+        let (dead, dead_task) = dead_upstream().await;
+        let (healthy, _healthy_mock) = start_mock(MockShipConfig {
+            blocks_to_stream: 0,
+            ..Default::default()
+        })
+        .await;
+        let harness = start_session_with(&[&dead, &healthy], &[&dead], liveness(6_000)).await;
+        let mut client = connect(&harness.url).await;
+        set_online(&harness.hub, &healthy).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let lost = Instant::now();
+        {
+            let mut db = harness.hub.state.lock().await;
+            let state = db.get_mut(&dead).unwrap();
+            state.online = false;
+            state.offline_since = Some(std::time::Instant::now());
+            harness.hub.rebuild(&db);
+        }
+        client.send(blocks_request(100, 103, 10)).await.unwrap();
+        assert_eq!(read_block_nums(&mut client, 3).await, vec![100, 101, 102]);
+        let waited = lost.elapsed();
+        assert!(
+            waited < Duration::from_secs(3),
+            "failed over after {waited:?}"
+        );
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Silent), 1);
         dead_task.abort();
     }
 

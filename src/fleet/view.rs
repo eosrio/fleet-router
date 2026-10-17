@@ -632,7 +632,11 @@ pub(crate) fn build_view(
         }
     }
     if ctx.topology == ResolvedTopology::Stitched {
-        warn_stitched(ctx, &upstreams, canonical.as_ref(), lib, mem);
+        // Only live nodes say where the LIB is. An archive-only fleet's tip is
+        // its newest archive head, so its archives can never be above it
+        // (and which archive reports first must not decide a warning).
+        let live_lib = if live_configured { lib } else { None };
+        warn_stitched(ctx, &upstreams, canonical.as_ref(), live_lib, mem);
     }
 
     let chain_id = ctx.pinned_chain_id.or_else(|| {
@@ -933,12 +937,13 @@ fn choose_canonical(
 
 /// One-time warnings of a stitched listener: an upstream whose ABI differs
 /// from the canonical one (once per upstream and fingerprint), and a frozen
-/// upstream that serves blocks above the fleet LIB + 1 (once per upstream).
+/// upstream that serves blocks above the LIB + 1 its live nodes report (once
+/// per upstream). `live_lib` is `None` while no live node's LIB is known.
 fn warn_stitched(
     ctx: &BuildCtx<'_>,
     upstreams: &[UpstreamView],
     canonical: Option<&(Arc<AbiEntry>, AbiSource)>,
-    lib: Option<BlockPos>,
+    live_lib: Option<BlockPos>,
     mem: &mut HubMemory,
 ) {
     let listener = ctx.listener.unwrap_or("default");
@@ -965,7 +970,7 @@ fn warn_stitched(
             }
         }
     }
-    let Some(lib) = lib else {
+    let Some(lib) = live_lib else {
         return;
     };
     for u in upstreams
@@ -1206,6 +1211,50 @@ mod tests {
 
     fn tips(n: usize) -> Vec<Arc<ObservedTip>> {
         (0..n).map(|_| Arc::new(ObservedTip::default())).collect()
+    }
+
+    /// An archive-only fleet never warns that an archive serves blocks above
+    /// the LIB, whichever archive reports first. With live nodes it warns,
+    /// once per archive, when one ends above the LIB they report, and not
+    /// before their LIB is known.
+    #[test]
+    fn the_frozen_end_warning_needs_a_live_lib() {
+        let t = tips(3);
+        let declared = |index, begin, end| frozen_unreported(index, Some((begin, end)));
+        for list in [
+            vec![frozen(0, 1, 1001), declared(1, 1001, 2001)],
+            vec![declared(0, 1, 1001), frozen(1, 1001, 2001)],
+            vec![frozen(0, 1, 1001), frozen(1, 1001, 2001)],
+        ] {
+            let mut m = mem();
+            let v = build(&list, &t, &mut m);
+            assert!(v.head.is_some());
+            assert!(m.warned_frozen_end.is_empty(), "archive-only");
+        }
+
+        let mut quiet = live(2, 1900, 1950);
+        quiet.online = false;
+        quiet.ranges_known = false;
+        quiet.head = None;
+        quiet.lib = None;
+        let mut m = mem();
+        build(
+            &[frozen(0, 2, 1001), frozen(1, 1001, 2001), quiet],
+            &t,
+            &mut m,
+        );
+        assert!(m.warned_frozen_end.is_empty(), "no live LIB yet");
+
+        // The live LIB is 1940: B's range ends above it, A's does not.
+        let fleet = [
+            frozen(0, 2, 1001),
+            frozen(1, 1001, 2001),
+            live(2, 1900, 1950),
+        ];
+        build(&fleet, &t, &mut m);
+        assert_eq!(m.warned_frozen_end, HashSet::from([1]));
+        build(&fleet, &t, &mut m);
+        assert_eq!(m.warned_frozen_end.len(), 1, "once");
     }
 
     #[test]

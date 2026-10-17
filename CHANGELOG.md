@@ -19,7 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enable, or drain an upstream, change its priority and weight at runtime,
   clear its quarantines, and move or close a single session. A drain moves
   live sessions to other upstreams with the normal failover, so clients stay
-  connected. Runtime changes are not written back to the config.
+  connected. A session moves only when another online upstream's range
+  starts at or before its next block, so draining the only archive node
+  leaves its history readers in place. Runtime changes are not written back
+  to the config.
 - `dashboard.allowed_hosts`: dashboard routes answer only requests addressed
   by IP, `localhost`, or a listed name, which blocks DNS rebinding. At most 32
   live streams are open at once.

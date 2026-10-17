@@ -202,12 +202,12 @@ Every successful action is recorded as a `control` event and logged.
 | --- | --- | --- |
 | `GET /api/v1/auth` | | `204` if the token is valid. Lets a client check a token before showing controls. |
 | `POST /api/v1/listeners/{listener}/upstreams/{endpoint}/disable` | | Stop routing **new** sessions to it. Current sessions stay. The monitor keeps polling it. |
-| `POST /api/v1/listeners/{listener}/upstreams/{endpoint}/drain` | | Disable it and move every current session to another upstream with the normal failover (resume at the next block, no client reconnect). Sessions with no other upstream to go to stay where they are. |
+| `POST /api/v1/listeners/{listener}/upstreams/{endpoint}/drain` | | Disable it and move its current sessions to other upstreams with the normal failover (resume at the next block, no client reconnect). A session moves only when another online upstream's trace range starts at or before the session's next block. Sessions that no other upstream can serve (for example readers of old history when draining the only archive node) stay where they are, and the `control` event says how many stayed. |
 | `POST /api/v1/listeners/{listener}/upstreams/{endpoint}/enable` | | Route to it again. |
 | `PATCH /api/v1/listeners/{listener}/upstreams/{endpoint}` | `{"priority": 5, "weight": 2}` (either field) | Change priority or weight. `weight` must be at least 1. Applies to new sessions and failovers. |
 | `POST /api/v1/listeners/{listener}/upstreams/{endpoint}/reset` | | Restore `priority`, `weight`, and enabled state from the config. |
 | `POST /api/v1/listeners/{listener}/upstreams/{endpoint}/clear-quarantine` | | Remove its active block-range quarantines. |
-| `POST /api/v1/sessions/{id}/move` | | Move one session to another upstream with the normal failover. |
+| `POST /api/v1/sessions/{id}/move` | | Move one session to another upstream with the normal failover. Returns `409` when no other online upstream's range starts at or before the session's next block. |
 | `POST /api/v1/sessions/{id}/close` | | Close one session with WebSocket close code 1000 and reason `closed by operator`. |
 
 Upstream actions return the updated upstream object (same shape as in `status`). Session actions return `202` with `{"ok": true}`; the move or close happens asynchronously and shows up as an event.

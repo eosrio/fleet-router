@@ -113,6 +113,29 @@ pub fn should_reroute_for_finality(
     })
 }
 
+/// Whether another upstream than `endpoint` can take over a session whose next
+/// block is `next_block`, for an operator move or drain.
+///
+/// The other upstream must be routable and online, and its trace range must
+/// start at or before the block. A range that ends earlier still qualifies:
+/// sessions at the chain tip wait for the node to advance, as on any
+/// failover. A node that starts after the block (a pruned node, for a reader
+/// catching up on old history) does not. `None` (no block requested yet)
+/// accepts any routable, online upstream.
+pub fn has_alternative_for(
+    servers: &HashMap<String, ServerState>,
+    endpoint: &str,
+    next_block: Option<u32>,
+) -> bool {
+    servers.iter().any(|(name, state)| {
+        name != endpoint
+            && state.routable()
+            && state.online
+            && next_block
+                .is_none_or(|block| state.trace_end_block > 0 && state.trace_begin_block <= block)
+    })
+}
+
 /// Select a backend server from the list of available (enabled + online) servers.
 ///
 /// Candidates are ranked, best first:
@@ -703,6 +726,28 @@ mod tests {
         servers.remove("other");
         assert!(select_backend_server(&mut servers, route_at(100)).is_err());
         assert!(select_failover_server(&mut servers, route_at(100), None).is_err());
+    }
+
+    #[test]
+    fn move_needs_another_upstream_whose_range_starts_by_the_next_block() {
+        let mut servers = HashMap::new();
+        // The archive holds old history; the pruned node starts at 400.
+        servers.insert("archive".to_string(), server(0, (1, 500), (0, 0)));
+        servers.insert("pruned".to_string(), server(0, (400, 500), (0, 0)));
+
+        // A reader catching up at block 100 has nowhere to go.
+        assert!(!has_alternative_for(&servers, "archive", Some(100)));
+        // A session near the tip, even past the pruned node's end, can move.
+        assert!(has_alternative_for(&servers, "archive", Some(450)));
+        assert!(has_alternative_for(&servers, "archive", Some(500)));
+        // Before any block is requested, any online upstream will do.
+        assert!(has_alternative_for(&servers, "archive", None));
+
+        servers.get_mut("pruned").unwrap().online = false;
+        assert!(!has_alternative_for(&servers, "archive", Some(450)));
+        servers.get_mut("pruned").unwrap().online = true;
+        servers.get_mut("pruned").unwrap().operator_disabled = true;
+        assert!(!has_alternative_for(&servers, "archive", None));
     }
 
     #[test]

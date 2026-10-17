@@ -19,8 +19,8 @@ use tungstenite::Message;
 
 use crate::abi::accept_upstream_abi;
 use crate::functions::{
-    parse_blocks_route, select_backend_server, select_failover_server, should_reroute_for_finality,
-    RouteRequest,
+    has_alternative_for, parse_blocks_route, select_backend_server, select_failover_server,
+    should_reroute_for_finality, RouteRequest,
 };
 use crate::models::{
     BlockFailureQuarantine, ProxyLimits, ServerConfigDb, ServerStateDb, UpstreamCounters,
@@ -248,15 +248,6 @@ async fn note_block_failure(
             .upstream(endpoint),
         );
     }
-}
-
-/// Whether another upstream than `endpoint` could take a moved session now.
-async fn has_alternative(backend_servers: &ServerStateDb, endpoint: &str) -> bool {
-    backend_servers
-        .lock()
-        .await
-        .iter()
-        .any(|(name, state)| name != endpoint && state.routable() && state.online)
 }
 
 /// Read the upstream's first meaningful frame, which must be the Text ABI.
@@ -641,12 +632,13 @@ pub async fn handle_client(
                         }
                         if session.take_move_request() {
                             let current = current_endpoint.lock().await.clone();
-                            if has_alternative(&backend_servers, &current).await {
+                            let next_block = session.next_block();
+                            if has_alternative_for(&*backend_servers.lock().await, &current, next_block) {
                                 operator_move = true;
                                 rerouted = true;
                                 break;
                             }
-                            tracing::info!(upstream = %current, "operator move skipped: no other upstream available");
+                            tracing::info!(upstream = %current, ?next_block, "operator move skipped: no other upstream can serve the next block");
                         }
                         continue;
                     }
@@ -685,12 +677,13 @@ pub async fn handle_client(
                         }
                         if session.take_move_request() {
                             let current = current_endpoint.lock().await.clone();
-                            if has_alternative(&backend_servers, &current).await {
+                            let next_block = session.next_block();
+                            if has_alternative_for(&*backend_servers.lock().await, &current, next_block) {
                                 operator_move = true;
                                 rerouted = true;
                                 break;
                             }
-                            tracing::info!(upstream = %current, "operator move skipped: no other upstream available");
+                            tracing::info!(upstream = %current, ?next_block, "operator move skipped: no other upstream can serve the next block");
                         }
                         continue;
                     }

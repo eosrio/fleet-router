@@ -171,6 +171,14 @@ impl SessionInfo {
         Self::block(&self.last_block)
     }
 
+    /// The block this session needs next: one past the last block delivered,
+    /// or the requested start block before any arrives.
+    pub fn next_block(&self) -> Option<u32> {
+        self.last_block()
+            .map(|block| block.saturating_add(1))
+            .or_else(|| self.start_block())
+    }
+
     pub fn finality(&self) -> bool {
         self.finality.load(Ordering::Relaxed)
     }
@@ -373,11 +381,14 @@ mod tests {
         let id = registration.info.id;
         let info = telemetry.session(id).unwrap();
         assert_eq!(info.start_block(), None);
+        assert_eq!(info.next_block(), None);
         info.note_request(100, true);
+        assert_eq!(info.next_block(), Some(100));
         info.note_frame(10, Some(100));
         info.note_frame(5, None);
         assert_eq!(info.start_block(), Some(100));
         assert_eq!(info.last_block(), Some(100));
+        assert_eq!(info.next_block(), Some(101));
         assert_eq!((info.blocks(), info.bytes()), (1, 15));
         assert!(info.finality());
 

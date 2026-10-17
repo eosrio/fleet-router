@@ -427,7 +427,7 @@ function renderControls(u, overridden) {
     drain.addEventListener("click", async () => {
       const ok = await confirmAction({
         title: `Drain ${u.name}?`,
-        text: `New sessions stop going to ${u.name}, and its ${int(u.sessions)} current session${u.sessions === 1 ? "" : "s"} move to other upstreams. Clients keep their connection and resume at the next block. Sessions with nowhere else to go stay.`,
+        text: `New sessions stop going to ${u.name}, and its ${int(u.sessions)} current session${u.sessions === 1 ? "" : "s"} move to other upstreams. Clients keep their connection and resume at the next block. A session stays here if no other online upstream has its next block, for example a reader of old history when this is the only archive node; the event log shows how many stayed.`,
         ok: "Drain",
       });
       if (ok) await run(drain, () => api.upstreamAction(open.listener, open.endpoint, "drain"), (fresh) => `Draining ${fresh.name}: its sessions are moving to other upstreams.`);

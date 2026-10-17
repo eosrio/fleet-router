@@ -325,3 +325,93 @@ async fn dashboard_is_off_unless_enabled_and_control_is_off_without_a_token() {
     drop(router);
     h1.shutdown().await;
 }
+
+#[tokio::test]
+async fn drain_keeps_a_history_reader_that_no_other_upstream_can_serve() {
+    let archive = MockShipServer::new(mock_config(1_000_000)).await;
+    let pruned = MockShipServer::new(MockShipConfig {
+        trace_begin_block: 900_000,
+        ..mock_config(1_000_000)
+    })
+    .await;
+    let (archive_ep, pruned_ep) = (archive.endpoint(), pruned.endpoint());
+    let (h1, h2) = (archive.start(), pruned.start());
+    let router = Router::start(
+        &[archive_ep.clone(), pruned_ep],
+        serde_json::json!({ "enabled": true, "control_token": TOKEN }),
+    );
+    let http = reqwest::Client::new();
+    router.wait_until_all_up(&http, 2).await;
+
+    // A reader catching up on old history, which only the archive has.
+    let (ws, _) = connect_async(format!("ws://127.0.0.1:{}", router.listen_port))
+        .await
+        .unwrap();
+    let (mut writer, mut reader) = ws.split();
+    let _abi = reader.next().await.unwrap().unwrap();
+    writer
+        .send(Message::Binary(blocks_request(100, 900_000).into()))
+        .await
+        .unwrap();
+    let before = read_blocks(&mut reader, 20).await;
+    assert_eq!(
+        only_session(&http, &router).await["upstream"],
+        archive_ep.as_str()
+    );
+
+    let resp = http
+        .post(router.url(&format!(
+            "/api/v1/listeners/default/upstreams/{}/drain",
+            archive_ep.replace(':', "%3A")
+        )))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The session stays on the archive and keeps streaming without a gap.
+    let after = read_blocks(&mut reader, 100).await;
+    let mut all = before.clone();
+    all.extend(&after);
+    assert_consecutive(&all);
+    let session = only_session(&http, &router).await;
+    assert_eq!(
+        session["upstream"],
+        archive_ep.as_str(),
+        "session: {session}"
+    );
+    assert_eq!(session["failovers"], 0);
+
+    // A manual move is refused for the same reason.
+    let id = session["id"].as_u64().unwrap();
+    let resp = http
+        .post(router.url(&format!("/api/v1/sessions/{id}/move")))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+
+    let events: Value = http
+        .get(router.url("/api/v1/events"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "control"
+                && event["message"].as_str().unwrap().contains("1 stay")),
+        "events: {events}"
+    );
+
+    drop(router);
+    h1.shutdown().await;
+    h2.shutdown().await;
+}

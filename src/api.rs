@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, Semaphore};
 
+use crate::functions::has_alternative_for;
 use crate::health::ListenerHealthState;
 use crate::models::{Server, ServerConfigDb, ServerState};
 use crate::tasks::hex_32;
@@ -537,9 +538,26 @@ async fn update_upstream(
     let ctx = find_listener(app, listener)?;
     let config = ctx.config_db.lock().await.get(endpoint).cloned();
     let mut db = ctx.health.state_db.lock().await;
-    let has_alternative = db
-        .iter()
-        .any(|(name, state)| name != endpoint && state.routable() && state.online);
+    if !db.contains_key(endpoint) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("unknown upstream '{endpoint}' on listener '{listener}'"),
+        ));
+    }
+    // For a drain, decide per session before this upstream is disabled: a
+    // session moves only when another upstream can serve its next block.
+    let (mut movable, mut stranded) = (Vec::new(), 0usize);
+    if matches!(action, Some(UpstreamAction::Drain)) {
+        for session in telemetry::global().sessions() {
+            if &*session.listener == listener && session.upstream() == endpoint {
+                if has_alternative_for(&db, endpoint, session.next_block()) {
+                    movable.push(session);
+                } else {
+                    stranded += 1;
+                }
+            }
+        }
+    }
     let Some(state) = db.get_mut(endpoint) else {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -558,18 +576,16 @@ async fn update_upstream(
         }
         Some(UpstreamAction::Drain) => {
             state.operator_disabled = true;
-            let mut moved = 0usize;
-            if has_alternative {
-                for session in telemetry::global().sessions() {
-                    if &*session.listener == listener && session.upstream() == endpoint {
-                        session.request_move();
-                        moved += 1;
-                    }
-                }
-                format!("drained {name}: moving {moved} session(s)")
-            } else {
-                format!("drained {name}: no other upstream is online, sessions stay")
+            for session in &movable {
+                session.request_move();
             }
+            let mut message = format!("drained {name}: moving {} session(s)", movable.len());
+            if stranded > 0 {
+                message.push_str(&format!(
+                    ", {stranded} stay because no other upstream has their next block"
+                ));
+            }
+            message
         }
         Some(UpstreamAction::Reset) => {
             state.operator_disabled = false;
@@ -675,19 +691,18 @@ async fn session_action(
     match action {
         SessionAction::Move => {
             let ctx = find_listener(app, &session.listener)?;
-            let has_alternative = ctx
-                .health
-                .state_db
-                .lock()
-                .await
-                .iter()
-                .any(|(name, state)| name != &upstream && state.routable() && state.online);
-            if !has_alternative {
+            let next_block = session.next_block();
+            let db = ctx.health.state_db.lock().await;
+            if !has_alternative_for(&db, &upstream, next_block) {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
-                    "no other upstream is online to move this session to",
+                    match next_block {
+                        Some(block) => format!("no other upstream online has block {block}"),
+                        None => "no other upstream is online".to_string(),
+                    },
                 ));
             }
+            drop(db);
             session.request_move();
             audit(
                 &session.listener,

@@ -27,6 +27,11 @@ const CLEAN_DELAY: Duration = Duration::from_millis(100);
 /// a request write that failed before any frame.
 pub(super) const DIAL_EXCLUSION: Duration = Duration::from_secs(2);
 
+/// The longest an operator move keeps the session off the upstream it left.
+/// The exclusion ends sooner: once the next link is up, or when nothing
+/// else can take the session, which then returns there.
+pub(super) const MOVE_EXCLUSION: Duration = Duration::from_secs(10);
+
 /// How long an upstream that jumped past the cursor on a resume is avoided.
 const UNCOVERED_EXCLUSION: Duration = Duration::from_secs(30);
 

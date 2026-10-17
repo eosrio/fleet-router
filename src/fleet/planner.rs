@@ -234,20 +234,30 @@ fn preference(a: &UpstreamView, a_conns: usize, b: &UpstreamView, b_conns: usize
 }
 
 /// Whether `u` can take over a session whose next block is `next_block`, for
-/// an operator move or drain: routable, online and usable, and its trace
-/// range starts at or before the block. A live range that ends earlier still
-/// qualifies (a session at the tip waits for the node to advance, as on any
-/// failover); a frozen one must contain the block. A node whose range starts
-/// after the block (a pruned node, for a reader catching up on old history)
-/// does not. `None` (no block requested yet) accepts any such upstream.
+/// an operator move or drain: routable, online and usable, below
+/// `max_sessions`, not quarantined at the block, and its trace range starts
+/// at or before the block. A live range that ends earlier still qualifies (a
+/// session at the tip waits for the node to advance, as on any failover); a
+/// frozen one must contain the block. A node whose range starts after the
+/// block (a pruned node, for a reader catching up on old history) does not.
+/// `None` (no block requested yet) accepts any such upstream.
+///
+/// A full or quarantined upstream is skipped by the failover that follows
+/// the move as well: counting it would close the client (or hold it) instead
+/// of leaving it where it is.
 pub fn can_take_over(u: &UpstreamView, next_block: Option<u32>) -> bool {
+    let now = Instant::now();
     u.routable()
         && u.online
         && u.known
         && u.abi_ok
-        && next_block.is_none_or(|block| match u.role {
-            Role::Live => u.covers(Log::Trace, block),
-            Role::Frozen => u.covers_ids(block),
+        && !u.at_capacity()
+        && next_block.is_none_or(|block| {
+            !u.quarantined_at(block, now)
+                && match u.role {
+                    Role::Live => u.covers(Log::Trace, block),
+                    Role::Frozen => u.covers_ids(block),
+                }
         })
 }
 
@@ -2212,6 +2222,44 @@ mod tests {
         assert!(can_take_over(&v.upstreams[1], Some(1500)));
         assert!(!can_take_over(&v.upstreams[1], Some(500)));
         assert!(!can_take_over(&v.upstreams[1], Some(2001)));
+    }
+
+    #[test]
+    fn a_move_never_counts_on_a_full_or_quarantined_upstream() {
+        // The failover after a move skips both, so a drain must leave such
+        // a session where it is.
+        let mut full = pool_server(1, 1, (1, 500), (0, 0));
+        full.max_sessions = Some(1);
+        let v = pool_view(vec![pool_server(0, 0, (1, 500), (0, 0)), full]);
+        assert!(!can_take_over(v.up(1).unwrap(), Some(450)));
+        assert!(!can_take_over(v.up(1).unwrap(), None));
+        assert_eq!(
+            pick(&v, at(450), Some(0), true),
+            Some(0),
+            "the pick skips it"
+        );
+        // A slot frees up: it can take the session again.
+        v.up(1).unwrap().connections.store(0, Ordering::Relaxed);
+        assert!(can_take_over(v.up(1).unwrap(), Some(450)));
+
+        let mut quarantined = pool_server(1, 0, (1, 500), (0, 0));
+        quarantined.quarantines.push(BlockQuarantine {
+            block: 400,
+            range: 100,
+            until: Instant::now() + NOW_TTL,
+        });
+        let v = pool_view(vec![pool_server(0, 0, (1, 500), (0, 0)), quarantined]);
+        let u = v.up(1).unwrap();
+        assert!(!can_take_over(u, Some(450)));
+        assert!(can_take_over(u, Some(350)), "only inside the quarantine");
+        assert!(can_take_over(u, None));
+
+        // Stitched: a full replica of the archive the session is on.
+        let mut full = frozen(1, 2, 1001);
+        full.max_sessions = Some(1);
+        full.connections.store(1, Ordering::Relaxed);
+        let v = view(vec![frozen(0, 2, 1001), full]);
+        assert!(!can_take_over(&v.upstreams[1], Some(500)));
     }
 
     #[test]

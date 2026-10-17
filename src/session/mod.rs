@@ -103,7 +103,7 @@ use client::{
 use failover::{
     block_unavailable_reason, classify, hold_backoff, hold_close_reason, jitter,
     note_block_failure, plan_same_block_failover, EndAction, EndFacts, Exclusion, UpEnd,
-    ViolationKind, ABI_EXCLUSION, DIAL_EXCLUSION,
+    ViolationKind, ABI_EXCLUSION, DIAL_EXCLUSION, MOVE_EXCLUSION,
 };
 pub use link::ConnectionGuard;
 use link::{
@@ -440,6 +440,10 @@ struct Session {
     /// The upstream the last failover or operator move left, and why. The
     /// move is reported once the next link is up.
     moved_from: Option<(Arc<str>, FailoverReason)>,
+    /// The upstream an operator move left, hard-excluded (for at most
+    /// [`MOVE_EXCLUSION`]) until the next link is up or nothing else can take
+    /// the session.
+    moved_off: Option<Arc<str>>,
 }
 
 impl Session {
@@ -488,6 +492,7 @@ impl Session {
             end_reason: "client closed",
             registry,
             moved_from: None,
+            moved_off: None,
         }
     }
 
@@ -793,7 +798,14 @@ impl Session {
 
     /// Move the session off its link's upstream, with the normal failover:
     /// the client keeps its connection and resumes at its cursor. Skipped
-    /// when no other upstream can serve the next block.
+    /// when no other upstream can serve the next block now.
+    ///
+    /// With a request in progress, the check is the one the failover makes
+    /// (the plan or the pool pick, without this upstream), so a full,
+    /// quarantined or excluded upstream never counts. The failover then
+    /// hard-excludes the upstream it left: the soft exclusion of an ordinary
+    /// failover ranks below role preference (stitched) and below coverage
+    /// and freshness (pool), so it alone could land on the same upstream.
     async fn on_operator_move(&mut self) -> Flow {
         let Some(endpoint) = self.link.as_ref().map(|l| l.endpoint.clone()) else {
             tracing::info!("operator move skipped: the session has no upstream link");
@@ -801,11 +813,19 @@ impl Session {
         };
         self.sync_view();
         let next_block = self.c.req.is_some().then_some(self.c.cursor);
-        let other = self
-            .view
-            .upstreams
-            .iter()
-            .any(|u| u.endpoint != endpoint && can_take_over(u, next_block));
+        let other = match self.c.req.as_ref() {
+            Some(creq) if self.c.in_progress() => {
+                self.alternative_for(self.c.cursor, creq, &endpoint)
+            }
+            _ => {
+                let now = std_now();
+                self.view.upstreams.iter().any(|u| {
+                    u.endpoint != endpoint
+                        && !self.ex.hard_active(&u.endpoint, now)
+                        && can_take_over(u, next_block)
+                })
+            }
+        };
         if !other {
             tracing::info!(
                 upstream = %endpoint,
@@ -815,7 +835,52 @@ impl Session {
             return Flow::Continue;
         }
         tracing::info!(upstream = %endpoint, "moving session at operator request");
-        self.on_link_end(UpEnd::Moved).await
+        let flow = self.on_link_end(UpEnd::Moved).await;
+        let failing_over = matches!(
+            &self.moved_from,
+            Some((from, FailoverReason::Operator)) if *from == endpoint
+        );
+        if failing_over {
+            self.ex
+                .add_hard(endpoint.clone(), MOVE_EXCLUSION, std_now());
+            self.moved_off = Some(endpoint);
+        }
+        flow
+    }
+
+    /// Lift the exclusion an operator move put on the upstream it left: the
+    /// move is done (the next link is up), or nothing else can take the
+    /// session, which then returns there rather than hold or close, as after
+    /// an ordinary failover. Returns whether there was one to lift.
+    fn release_move_exclusion(&mut self) -> bool {
+        let Some(from) = self.moved_off.take() else {
+            return false;
+        };
+        self.ex.hard.retain(|(ep, _)| *ep != from);
+        true
+    }
+
+    /// `pool_pick` for this session, back to the upstream an operator move
+    /// left when nothing else can take it.
+    fn pool_pick_for(&mut self, route: Option<(Need, u32)>, failover: bool) -> Option<usize> {
+        let pick = |s: &Self| {
+            pool_pick(
+                &s.view,
+                route,
+                &s.ex,
+                failover,
+                s.id,
+                s.ctx.live_lag_blocks,
+                std_now(),
+            )
+        };
+        if let Some(up) = pick(self) {
+            return Some(up);
+        }
+        if self.release_move_exclusion() {
+            return pick(self);
+        }
+        None
     }
 
     /// Record a session that ends with an error in the dashboard event log.
@@ -1795,22 +1860,11 @@ impl Session {
     /// failed link keeps ranking honest; when it is all that blocks a pick
     /// (the upstream is at `max_sessions` because of it), it is released.
     fn pick_for_failover(&mut self, route: Option<(Need, u32)>) -> Option<usize> {
-        let pick = |s: &Self| {
-            pool_pick(
-                &s.view,
-                route,
-                &s.ex,
-                true,
-                s.id,
-                s.ctx.live_lag_blocks,
-                std_now(),
-            )
-        };
-        if let Some(up) = pick(self) {
+        if let Some(up) = self.pool_pick_for(route, true) {
             return Some(up);
         }
         self.retired.take()?;
-        pick(self)
+        self.pool_pick_for(route, true)
     }
 
     /// Spawn a dial task for upstream `up`, holding a slot on it.
@@ -1874,6 +1928,9 @@ impl Session {
         if let Some(link) = self.link.as_mut() {
             link.st.upstream_online = self.view.up(link.st.up).is_some_and(|u| u.online);
         }
+        // An operator move is done: from now on the upstream it left is only
+        // soft-excluded, like after any failover.
+        self.release_move_exclusion();
         if let Some((from, reason)) = self.moved_from.take() {
             let level = if reason == FailoverReason::Operator {
                 Level::Info
@@ -1974,15 +2031,7 @@ impl Session {
                 self.dial_attempts += 1;
                 if self.dial_attempts < MAX_DIAL_ATTEMPTS {
                     let route = self.c.req.as_ref().map(|r| (Need::of(r), self.c.cursor));
-                    let next = pool_pick(
-                        &self.view,
-                        route,
-                        &self.ex,
-                        purpose != Purpose::Initial,
-                        self.id,
-                        self.ctx.live_lag_blocks,
-                        std_now(),
-                    );
+                    let next = self.pool_pick_for(route, purpose != Purpose::Initial);
                     if let Some(up) = next {
                         if self.start_dial(up, purpose, None) {
                             return Flow::Continue;
@@ -2069,11 +2118,16 @@ impl Session {
     /// causes is planned again without that slot. A hold blamed on
     /// exclusions is reported as busy only while an upstream that answered
     /// 503 is among them; otherwise its upstreams are unreachable (offline).
+    /// A hold right after an operator move is planned again with the
+    /// upstream the move left: the session returns there rather than hold.
     fn plan(&mut self, from: u32, allow_offline: bool) -> Step {
         let Some(shape) = self.c.req.as_ref().map(Shape::of) else {
             return Step::Done;
         };
         let mut step = self.next_step_for(&shape, from, allow_offline);
+        if matches!(step, Step::Hold { .. }) && self.release_move_exclusion() {
+            step = self.next_step_for(&shape, from, allow_offline);
+        }
         if matches!(
             step,
             Step::Hold {
@@ -3867,5 +3921,310 @@ mod tests {
         assert_eq!(harness.hub.stats.predials.get(PredialResult::Used), 1);
         assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Silent), 0);
         assert_eq!(mock_b.sessions_accepted(), 1, "the standby link is kept");
+    }
+
+    /// Whether the control API counts a session at `next_block` on `endpoint`
+    /// as movable (its drain and move check).
+    fn api_counts_movable(hub: &FleetHub, endpoint: &str, next_block: Option<u32>) -> bool {
+        hub.view()
+            .upstreams
+            .iter()
+            .any(|u| &*u.endpoint != endpoint && can_take_over(u, next_block))
+    }
+
+    /// Pool: a session streams from A when an operator drains A, while
+    /// `block` keeps B, the only other upstream, from taking it. The session
+    /// stays on A and keeps streaming.
+    async fn drain_leaves_the_session_when_b_cannot_take_it(
+        block: impl FnOnce(&mut crate::models::ServerState),
+    ) {
+        let config = || MockShipConfig {
+            blocks_to_stream: 0,
+            block_delay: Some(Duration::from_millis(5)),
+            ..Default::default()
+        };
+        let (a, _mock_a) = start_mock(config()).await;
+        let (b, mock_b) = start_mock(config()).await;
+        let harness = start_session_with(&[&a, &b], &[&a, &b], limits(0)).await;
+        set_tip(&harness.hub, &a, 100_000, 99_000).await;
+        set_tip(&harness.hub, &b, 100_000, 99_000).await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            let state = db.get_mut(&b).unwrap();
+            state.priority = 5;
+            block(state);
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        assert_eq!(info.upstream(), a);
+        client
+            .send(blocks_request(100, 100_000, 100))
+            .await
+            .unwrap();
+        let mut blocks = read_block_nums(&mut client, 5).await;
+        assert!(
+            !api_counts_movable(&harness.hub, &a, info.next_block()),
+            "the drain must report the session as staying"
+        );
+
+        // The session is told to move anyway (a stale API view, say).
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&a).unwrap().operator_disabled = true;
+            info.request_move();
+            harness.hub.rebuild(&db);
+        }
+        blocks.extend(read_block_nums(&mut client, 30).await);
+        assert_eq!(blocks, (100..135).collect::<Vec<_>>());
+        assert_eq!(info.upstream(), a, "the session stays where it is");
+        assert_eq!(info.failovers(), 0);
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Operator), 0);
+        assert_eq!(mock_b.sessions_accepted(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_drain_leaves_a_pool_session_whose_only_alternative_is_full() {
+        drain_leaves_the_session_when_b_cannot_take_it(|b| {
+            b.max_sessions = Some(1);
+            b.connections.fetch_add(1, Ordering::Relaxed);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_drain_leaves_a_pool_session_whose_only_alternative_is_quarantined() {
+        drain_leaves_the_session_when_b_cannot_take_it(|b| {
+            b.quarantines.push(crate::models::BlockQuarantine {
+                block: 1,
+                range: 1_000_000,
+                until: std::time::Instant::now() + Duration::from_secs(60),
+            });
+        })
+        .await;
+    }
+
+    /// Stitched: draining the replica a session streams from, while its
+    /// twin is at `max_sessions`, leaves the session where it is instead of
+    /// holding it until the client is closed.
+    #[tokio::test]
+    async fn a_drain_leaves_a_stitched_session_whose_only_replica_is_full() {
+        let replica = || MockShipConfig {
+            block_delay: Some(Duration::from_millis(5)),
+            ..MockShipConfig::frozen(1, 2001)
+        };
+        let (a, mock_a) = start_mock(replica()).await;
+        let (b, mock_b) = start_mock(replica()).await;
+        let harness = start_stitched(&[(&a, 1, 2001), (&b, 1, 2001)]).await;
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        client.send(blocks_request(10, 1000, 1000)).await.unwrap();
+        let mut blocks = read_block_nums(&mut client, 20).await;
+        let first = info.upstream();
+        let (other, other_mock) = if first == a {
+            (b.clone(), &mock_b)
+        } else {
+            (a.clone(), &mock_a)
+        };
+        {
+            let mut db = harness.hub.state.lock().await;
+            let state = db.get_mut(&other).unwrap();
+            state.max_sessions = Some(1);
+            state.connections.fetch_add(1, Ordering::Relaxed);
+            harness.hub.rebuild(&db);
+        }
+        assert!(!api_counts_movable(&harness.hub, &first, info.next_block()));
+
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&first).unwrap().operator_disabled = true;
+            info.request_move();
+            harness.hub.rebuild(&db);
+        }
+        blocks.extend(read_block_nums(&mut client, 50).await);
+        assert_eq!(blocks, (10..80).collect::<Vec<_>>());
+        assert_eq!(info.upstream(), first, "the session stays where it is");
+        assert_eq!(info.failovers(), 0);
+        assert_eq!(other_mock.sessions_accepted(), 0);
+    }
+
+    /// Stitched, default `history_preference` (frozen): a session reads old
+    /// blocks from archive A while live node L's range starts below its
+    /// cursor. An operator move lands on L. Role preference ranks above the
+    /// soft exclusion of an ordinary failover, which alone would re-dial A.
+    #[tokio::test]
+    async fn an_operator_move_leaves_an_archive_for_a_live_node_that_covers_the_cursor() {
+        let (a, mock_a) = start_mock(MockShipConfig {
+            block_delay: Some(Duration::from_millis(5)),
+            ..MockShipConfig::frozen(1, 1001)
+        })
+        .await;
+        let (l, mock_l) = start_mock(MockShipConfig {
+            block_delay: Some(Duration::from_millis(5)),
+            ..MockShipConfig::live(900, 1500)
+        })
+        .await;
+        let servers = vec![
+            Server {
+                name: "archive".into(),
+                endpoint: a.clone(),
+                enabled: true,
+                role: Role::Frozen,
+                range: Some(crate::ship::Range {
+                    begin: 1,
+                    end: 1001,
+                }),
+                ..Default::default()
+            },
+            Server {
+                name: "live".into(),
+                endpoint: l.clone(),
+                enabled: true,
+                role: Role::Live,
+                ..Default::default()
+            },
+        ];
+        let resolved = ResolvedListener {
+            topology: ResolvedTopology::Stitched,
+            ..listener(servers.clone())
+        };
+        let hub = FleetHub::new(
+            &resolved,
+            build_state_db(servers.clone()),
+            build_config_db(servers),
+        );
+        {
+            let abi = Arc::new(crate::abi::AbiEntry::new(mock_ship::SHIP_ABI_JSON));
+            let mut db = hub.state.lock().await;
+            let pos = |num| BlockPos {
+                num,
+                id: mock_ship::fake_block_id(num),
+            };
+            for (endpoint, begin, end, head, lib) in
+                [(&a, 1, 1001, 1000, 1000), (&l, 900, 1501, 1500, 1490)]
+            {
+                let state = db.get_mut(endpoint.as_str()).unwrap();
+                state.online = true;
+                state.ranges_known = true;
+                state.trace_begin_block = begin;
+                state.trace_end_block = end;
+                state.chain_state_begin_block = begin;
+                state.chain_state_end_block = end;
+                state.head = Some(pos(head));
+                state.lib = Some(pos(lib));
+                state.status_v1 = Some(true);
+                state.abi = Some(abi.clone());
+            }
+            hub.rebuild(&db);
+        }
+        let harness = serve_one(&resolved, hub, limits(0)).await;
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        client.send(blocks_request(950, 1000, 1000)).await.unwrap();
+        let mut blocks = read_block_nums(&mut client, 10).await;
+        assert_eq!(info.upstream(), a, "history is read from the archive");
+        assert!(api_counts_movable(&harness.hub, &a, info.next_block()));
+
+        info.request_move();
+        blocks.extend(read_block_nums(&mut client, 20).await);
+        assert_eq!(blocks, (950..980).collect::<Vec<_>>());
+        assert_eq!(info.upstream(), l, "moved to the live node");
+        assert_eq!(info.failovers(), 1);
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Operator), 1);
+        assert_eq!(
+            mock_a.sessions_accepted(),
+            1,
+            "the archive is not re-dialed"
+        );
+        assert_eq!(mock_l.sessions_accepted(), 1);
+        let moved = telemetry::global()
+            .events_after(0)
+            .into_iter()
+            .filter(|e| e.session == Some(info.id) && e.kind == EventKind::SessionFailover)
+            .map(|e| e.message)
+            .collect::<Vec<_>>();
+        assert_eq!(moved, [format!("moved from {a} to {l} (operator)")]);
+    }
+
+    /// An upstream that accepts TCP connections and drops them before the
+    /// WebSocket handshake, so every dial to it fails at once.
+    async fn refusing_upstream() -> (String, JoinHandle<()>) {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = tcp.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = tcp.accept().await {
+                drop(stream);
+            }
+        });
+        (endpoint, task)
+    }
+
+    /// Pool: the upstream an operator move picked fails its dial and nothing
+    /// else can take the session. It returns to the upstream it left, as
+    /// after an ordinary failover, instead of closing the client.
+    #[tokio::test]
+    async fn an_operator_move_whose_target_fails_returns_to_the_upstream_it_left() {
+        let (a, mock_a) = start_mock(MockShipConfig {
+            blocks_to_stream: 0,
+            block_delay: Some(Duration::from_millis(5)),
+            ..Default::default()
+        })
+        .await;
+        let (b, refusing) = refusing_upstream().await;
+        let harness = start_session_with(&[&a, &b], &[&a, &b], limits(0)).await;
+        set_tip(&harness.hub, &a, 100_000, 99_000).await;
+        set_tip(&harness.hub, &b, 100_000, 99_000).await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&b).unwrap().priority = 5;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        assert_eq!(info.upstream(), a);
+        client
+            .send(blocks_request(100, 100_000, 100))
+            .await
+            .unwrap();
+        let mut blocks = read_block_nums(&mut client, 5).await;
+
+        info.request_move();
+        blocks.extend(read_block_nums(&mut client, 30).await);
+        assert_eq!(blocks, (100..135).collect::<Vec<_>>());
+        assert_eq!(info.upstream(), a);
+        assert_eq!(mock_a.sessions_accepted(), 2, "re-dialed after the move");
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Operator), 1);
+        refusing.abort();
+    }
+
+    /// Stitched: the same, with a replica whose dial fails. The session
+    /// returns to the archive it left at once instead of holding until the
+    /// move's exclusion runs out.
+    #[tokio::test]
+    async fn a_stitched_move_whose_target_fails_returns_to_the_archive_it_left() {
+        let (a, mock_a) = start_mock(MockShipConfig {
+            block_delay: Some(Duration::from_millis(5)),
+            ..MockShipConfig::frozen(1, 2001)
+        })
+        .await;
+        let (b, refusing) = refusing_upstream().await;
+        let harness = start_stitched(&[(&a, 1, 2001), (&b, 1, 2001)]).await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&b).unwrap().priority = 5;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        client.send(blocks_request(10, 1000, 1000)).await.unwrap();
+        let mut blocks = read_block_nums(&mut client, 10).await;
+        assert_eq!(info.upstream(), a);
+
+        info.request_move();
+        blocks.extend(read_block_nums(&mut client, 30).await);
+        assert_eq!(blocks, (10..50).collect::<Vec<_>>());
+        assert_eq!(info.upstream(), a);
+        assert_eq!(mock_a.sessions_accepted(), 2, "re-dialed after the move");
+        refusing.abort();
     }
 }

@@ -14,7 +14,8 @@
 //! 404 moves on to the next candidate, unless the block was asked for by an
 //! id that a verified frozen range server holding the block refused. When a
 //! live node is a candidate, one attempt is kept for it, so a real nodeos
-//! writes the final error.
+//! writes the final error; for a request by id, one is also kept for such a
+//! frozen range server.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -100,6 +101,16 @@ impl ApiView<'_> {
     /// A verified frozen API whose blocks include `n`, up or not.
     fn archives(&self, n: u32) -> bool {
         self.role == Role::Frozen && self.verified && self.blocks.is_some_and(|r| r.contains(n))
+    }
+
+    /// A verified frozen API that serves `n` below the end of its declared
+    /// range (when it declares one). It looks an id up as its own block `n`,
+    /// so its Unknown Block for an id is the answer ([`id_holders`]). Past
+    /// its declared end it may serve blocks of a fork the live nodes left
+    /// (logs copied at a cut-over from a snapshot), and a canonical id that
+    /// it refuses there still names a block.
+    fn holds_id(&self, n: u32) -> bool {
+        self.archives(n) && self.declared.is_none_or(|d| n < d.end)
     }
 
     /// A frozen API that answers for `n`, up or not, busy or not. Once
@@ -244,13 +255,13 @@ pub fn plan_block(q: &BlockQuery, apis: &[ApiView<'_>]) -> BlockPlan {
 }
 
 /// For a block requested by id: the verified frozen APIs in `order` whose
-/// blocks hold `n`. Such an API looks the id up as its own block `n` and
-/// answers Unknown Block when the ids differ. Its block `n` is irreversible,
-/// so no upstream holds another block `n`: the id names no block, and that
-/// Unknown Block is the answer ([`settles`]).
+/// blocks hold `n` ([`ApiView::holds_id`]). Such an API looks the id up as
+/// its own block `n` and answers Unknown Block when the ids differ. Its
+/// block `n` is irreversible, so no upstream holds another block `n`: the id
+/// names no block, and that Unknown Block is the answer ([`settles`]).
 fn id_holders(n: u32, order: &[usize], apis: &[ApiView<'_>]) -> Vec<usize> {
     apis.iter()
-        .filter(|a| a.archives(n) && order.contains(&a.index))
+        .filter(|a| a.holds_id(n) && order.contains(&a.index))
         .map(|a| a.index)
         .collect()
 }
@@ -309,6 +320,12 @@ fn reversible_order(n: u32, path: &str, apis: &[ApiView<'_>], cap: usize) -> Vec
 /// so an Unknown Block from a node whose log begins above it must not become
 /// the answer. When the archives cannot answer, the client gets Busy and
 /// retries.
+///
+/// The list is cut to `cap`. With at least two places, one is kept for a
+/// live node. A request by id also keeps one for an archive whose Unknown
+/// Block is the answer ([`id_holders`]): live nodes that take every place
+/// (`live_first`) would otherwise each have their Unknown Block dropped for
+/// a claimed block, and a wrong id would get Busy on every retry.
 fn irreversible_order(
     n: u32,
     q: &BlockQuery,
@@ -359,6 +376,23 @@ fn irreversible_order(
         let first_live = [&l, &u, &x].into_iter().flat_map(|t| t.first()).next();
         if let (Some(&first_live), Some(last)) = (first_live, order.last_mut()) {
             *last = first_live;
+        }
+    }
+
+    // Keep one attempt for an id holder: the last place, or the one before
+    // it when the last holds the only live node (the place kept above, with
+    // at least two attempts). A single attempt goes to the holder: it
+    // answers a right id and a wrong one alike, where a live node's Unknown
+    // Block for a claimed block is dropped.
+    let by_id = q.hint.is_some_and(|h| h.by_id);
+    if by_id && !order.iter().any(|a| a.holds_id(n)) {
+        let holder = f.iter().copied().find(|a| a.holds_id(n));
+        let lives = order.iter().filter(|a| a.is_live()).count();
+        let place = order
+            .iter()
+            .rposition(|a| !(cap >= 2 && lives == 1 && a.is_live()));
+        if let (Some(holder), Some(place)) = (holder, place) {
+            order[place] = holder;
         }
     }
     order.into_iter().map(|a| a.index).collect()
@@ -1116,6 +1150,121 @@ mod tests {
         ] {
             assert!(!settles(reason, true), "{reason:?}");
         }
+    }
+
+    /// The same query, naming its block by id.
+    fn by_id(q: BlockQuery) -> BlockQuery {
+        BlockQuery {
+            hint: q.hint.map(|h| Hint { by_id: true, ..h }),
+            ..q
+        }
+    }
+
+    /// The attempt order and the id holders of a routed plan.
+    fn order_and_holders(q: &BlockQuery, apis: &[ApiView<'_>]) -> (Vec<usize>, Vec<usize>) {
+        match plan_block(q, apis) {
+            BlockPlan::Routed {
+                order, id_holders, ..
+            } => (order, id_holders),
+            BlockPlan::Unhinted => panic!("unexpected unhinted plan"),
+        }
+    }
+
+    // With live_first, live nodes that hold the block can take every place.
+    // Their Unknown Block for an archived block is dropped, so without a
+    // place for the archive a wrong id would get Busy on every retry.
+    #[test]
+    fn a_request_by_id_keeps_an_attempt_for_an_id_holder() {
+        let lives = [
+            live(4, Some(1), 5000, 6000),
+            live(5, Some(1), 5000, 6000),
+            live(6, Some(1), 5000, 6000),
+        ];
+        let apis = [frozen(0, 1, 1001), lives[0], lives[1], lives[2]];
+        let live_first = BlockQuery {
+            block_source: BlockSource::LiveFirst,
+            ..raw(500)
+        };
+        // By number, the live nodes take every place.
+        let (o, h) = order_and_holders(&live_first, &apis);
+        assert_eq!(o.len(), 3);
+        assert!(o.iter().all(|i| *i >= 4), "{o:?}");
+        assert!(h.is_empty());
+        // By id, the last place goes to the archive.
+        let (o, h) = order_and_holders(&by_id(live_first), &apis);
+        assert_eq!(o.len(), 3);
+        assert!(o[..2].iter().all(|i| *i >= 4), "{o:?}");
+        assert_eq!((o[2], h), (0, vec![0]));
+        // A single attempt goes to the archive by id, to a live node by
+        // number.
+        let one = BlockQuery {
+            max_attempts: 1,
+            ..live_first
+        };
+        assert_eq!(order_and_holders(&by_id(one), &apis), (vec![0], vec![0]));
+        assert!(order_and_holders(&one, &apis).0[0] >= 4);
+        // frozen_first already tries the archive first.
+        let (o, h) = order_and_holders(&by_id(raw(500)), &apis);
+        assert_eq!((o[0], h), (0, vec![0]));
+        assert!(o[1..].iter().all(|i| *i >= 4), "{o:?}");
+        // A busy archive gets no place: Busy, and the client retries.
+        let busy = ApiView {
+            busy: true,
+            ..frozen(0, 1, 1001)
+        };
+        let (o, h) = order_and_holders(&by_id(live_first), &[busy, lives[0], lives[1]]);
+        assert_eq!((o.len(), h), (2, vec![]));
+
+        // Archives that serve block 600 past their declared end fill the
+        // places before the holder; the place kept for the live node stays.
+        let past_end = |index| ApiView {
+            declared: Some(Range { begin: 2, end: 501 }),
+            ..frozen(index, 1, 1001)
+        };
+        let holder = ApiView {
+            priority: 1,
+            ..frozen(2, 1, 1001)
+        };
+        let two = BlockQuery {
+            max_attempts: 2,
+            ..raw(600)
+        };
+        let apis = [past_end(0), past_end(1), holder, lives[0]];
+        let (o, _) = order_and_holders(&two, &apis);
+        assert!(o[0] < 2 && o[1] == 4, "by number: {o:?}");
+        assert_eq!(order_and_holders(&by_id(two), &apis), (vec![2, 4], vec![2]));
+    }
+
+    // A cut-over from a snapshot at S = 6400 where the last archive serves
+    // the old node's logs to 6401 instead of ending at S + 1: its 6401 may be
+    // a block of a fork the live node left. Its Unknown Block for the live
+    // node's id of 6401 is no answer, since that id names a block.
+    #[test]
+    fn an_archive_is_no_id_holder_past_its_declared_end() {
+        let tail = ApiView {
+            declared: Some(Range {
+                begin: 3001,
+                end: 6401,
+            }),
+            ..frozen(0, 3001, 6402)
+        };
+        let l = live(4, Some(6401), 6990, 7000);
+        let q = |n| by_id(raw(n));
+        assert_eq!(
+            order_and_holders(&q(6401), &[tail, l]),
+            (vec![0, 4], vec![])
+        );
+        // Below its declared end, it is one.
+        assert_eq!(order_and_holders(&q(6400), &[tail, l]), (vec![0], vec![0]));
+        // With no declared range, its served blocks count.
+        let undeclared = ApiView {
+            declared: None,
+            ..tail
+        };
+        assert_eq!(
+            order_and_holders(&q(6401), &[undeclared, l]),
+            (vec![0, 4], vec![0])
+        );
     }
 
     // Once an archive is verified, its `blocks` are its exact claim: a

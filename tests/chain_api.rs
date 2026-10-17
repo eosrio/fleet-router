@@ -1155,6 +1155,61 @@ async fn a_wrong_id_of_an_archived_block_gets_the_archives_unknown_block() {
     assert_eq!(late.hits(RAW_BLOCK), 0);
 }
 
+// With live_first, live nodes that hold an archived block can take every
+// attempt, and their Unknown Block for it is dropped. A request by id keeps
+// one attempt for the archive, so a wrong id gets its Unknown Block, not 503
+// on every retry. A right id is still served by a live node.
+#[tokio::test]
+async fn live_first_keeps_an_attempt_for_the_archive_on_a_wrong_id() {
+    let archive = frozen_node("archive-a", (2, 1001), (1, 1001), 4).await;
+    let lives = [
+        live_node("live-1", 100, 5000).await,
+        live_node("live-2", 100, 5000).await,
+        live_node("live-3", 100, 5000).await,
+    ];
+    let mut servers = vec![archive.frozen((2, 1001))];
+    servers.extend(lives.iter().map(Node::live));
+    let (router, port) = start(config(&servers, json!({ "block_source": "live_first" }))).await;
+    // Block 5 only the archive holds: once it serves it, it is verified.
+    wait_served(port, RAW_BLOCK, &raw(5), "archive-a").await;
+    // Every live node is up, so they fill the three attempts by number.
+    wait_http(
+        router.metrics(),
+        "/ready?scope=api",
+        200,
+        "ready: 4 chain API upstream(s) up\n",
+    )
+    .await;
+    let live_hits = || lives.iter().map(|l| l.hits(RAW_BLOCK)).sum::<usize>();
+
+    let wrong = hex(&block_id_seeded(500, 7));
+    let body = format!(r#"{{"block_num_or_id":"{wrong}"}}"#);
+    let genuine = direct(&archive, RAW_BLOCK, &body).await;
+    assert_eq!(genuine.status, 400, "{}", genuine.text());
+    assert!(genuine.text().contains("3100002"), "{}", genuine.text());
+    for _ in 0..2 {
+        archive.api.clear_requests();
+        for l in &lives {
+            l.api.clear_requests();
+        }
+        let answer = post(port, RAW_BLOCK, &body).await;
+        assert_eq!((answer.status, answer.text()), (400, genuine.text()));
+        assert_eq!(archive.hits(RAW_BLOCK), 1, "the last attempt");
+        assert_eq!(live_hits(), 2, "the live nodes first");
+    }
+    // A right id is answered by the first live node.
+    archive.api.clear_requests();
+    let right = format!(r#"{{"block_num_or_id":"{}"}}"#, hex(&block_id(500)));
+    let answer = post(port, RAW_BLOCK, &right).await;
+    assert_eq!(answer.status, 200, "{}", answer.text());
+    assert!(
+        served_by(&answer).is_some_and(|name| name.starts_with("live-")),
+        "{}",
+        answer.text()
+    );
+    assert_eq!(archive.hits(RAW_BLOCK), 0);
+}
+
 // CA19
 #[tokio::test]
 async fn probe_churn_never_changes_the_fleet_view() {

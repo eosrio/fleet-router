@@ -75,7 +75,7 @@ Toward an archive, the router requests only blocks inside its range (or below th
 
 A common way to split a node's history is to archive its logs, then start a live node from a snapshot of the same chain. With the snapshot at block `S`:
 
-- **The last archive ends at `S + 1`.** Serve and declare a `range` for the last frozen range server that ends at `S + 1` (exclusive), so its last block is `S`. The logs copied from the old node may hold blocks after `S` that the live node does not follow: blocks of a fork it abandoned. They must not be served, and the router routes by range: an archive that reaches past `S` would have its blocks there served instead of the live node's.
+- **The last archive ends at `S + 1`.** Serve and declare a `range` for the last frozen range server that ends at `S + 1` (exclusive), so its last block is `S`. The logs copied from the old node may hold blocks after `S` that the live node does not follow: blocks of a fork it abandoned. They must not be served, and the router routes by range: an archive that reaches past `S` would have its blocks there served instead of the live node's. Its [chain API](chain-api.md#reversible-and-irreversible-blocks) would serve them by number too; only for a request by id does the router stop at the declared end, and not take its Unknown Block past it as the answer.
 - **The live node's first blocks.** A live node started from a snapshot at `S` holds chain-state data from `S`, and traces, finality data and blocks from `S + 1`. With the last archive ending at `S + 1`, the live tier overlaps the archives by `0` blocks of trace and `1` of chain state: no hole, and the normal shape, not a reason to alert (see [Alerts](observability.md#alerts)).
 
 ### Seams and handoffs

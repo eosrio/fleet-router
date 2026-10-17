@@ -75,11 +75,11 @@ An **irreversible** block goes through candidate tiers:
 - **U**: live nodes that do not report `earliest_available_block_num` (EOSIO 2.0 and FIO nodes), with `n ≤ head`;
 - **X**: live nodes whose block log begins above `n`. They answer a genuine Unknown Block.
 
-With [`block_source`](configuration.md#chain-api) `"frozen_first"` (the default) the order is F, L, U, X; with `"live_first"` it is L, F, U, X. `get_block` uses L, U, X. Inside a tier, candidates with a free slot come first, then the lower `priority`, then fewer requests in flight per unit of `weight`, then a hash of the block's 4096-block chunk, so nearby blocks go to the same replica and its page cache stays warm. The list is cut to `max_attempts`. When it holds no live node but a live node is a candidate, and `max_attempts` is at least 2, the last place goes to a live node, so that a real nodeos writes the final error.
+With [`block_source`](configuration.md#chain-api) `"frozen_first"` (the default) the order is F, L, U, X; with `"live_first"` it is L, F, U, X. `get_block` uses L, U, X. Inside a tier, candidates with a free slot come first, then the lower `priority`, then fewer requests in flight per unit of `weight`, then a hash of the block's 4096-block chunk, so nearby blocks go to the same replica and its page cache stays warm. The list is cut to `max_attempts`. When it holds no live node but a live node is a candidate, and `max_attempts` is at least 2, the last place goes to a live node, so that a real nodeos writes the final error. For a request by id, when the list holds no frozen range server whose Unknown Block is the answer (see below) but one is a candidate, a place goes to one too: the last place, or the one before it when the last holds the list's only live node; with a single attempt, that attempt. Otherwise, with `"live_first"`, live nodes could take every place, and a wrong id would get `503` on every retry.
 
 For `get_block_info`, `get_block_header` and `get_raw_block`, a block that a frozen range server claims (it is in its served blocks once verified, in its declared `range` before that) exists. Tier X is then left out, and an Unknown Block is not kept as the answer: when no attempt serves the block, the client gets another kept answer if there is one (a `404`), else `503 No chain API upstream available`, and can retry.
 
-A request **by id** is the exception. A verified frozen range server that serves block `n` looks the id up as its own block `n`, and answers Unknown Block when the ids differ. Block `n` is irreversible, so no upstream holds another block `n`: the id names no block, and that Unknown Block is the answer, as on nodeos. By number, an Unknown Block from such a server for a block it serves breaks its contract, so the next candidate is tried as above.
+A request **by id** is the exception. A verified frozen range server that serves block `n`, below the end of its declared `range`, looks the id up as its own block `n`, and answers Unknown Block when the ids differ. Block `n` is irreversible, so no upstream holds another block `n`: the id names no block, and that Unknown Block is the answer, as on nodeos. Past the end of its declared `range`, a server may serve blocks of a fork the live nodes left (see [Cut-over from a snapshot](operations.md#cut-over-from-a-snapshot)), so its Unknown Block there is not the answer. By number, an Unknown Block from such a server for a block it serves breaks its contract, so the next candidate is tried as above.
 
 Each attempt's answer decides what happens next:
 
@@ -87,7 +87,7 @@ Each attempt's answer decides what happens next:
 | --- | --- | --- |
 | The connection failed, or no response head within `upstream_timeout_ms` | Next candidate; the API is down until its next good probe | The same |
 | `503` | Next candidate; the API is skipped for 2 s | The same |
-| `400` with nodeos's Unknown Block (`error.code` 3100002) | Final | Next candidate; the answer is kept. Final from a verified frozen range server that serves the block, for a request by id |
+| `400` with nodeos's Unknown Block (`error.code` 3100002) | Final | Next candidate; the answer is kept. Final from a verified frozen range server that serves the block below the end of its declared `range`, for a request by id |
 | `404` | Final | Next candidate; the answer is kept |
 | Anything else | Final | Final |
 

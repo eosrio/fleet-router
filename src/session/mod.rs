@@ -101,8 +101,8 @@ use client::{
     PendingClientFrames, ResultKind, MAX_PENDING_CLIENT_BYTES,
 };
 use failover::{
-    block_unavailable_reason, classify, hold_backoff, hold_close_reason, jitter,
-    note_block_failure, plan_same_block_failover, EndAction, EndFacts, Exclusion, UpEnd,
+    block_unavailable_reason, blockless_move_backoff, classify, hold_backoff, hold_close_reason,
+    jitter, note_block_failure, plan_same_block_failover, EndAction, EndFacts, Exclusion, UpEnd,
     ViolationKind, ABI_EXCLUSION, DIAL_EXCLUSION, MOVE_EXCLUSION,
 };
 pub use link::ConnectionGuard;
@@ -287,10 +287,12 @@ impl Left {
         }
     }
 
-    /// Operator moves and reroutes are routine; other failovers are not.
+    /// Operator moves, moves off an archive without a block log (nothing is
+    /// wrong with it) and reroutes are routine; other failovers are not.
     fn level(self) -> Level {
         match self {
-            Left::Failover(FailoverReason::Operator) | Left::Reroute => Level::Info,
+            Left::Failover(FailoverReason::Operator | FailoverReason::NoBlockLog)
+            | Left::Reroute => Level::Info,
             Left::Failover(_) => Level::Warn,
         }
     }
@@ -484,6 +486,11 @@ struct Session {
     /// A handler took a new view with [`Session::sync_view`]; the loop has
     /// not acted on it yet (see [`Session::on_view_change`]).
     view_unseen: bool,
+    /// Stitched: moves off archives without a block log made since a result
+    /// last came with all it asked for, and when the last one was made (see
+    /// [`blockless_move_backoff`]).
+    blockless_moves: u32,
+    blockless_moved_at: Option<Instant>,
 }
 
 impl Session {
@@ -534,6 +541,8 @@ impl Session {
             moved_from: None,
             moved_off: None,
             view_unseen: false,
+            blockless_moves: 0,
+            blockless_moved_at: None,
         }
     }
 
@@ -1454,7 +1463,12 @@ impl Session {
             Some(Judgement::Forward(fw)) if fw.no_block => {
                 self.forward_without_block(frame, h, fw).await
             }
-            Some(Judgement::Forward(fw)) => self.forward_result(frame, h, fw).await,
+            Some(Judgement::Forward(fw)) => {
+                // Nothing the request asked for is missing: any move off an
+                // archive without a block log got there.
+                self.blockless_moves = 0;
+                self.forward_result(frame, h, fw).await
+            }
         }
     }
 
@@ -1464,10 +1478,14 @@ impl Session {
     /// same result when its block log lacks the block.
     ///
     /// The upstream is flagged for the listener (warned once), so plans rank
-    /// it below upstreams that hold blocks. When one of those can serve the
-    /// cursor now, the session fails over to it and resumes at this block.
-    /// Otherwise the result is forwarded without `block`, as one node with a
-    /// pruned block log sends it, and counted.
+    /// it below upstreams that hold blocks. When the failover that leaves it
+    /// would serve the cursor from one of those, the session fails over and
+    /// resumes at this block. Otherwise the result is forwarded without
+    /// `block`, as one node with a pruned block log sends it, and counted.
+    ///
+    /// That answer stands until the fleet view changes. A move that ended on
+    /// such an archive again delays the next one (see
+    /// [`blockless_move_backoff`]).
     async fn forward_without_block(&mut self, frame: Bytes, h: ResultHead, fw: Forward) -> Flow {
         let Some((up, endpoint, name)) = self
             .link
@@ -1488,18 +1506,25 @@ impl Session {
             }
             self.sync_view();
         }
+        let now = Instant::now();
         let generation = self.view.generation;
-        let checked = self
+        let due = self
             .link
             .as_ref()
-            .is_some_and(|l| l.st.blockless_checked == Some(generation));
-        if !checked {
+            .is_some_and(|l| l.st.blockless_checked != Some(generation));
+        let may_move = self
+            .blockless_moved_at
+            .is_none_or(|at| now >= at + blockless_move_backoff(self.blockless_moves));
+        if due && may_move {
             if self.block_holder_for(block, &endpoint) {
                 tracing::info!(
                     upstream = %endpoint,
+                    name = %name,
                     block,
                     "moving to an upstream that holds blocks"
                 );
+                self.blockless_moves = self.blockless_moves.saturating_add(1);
+                self.blockless_moved_at = Some(now);
                 return self.on_link_end(UpEnd::NoBlockLog).await;
             }
             if let Some(link) = self.link.as_mut() {
@@ -1512,15 +1537,19 @@ impl Session {
         self.forward_result(frame, h, fw).await
     }
 
-    /// Stitched: whether an upstream other than `endpoint` that is not known
-    /// to lack a block log would serve block `k` of the current request now.
+    /// Stitched: whether the failover that leaves the archive `endpoint` at
+    /// block `k` ([`UpEnd::NoBlockLog`]: `endpoint` soft-excluded, the other
+    /// exclusions kept) would serve the current request from an upstream not
+    /// known to lack a block log. This is the plan that failover makes, so a
+    /// session leaves only for the blocks: an upstream that holds them but
+    /// ranks below the archive (stale, behind the block, full) would only
+    /// send it back, again and again.
     fn block_holder_for(&self, k: u32, endpoint: &str) -> bool {
         let Some(creq) = self.c.req.as_ref() else {
             return false;
         };
-        let now = std_now();
         let mut ex = self.ex.clone();
-        ex.add_hard(Arc::from(endpoint), Duration::from_secs(60), now);
+        ex.soft = Some(Arc::from(endpoint));
         let tip = self.ctx.hub.fresh_tip(&self.view);
         let step = next_step(
             &self.view,
@@ -1533,9 +1562,14 @@ impl Session {
             &self.ctx.stitching,
             self.ctx.live_lag_blocks,
             false,
-            now,
+            std_now(),
         );
-        matches!(step, Step::Serve(st) if self.view.up(st.up).is_some_and(|u| !u.no_block_log))
+        matches!(
+            step,
+            Step::Serve(st)
+                if *st.endpoint != *endpoint
+                    && self.view.up(st.up).is_some_and(|u| !u.no_block_log)
+        )
     }
 
     /// Whether another upstream than `endpoint` could serve block `k` of the
@@ -1989,7 +2023,14 @@ impl Session {
                 counters.failovers_total.fetch_add(1, Ordering::Relaxed);
                 self.registry.info.note_failover();
                 self.moved_from = Some((endpoint.clone(), Left::Failover(reason)));
-                if plan.failures > 0 {
+                if reason == FailoverReason::NoBlockLog {
+                    // Routine: the move was logged where it was decided.
+                    tracing::debug!(
+                        upstream = %endpoint,
+                        block = k,
+                        "leaving an archive without a block log"
+                    );
+                } else if plan.failures > 0 {
                     tracing::warn!(
                         upstream = %endpoint,
                         name = %name,
@@ -4721,6 +4762,161 @@ mod tests {
             .await
             .unwrap();
         assert!(!harness.hub.state.lock().await[&archive].no_block_log);
+    }
+
+    /// One session of a stitched listener over archives and live nodes,
+    /// served in-process. Each `(endpoint, role, begin, head, stale)` is
+    /// online with trace and chain state `[begin, head]` and that head; an
+    /// archive's LIB is its head, a live node's is 10 below. A stale upstream
+    /// is one the monitor saw stop advancing.
+    async fn start_fleet(ups: &[(&str, Role, u32, u32, bool)]) -> Harness {
+        let servers: Vec<Server> = ups
+            .iter()
+            .enumerate()
+            .map(|(i, &(endpoint, role, begin, head, _))| Server {
+                name: format!("upstream-{i}"),
+                endpoint: endpoint.to_string(),
+                enabled: true,
+                role,
+                range: (role == Role::Frozen).then_some(crate::ship::Range {
+                    begin,
+                    end: head + 1,
+                }),
+                ..Default::default()
+            })
+            .collect();
+        let resolved = ResolvedListener {
+            topology: ResolvedTopology::Stitched,
+            ..listener(servers.clone())
+        };
+        let hub = FleetHub::new(
+            &resolved,
+            build_state_db(servers.clone()),
+            build_config_db(servers),
+        );
+        {
+            let abi = Arc::new(crate::abi::AbiEntry::new(mock_ship::SHIP_ABI_JSON));
+            let mut db = hub.state.lock().await;
+            let pos = |num| BlockPos {
+                num,
+                id: mock_ship::fake_block_id(num),
+            };
+            for &(endpoint, role, begin, head, stale) in ups {
+                let state = db.get_mut(endpoint).unwrap();
+                let lib = match role {
+                    Role::Frozen => head,
+                    Role::Live => head - 10,
+                };
+                state.online = true;
+                state.ranges_known = true;
+                state.trace_begin_block = begin;
+                state.trace_end_block = head + 1;
+                state.chain_state_begin_block = begin;
+                state.chain_state_end_block = head + 1;
+                state.head = Some(pos(head));
+                state.lib = Some(pos(lib));
+                state.status_v1 = Some(true);
+                state.abi = Some(abi.clone());
+                state.stale = stale;
+            }
+            hub.rebuild(&db);
+        }
+        serve_one(&resolved, hub, limits(0)).await
+    }
+
+    fn results_without_block(hub: &FleetHub, up: usize) -> u64 {
+        hub.stats
+            .upstream(up)
+            .unwrap()
+            .results_without_block
+            .load(Ordering::Relaxed)
+    }
+
+    /// Stitched: the only live node that covers a block request is stale.
+    /// The failover that would leave the archive without a block log ranks
+    /// that node below the archive and would only come back to it, so the
+    /// archive serves the request without blocks rather than moving in a
+    /// loop that never forwards anything.
+    #[tokio::test]
+    async fn a_stale_live_node_does_not_draw_a_block_request_off_an_archive_without_a_block_log() {
+        let (archive, archive_mock) = start_mock(MockShipConfig {
+            no_block_log: true,
+            ..MockShipConfig::frozen(1, 1001)
+        })
+        .await;
+        let (live, live_mock) = start_mock(MockShipConfig::live(900, 1500)).await;
+        let harness = start_fleet(&[
+            (&archive, Role::Frozen, 1, 1000, false),
+            (&live, Role::Live, 900, 1500, true),
+        ])
+        .await;
+        let mut client = connect(&harness.url).await;
+        client.send(block_request(950, 960, 100)).await.unwrap();
+        let views = read_views(&mut client, 10).await;
+        assert_eq!(
+            views.iter().filter_map(BlockView::num).collect::<Vec<_>>(),
+            (950..960).collect::<Vec<_>>()
+        );
+        assert!(views.iter().all(|v| v.block.is_none()));
+        assert_eq!(
+            harness.hub.stats.failovers.get(FailoverReason::NoBlockLog),
+            0
+        );
+        assert_eq!(results_without_block(&harness.hub, 0), 10);
+        assert_eq!(archive_mock.sessions_accepted(), 1);
+        assert_eq!(live_mock.sessions_accepted(), 0);
+    }
+
+    /// Stitched: the live node that covers a block request is still syncing,
+    /// far behind the block, and the other one begins above it. Neither is
+    /// where the failover would go, so the archive without a block log
+    /// serves the request without blocks.
+    #[tokio::test]
+    async fn a_lagging_live_node_does_not_draw_a_block_request_off_an_archive_without_a_block_log()
+    {
+        let (archive, archive_mock) = start_mock(MockShipConfig {
+            no_block_log: true,
+            ..MockShipConfig::frozen(1, 3001)
+        })
+        .await;
+        let (syncing, syncing_mock) = start_mock(MockShipConfig::live(1000, 1100)).await;
+        let (tip, tip_mock) = start_mock(MockShipConfig::live(2500, 2600)).await;
+        let harness = start_fleet(&[
+            (&archive, Role::Frozen, 1, 3000, false),
+            (&syncing, Role::Live, 1000, 1100, false),
+            (&tip, Role::Live, 2500, 2600, false),
+        ])
+        .await;
+        let mut client = connect(&harness.url).await;
+        client.send(block_request(1500, 1510, 100)).await.unwrap();
+        let views = read_views(&mut client, 10).await;
+        assert_eq!(
+            views.iter().filter_map(BlockView::num).collect::<Vec<_>>(),
+            (1500..1510).collect::<Vec<_>>()
+        );
+        assert!(views.iter().all(|v| v.block.is_none()));
+        assert_eq!(
+            harness.hub.stats.failovers.get(FailoverReason::NoBlockLog),
+            0
+        );
+        assert_eq!(archive_mock.sessions_accepted(), 1);
+        assert_eq!(syncing_mock.sessions_accepted(), 0);
+        assert_eq!(tip_mock.sessions_accepted(), 0);
+    }
+
+    /// A move off an archive without a block log is routine, like an
+    /// operator move: nothing is wrong with the archive.
+    #[test]
+    fn a_move_off_an_archive_without_a_block_log_is_reported_as_routine() {
+        assert_eq!(
+            Left::Failover(FailoverReason::NoBlockLog).level(),
+            Level::Info
+        );
+        assert_eq!(
+            Left::Failover(FailoverReason::Operator).level(),
+            Level::Info
+        );
+        assert_eq!(Left::Failover(FailoverReason::Silent).level(), Level::Warn);
     }
 
     fn filled(hub: &FleetHub, up: usize) -> u64 {

@@ -57,6 +57,29 @@ pub(super) fn hold_backoff(attempt: u32) -> Duration {
     same_block_backoff(attempt.saturating_add(1))
 }
 
+/// The wait between moves off archives without a block log once one such
+/// move ended on one again, doubling with each further move.
+const BLOCKLESS_MOVE_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The longest wait between moves off archives without a block log.
+const BLOCKLESS_MOVE_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// How long after its last move off an archive without a block log a
+/// session waits before the next one, when `moves` such moves were made
+/// since a result last came with the `block` it asked for: none before the
+/// first, then 1 s, doubling to 60 s. A move that does not reach the blocks
+/// (the upstream that holds them refuses the session with HTTP 503, say)
+/// ends on such an archive again; retried at once, it would tear the stream
+/// down and dial again every few seconds.
+pub(super) fn blockless_move_backoff(moves: u32) -> Duration {
+    match moves {
+        0 => Duration::ZERO,
+        n => BLOCKLESS_MOVE_BACKOFF
+            .saturating_mul(1 << (n - 1).min(16))
+            .min(BLOCKLESS_MOVE_BACKOFF_MAX),
+    }
+}
+
 /// The close reason when a bounded hold at `block` runs out of `gap_wait_ms`.
 pub(super) fn hold_close_reason(why: HoldWhy, block: u32) -> String {
     match why {
@@ -186,8 +209,8 @@ pub(super) enum UpEnd {
     /// An operator moved the session off this upstream.
     Moved,
     /// A frozen upstream without a block log sent a result without the
-    /// requested `block`, while another upstream that holds blocks can serve
-    /// the cursor.
+    /// requested `block`, while the failover would serve the cursor from
+    /// another upstream that holds blocks.
     NoBlockLog,
 }
 
@@ -418,6 +441,18 @@ mod tests {
         assert_eq!(same_block_backoff(6), Duration::from_millis(3_200));
         assert_eq!(same_block_backoff(7), Duration::from_millis(3_200));
         assert_eq!(same_block_backoff(30), Duration::from_millis(3_200));
+    }
+
+    #[test]
+    fn blockless_moves_back_off_from_1s_and_cap_at_60s() {
+        let secs = |s| Duration::from_secs(s);
+        assert_eq!(blockless_move_backoff(0), Duration::ZERO, "the first move");
+        assert_eq!(blockless_move_backoff(1), secs(1));
+        assert_eq!(blockless_move_backoff(2), secs(2));
+        assert_eq!(blockless_move_backoff(3), secs(4));
+        assert_eq!(blockless_move_backoff(6), secs(32));
+        assert_eq!(blockless_move_backoff(7), secs(60));
+        assert_eq!(blockless_move_backoff(u32::MAX), secs(60));
     }
 
     #[test]

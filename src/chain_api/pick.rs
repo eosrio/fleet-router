@@ -71,6 +71,8 @@ pub struct ApiView<'a> {
     pub verified: bool,
     /// Frozen: the blocks its chain API serves, `[begin, end)`.
     pub blocks: Option<Range>,
+    /// Frozen: the server's configured `range`.
+    pub declared: Option<Range>,
 }
 
 impl ApiView<'_> {
@@ -93,6 +95,14 @@ impl ApiView<'_> {
     /// A verified frozen API whose blocks include `n`, up or not.
     fn archives(&self, n: u32) -> bool {
         self.role == Role::Frozen && self.verified && self.blocks.is_some_and(|r| r.contains(n))
+    }
+
+    /// A frozen API that answers for `n` by configuration or by
+    /// verification: its declared range or its verified blocks hold `n`. Up
+    /// or not, busy or not.
+    fn claims(&self, n: u32) -> bool {
+        self.role == Role::Frozen
+            && (self.declared.is_some_and(|r| r.contains(n)) || self.archives(n))
     }
 }
 
@@ -236,6 +246,12 @@ fn reversible_order(n: u32, path: &str, apis: &[ApiView<'_>], cap: usize) -> Vec
 ///
 /// `frozen_first` tries F, L, U, X; `live_first` L, F, U, X. `get_block`
 /// (decoded action data) is served by live nodes only: L, U, X.
+///
+/// For the endpoints a frozen range server serves, X is dropped when a
+/// frozen API claims `n` ([`ApiView::claims`]): the block exists, so an
+/// Unknown Block from a node whose log begins above it must not become the
+/// answer. When the archives cannot answer, the client gets Busy and
+/// retries.
 fn irreversible_order(n: u32, q: &BlockQuery, apis: &[ApiView<'_>], cap: usize) -> Vec<usize> {
     let path = q.endpoint.path();
     let live = |pred: &dyn Fn(&ApiView<'_>) -> bool| -> Vec<&ApiView<'_>> {
@@ -246,9 +262,17 @@ fn irreversible_order(n: u32, q: &BlockQuery, apis: &[ApiView<'_>], cap: usize) 
         tier.sort_by(tier_cmp(n));
         tier
     };
+    let archived = matches!(
+        q.endpoint,
+        BlockEndpoint::BlockInfo | BlockEndpoint::BlockHeader | BlockEndpoint::RawBlock
+    ) && apis.iter().any(|a| a.claims(n));
     let l = live(&|a| a.earliest.is_some_and(|e| e <= n) && a.head.is_some_and(|h| n <= h));
     let u = live(&|a| a.earliest.is_none());
-    let x = live(&|a| a.earliest.is_some_and(|e| e > n));
+    let x = if archived {
+        Vec::new()
+    } else {
+        live(&|a| a.earliest.is_some_and(|e| e > n))
+    };
     let mut f: Vec<&ApiView<'_>> = if q.endpoint == BlockEndpoint::Block {
         Vec::new()
     } else {
@@ -630,15 +654,21 @@ mod tests {
             earliest: None,
             verified: false,
             blocks: None,
+            declared: None,
         }
     }
 
-    /// A verified frozen API serving `[begin, end)`. Indices 0-3.
+    /// A verified frozen API serving `[begin, end)`, declared as `[begin + 1,
+    /// end)` (its SHiP range starts above its block log). Indices 0-3.
     fn frozen(index: usize, begin: u32, end: u32) -> ApiView<'static> {
         ApiView {
             apis: Some(&FROZEN_APIS),
             verified: true,
             blocks: Some(Range { begin, end }),
+            declared: Some(Range {
+                begin: begin + 1,
+                end,
+            }),
             ..base(index, Role::Frozen)
         }
     }
@@ -790,12 +820,93 @@ mod tests {
             max_attempts: 8,
             ..raw(500)
         };
-        assert_eq!(order(&q, &apis), (Region::Irreversible, vec![0, 4, 5, 6]));
+        // The archive holds block 500, so X is dropped (see the next test).
+        assert_eq!(order(&q, &apis), (Region::Irreversible, vec![0, 4, 5]));
         let live_first = BlockQuery {
             block_source: BlockSource::LiveFirst,
             ..q
         };
-        assert_eq!(order(&live_first, &apis).1, vec![4, 0, 5, 6]);
+        assert_eq!(order(&live_first, &apis).1, vec![4, 0, 5]);
+        // No archive claims block 2000: X comes last.
+        let q = BlockQuery {
+            max_attempts: 8,
+            ..raw(2000)
+        };
+        assert_eq!(order(&q, &apis).1, vec![4, 5, 6]);
+    }
+
+    // LEAD: an archive's block never ends on an X-tier Unknown Block.
+    #[test]
+    fn x_tier_is_dropped_when_an_archive_claims_the_block() {
+        let x = live(6, Some(3000), 5000, 6000);
+        let q = |ep, n| BlockQuery {
+            max_attempts: 8,
+            ..query(ep, n)
+        };
+        for ep in [
+            BlockEndpoint::RawBlock,
+            BlockEndpoint::BlockHeader,
+            BlockEndpoint::BlockInfo,
+        ] {
+            // The archive is busy, unverified (declared only) or down: no
+            // candidate, so the client gets Busy, never X's Unknown Block.
+            let busy = ApiView {
+                busy: true,
+                ..frozen(0, 1, 1001)
+            };
+            let unverified = ApiView {
+                verified: false,
+                blocks: None,
+                ..frozen(0, 1, 1001)
+            };
+            let down = ApiView {
+                up: false,
+                ..frozen(0, 1, 1001)
+            };
+            for archive in [busy, unverified, down] {
+                let (region, plan) = order(&q(ep, 500), &[archive, x]);
+                assert_eq!(region, Region::Irreversible, "{ep:?}");
+                assert_eq!(plan, Vec::<usize>::new(), "{ep:?} {archive:?}");
+            }
+            // Two replicas and two attempts: both go to the replicas; no slot
+            // is kept for X.
+            let replicas = [frozen(0, 1, 1001), frozen(1, 1, 1001)];
+            let two = BlockQuery {
+                max_attempts: 2,
+                ..query(ep, 500)
+            };
+            let mut o = order(&two, &[replicas[0], replicas[1], x]).1;
+            o.sort_unstable();
+            assert_eq!(o, vec![0, 1], "{ep:?}");
+            // L and U still follow the archives.
+            let l = live(4, Some(1), 5000, 6000);
+            let u = live(5, None, 5000, 6000);
+            assert_eq!(order(&q(ep, 500), &[x, u, l, replicas[0]]).1, vec![0, 4, 5]);
+            // Outside every claim, X is a candidate again.
+            assert_eq!(order(&q(ep, 1500), &[replicas[0], x]).1, vec![6]);
+        }
+        // A declared range alone is a claim, verified blocks alone too.
+        let declared_only = ApiView {
+            verified: false,
+            blocks: None,
+            declared: Some(Range {
+                begin: 400,
+                end: 600,
+            }),
+            ..frozen(0, 1, 1001)
+        };
+        let raw500 = q(BlockEndpoint::RawBlock, 500);
+        assert!(order(&raw500, &[declared_only, x]).1.is_empty());
+        let verified_only = ApiView {
+            declared: None,
+            busy: true,
+            ..frozen(0, 1, 1001)
+        };
+        assert!(order(&raw500, &[verified_only, x]).1.is_empty());
+        // get_block and get_block_header_state are live-only: X stays.
+        for ep in [BlockEndpoint::Block, BlockEndpoint::BlockHeaderState] {
+            assert_eq!(order(&q(ep, 500), &[frozen(0, 1, 1001), x]).1, vec![6]);
+        }
     }
 
     // CU4: get_block
@@ -824,13 +935,14 @@ mod tests {
     #[test]
     fn one_attempt_is_kept_for_a_live_node() {
         let replicas = [frozen(0, 1, 1001), frozen(1, 1, 1001), frozen(2, 1, 1001)];
-        let x = live(6, Some(3000), 5000, 6000);
+        // A node that does not report `earliest` (tier U).
+        let u = live(5, None, 5000, 6000);
         let mut apis = replicas.to_vec();
-        apis.push(x);
+        apis.push(u);
         let (r, o) = order(&raw(500), &apis);
         assert_eq!(r, Region::Irreversible);
         assert_eq!(o.len(), 3);
-        assert_eq!(o[2], 6, "the last slot goes to the live node");
+        assert_eq!(o[2], 5, "the last slot goes to the live node");
         assert!(o[..2].iter().all(|i| *i < 3));
 
         // Room for every candidate: nothing to replace.
@@ -840,28 +952,32 @@ mod tests {
         };
         let o = order(&q, &apis).1;
         assert_eq!(o.len(), 4);
-        assert_eq!(o[3], 6);
+        assert_eq!(o[3], 5);
 
-        // The first live candidate in tier order: L before U before X.
+        // The first live candidate in tier order: L before U.
         let l = live(4, Some(1), 5000, 6000);
-        let u = live(5, None, 5000, 6000);
         let mut apis = replicas.to_vec();
-        apis.extend([x, u, l]);
+        apis.extend([u, l]);
         let q = BlockQuery {
             max_attempts: 2,
             ..raw(500)
         };
         assert_eq!(order(&q, &apis).1[1], 4);
         let mut apis = replicas.to_vec();
-        apis.extend([x, u]);
+        apis.push(u);
         assert_eq!(order(&q, &apis).1[1], 5);
+        // X is no candidate for an archived block, so no slot is kept for it.
+        let x = live(6, Some(3000), 5000, 6000);
+        let mut apis = replicas.to_vec();
+        apis.push(x);
+        assert!(order(&q, &apis).1.iter().all(|i| *i < 3));
 
         // A single attempt goes to the first candidate.
         let q = BlockQuery {
             max_attempts: 1,
             ..raw(500)
         };
-        let o = order(&q, &[replicas[0], x]).1;
+        let o = order(&q, &[replicas[0], u]).1;
         assert_eq!(o, vec![0]);
 
         // No live candidate at all: archives only.

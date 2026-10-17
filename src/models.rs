@@ -921,6 +921,11 @@ fn listener_warnings(
 // Chain API: an opt-in nodeos-compatible HTTP port per listener
 // ---------------------------------------------------------------------------
 
+/// Upper bound of every connection and in-flight cap. Each cap sizes a
+/// semaphore, which cannot hold more than `usize::MAX >> 3` permits; no
+/// deployment needs more than a million.
+pub const MAX_CAPACITY: usize = 1_000_000;
+
 /// nodeos's default `max-body-size`.
 const DEFAULT_API_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const API_MAX_BODY_BYTES: std::ops::RangeInclusive<usize> = 1024..=64 * 1024 * 1024;
@@ -1071,11 +1076,33 @@ pub struct ChainApiConfig {
 }
 
 /// A server's chain API address, parsed from [`Server::api_endpoint`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Two endpoints are equal when their hosts are equal ignoring ASCII case
+/// and their ports are equal; `host` keeps the configured case, because it
+/// is what the upstream receives as `Host`.
+#[derive(Debug, Clone)]
 pub struct ApiEndpoint {
-    /// Lowercase. An IPv6 literal keeps its brackets.
+    /// As configured. An IPv6 literal keeps its brackets.
     pub host: String,
     pub port: u16,
+}
+
+impl PartialEq for ApiEndpoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.port == other.port && self.host.eq_ignore_ascii_case(&other.host)
+    }
+}
+
+impl Eq for ApiEndpoint {}
+
+impl std::hash::Hash for ApiEndpoint {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for byte in self.host.bytes() {
+            state.write_u8(byte.to_ascii_lowercase());
+        }
+        state.write_u8(0xff);
+        self.port.hash(state);
+    }
 }
 
 /// Why an `api_endpoint` was rejected.
@@ -1118,29 +1145,37 @@ impl ApiEndpoint {
         if host.is_empty() {
             return Err(ApiEndpointError::Invalid);
         }
-        let port = match parsed.port_u16() {
-            Some(port) => port,
-            None if explicit_http => 80,
+        // `host()` is a prefix of the authority; whatever follows it is the
+        // port. A port that is present must parse: `http://h:88888` is an
+        // error, not port 80.
+        let port = match parsed.as_str()[host.len()..].strip_prefix(':') {
+            Some(text) => text.parse::<u16>().map_err(|_| ApiEndpointError::Invalid)?,
+            None if parsed.as_str().len() == host.len() && explicit_http => 80,
             None => return Err(ApiEndpointError::Invalid),
         };
         if port == 0 {
             return Err(ApiEndpointError::Invalid);
         }
         Ok(ApiEndpoint {
-            host: host.to_ascii_lowercase(),
+            host: host.to_string(),
             port,
         })
     }
 
-    /// `host:port`, with the port always written. Sent as the upstream
-    /// `Host` header, which nodeos validates by default.
-    #[allow(dead_code)] // Used by the chain API runtime.
+    /// `host:port`, with the port always written and the host as
+    /// configured. Sent as the upstream `Host` header, which nodeos
+    /// validates by default.
     pub fn authority(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
 
+    /// `host:port` with a lowercase host: the same for every spelling of one
+    /// endpoint.
+    pub fn canonical(&self) -> String {
+        format!("{}:{}", self.host.to_ascii_lowercase(), self.port)
+    }
+
     /// `http://host:port`, the base of every upstream request.
-    #[allow(dead_code)] // Used by the chain API runtime.
     pub fn base_url(&self) -> String {
         format!("http://{}:{}", self.host, self.port)
     }
@@ -1148,7 +1183,6 @@ impl ApiEndpoint {
 
 /// A listener's chain API after validation, ready to be bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Read by the chain API runtime.
 pub struct ResolvedChainApi {
     /// `None` in single-listener mode.
     pub listener: Option<String>,
@@ -1165,7 +1199,6 @@ pub struct ResolvedChainApi {
 
 /// One server's chain API as the router routes to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Read by the chain API runtime.
 pub struct ApiUpstream {
     /// `ServerState::index` of the server.
     pub index: usize,
@@ -1178,6 +1211,8 @@ pub struct ApiUpstream {
     pub priority: u32,
     /// Share of requests inside a priority tier. At least 1.
     pub weight: u32,
+    /// A frozen server's declared [`Server::range`].
+    pub range: Option<Range>,
 }
 
 fn resolve_chain_api(
@@ -1207,6 +1242,7 @@ fn resolve_chain_api(
                 api,
                 priority: s.priority,
                 weight: s.weight.max(1),
+                range: s.range,
             })
         })
         .collect();
@@ -1343,6 +1379,9 @@ fn validate_chain_api(
         if value == 0 {
             bail!("{prefix}chain_api.{field} must be at least 1");
         }
+        if value > MAX_CAPACITY {
+            bail!("{prefix}chain_api.{field} must be at most {MAX_CAPACITY}");
+        }
     }
     if !api.push_servers.is_empty() && !api.allow.contains(&ApiClass::Push) {
         bail!("{prefix}chain_api.push_servers requires \"push\" in chain_api.allow");
@@ -1433,6 +1472,9 @@ impl ServerConfig {
         }
         if self.max_connections == 0 {
             bail!("max_connections must be greater than 0");
+        }
+        if self.max_connections > MAX_CAPACITY {
+            bail!("max_connections must be at most {MAX_CAPACITY}");
         }
         if self.max_message_bytes == 0 {
             bail!("max_message_bytes must be greater than 0");
@@ -1566,8 +1608,12 @@ impl ServerConfig {
                 if listener.listen_port == 0 {
                     bail!("listener '{name}': listen_port must be non-zero");
                 }
-                if let Some(0) = listener.max_connections {
-                    bail!("listener '{name}': max_connections must be greater than 0");
+                match listener.max_connections {
+                    Some(0) => bail!("listener '{name}': max_connections must be greater than 0"),
+                    Some(n) if n > MAX_CAPACITY => {
+                        bail!("listener '{name}': max_connections must be at most {MAX_CAPACITY}")
+                    }
+                    _ => {}
                 }
                 if let Some(cid) = &listener.chain_id {
                     parse_chain_id(cid, Some(name))?;
@@ -3899,6 +3945,10 @@ mod tests {
                     },
                     priority: 0,
                     weight: 1,
+                    range: Some(Range {
+                        begin: 2,
+                        end: 1001
+                    }),
                 },
                 ApiUpstream {
                     index: 1,
@@ -3911,6 +3961,7 @@ mod tests {
                     },
                     priority: 0,
                     weight: 1,
+                    range: None,
                 },
             ]
         );
@@ -4137,6 +4188,21 @@ mod tests {
                 "{raw}"
             );
         }
+        // Equality ignores the host's case; the configured case is what the
+        // upstream gets as `Host`.
+        let named = ApiEndpoint::parse("HTTP://Node.Example:8888/").unwrap();
+        assert_eq!(named.host, "Node.Example");
+        assert_eq!(named.authority(), "Node.Example:8888");
+        assert_eq!(named.base_url(), "http://Node.Example:8888");
+        assert_eq!(named.canonical(), "node.example:8888");
+        let hash = |e: &ApiEndpoint| {
+            use std::hash::{BuildHasher, BuildHasherDefault};
+            BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().hash_one(e)
+        };
+        let lower = ApiEndpoint::parse("node.example:8888").unwrap();
+        assert_eq!(named, lower);
+        assert_eq!(hash(&named), hash(&lower));
+        assert_ne!(named, ApiEndpoint::parse("node.example:8889").unwrap());
         assert_eq!(
             ApiEndpoint::parse("https://10.0.1.10:443"),
             Err(ApiEndpointError::Https)
@@ -4152,6 +4218,12 @@ mod tests {
             "10.0.1.10:0",
             "10.0.1.10:99999",
             "10.0.1.10:port",
+            // A port that is present must parse, with or without a scheme.
+            "http://10.0.1.10:88888",
+            "http://10.0.1.10:port",
+            "http://10.0.1.10:-1",
+            "http://10.0.1.10:0",
+            "http://[::1]:65536",
             "ws://10.0.1.10:8888",
             "http://",
             "http://:8888",
@@ -4425,6 +4497,19 @@ mod tests {
                 serde_json::json!({ "max_in_flight_per_upstream": 0 }),
                 "chain_api.max_in_flight_per_upstream must be at least 1",
             ),
+            // Each cap sizes a semaphore, which panics past its limit.
+            (
+                serde_json::json!({ "max_connections": 1_000_001 }),
+                "chain_api.max_connections must be at most 1000000",
+            ),
+            (
+                serde_json::json!({ "max_in_flight": u64::MAX }),
+                "chain_api.max_in_flight must be at most 1000000",
+            ),
+            (
+                serde_json::json!({ "max_in_flight_per_upstream": 1_000_001 }),
+                "chain_api.max_in_flight_per_upstream must be at most 1000000",
+            ),
         ];
         for (extra, want) in cases {
             assert_eq!(validation_error(&api(extra.clone())), want, "{extra}");
@@ -4438,6 +4523,44 @@ mod tests {
         api(serde_json::json!({ "max_body_bytes": 67_108_864, "max_attempts": 8, "probe_ms": 100, "upstream_queue_ms": 0 }))
             .validate()
             .unwrap();
+        api(serde_json::json!({
+            "max_connections": 1_000_000, "max_in_flight": 1_000_000,
+            "max_in_flight_per_upstream": 1_000_000
+        }))
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn listener_connection_caps_are_bounded() {
+        let mut cfg = minimal_config();
+        cfg["max_connections"] = serde_json::json!(1_000_001);
+        let cfg: ServerConfig = serde_json::from_value(cfg).unwrap();
+        assert_eq!(
+            validation_error(&cfg),
+            "max_connections must be at most 1000000"
+        );
+        let mut cfg = minimal_config();
+        cfg["max_connections"] = serde_json::json!(1_000_000);
+        serde_json::from_value::<ServerConfig>(cfg)
+            .unwrap()
+            .validate()
+            .unwrap();
+        let listener = |cap: u64| {
+            multi(
+                serde_json::json!({ "servers": [live("a", 18080)], "max_connections": cap }),
+                serde_json::json!({}),
+            )
+        };
+        assert_eq!(
+            validation_error(&listener(u64::MAX)),
+            "listener 'eos': max_connections must be at most 1000000"
+        );
+        assert_eq!(
+            validation_error(&listener(0)),
+            "listener 'eos': max_connections must be greater than 0"
+        );
+        listener(1_000_000).validate().unwrap();
     }
 
     // C8

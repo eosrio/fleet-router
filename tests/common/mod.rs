@@ -368,3 +368,42 @@ pub async fn read_blocks(
     }
     (blocks, None)
 }
+
+/// Start the router with a chain API on every listener whose config has a
+/// `chain_api` (or at the top level), each on a free port. Returns the
+/// router and the chain API ports in listener order, once they accept TCP.
+pub async fn start_with_chain_api(mut cfg: Value) -> (RouterProcess, Vec<u16>) {
+    let mut held = Vec::new();
+    let mut ports = Vec::new();
+    let mut assign = async |api: &mut Value| {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind 127.0.0.1:0");
+        let port = listener.local_addr().expect("local addr").port();
+        held.push(listener);
+        api["listen_port"] = json!(port);
+        port
+    };
+    if let Some(listeners) = cfg.get_mut("listeners").and_then(Value::as_array_mut) {
+        for listener in listeners {
+            if let Some(api) = listener.get_mut("chain_api") {
+                ports.push(assign(api).await);
+            }
+        }
+    } else if let Some(api) = cfg.get_mut("chain_api") {
+        ports.push(assign(api).await);
+    }
+    drop(held);
+    let router = RouterProcess::start(cfg).await;
+    let deadline = Instant::now() + START_TIMEOUT;
+    for port in &ports {
+        while !port_open(*port).await {
+            assert!(
+                Instant::now() < deadline,
+                "chain API port {port} never opened"
+            );
+            sleep(POLL).await;
+        }
+    }
+    (router, ports)
+}

@@ -34,8 +34,9 @@ use tracing::Instrument;
 use crate::config_sample::CONFIG_SAMPLE;
 use crate::fleet::{FleetHub, FleetView, Log};
 use crate::models::{
-    build_config_db, build_state_db_with_chain_id, format_bind_addr, ResolvedListener,
-    ResolvedTopology, Role, ServerConfig, ServerConfigDb, ServerStateDb, StaticConfig,
+    build_config_db, build_state_db_with_chain_id, format_bind_addr, ResolvedChainApi,
+    ResolvedListener, ResolvedTopology, Role, ServerConfig, ServerConfigDb, ServerStateDb,
+    StaticConfig,
 };
 use crate::session::{handle_client, ListenerCtx};
 use crate::ship::wire::{self, UpstreamMsg};
@@ -106,10 +107,11 @@ async fn main() -> Result<()> {
     };
     let limits = config.proxy_limits();
     let resolved_listeners = config.resolved_listeners();
+    let resolved_chain_apis = config.resolved_chain_apis();
 
     // Bind all client TCP listeners up front so any port conflict fails fast.
     let mut bound_listeners = Vec::with_capacity(resolved_listeners.len());
-    for listener_cfg in resolved_listeners {
+    for (listener_cfg, chain_api) in resolved_listeners.into_iter().zip(resolved_chain_apis) {
         let bind_addr = format_bind_addr(&listener_cfg.listen_address, listener_cfg.listen_port);
         let tcp_listener = TcpListener::bind(&bind_addr)
             .await
@@ -138,7 +140,23 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        bound_listeners.push((listener_cfg, tcp_listener));
+        // The listener's chain API, bound with the SHiP listeners.
+        let chain_api = match chain_api {
+            Some(api) => {
+                let api_listener = TcpListener::bind(&api.bind).await.map_err(|e| {
+                    anyhow::anyhow!("error binding the chain API to {}: {}", api.bind, e)
+                })?;
+                tracing::info!(
+                    listener = listener_cfg.name.as_deref().unwrap_or_default(),
+                    address = %api.bind,
+                    upstreams = api.upstreams.len(),
+                    "chain API listening"
+                );
+                Some((api, api_listener))
+            }
+            None => None,
+        };
+        bound_listeners.push((listener_cfg, tcp_listener, chain_api));
     }
 
     // Graceful-shutdown broadcast: every long-lived task subscribes.
@@ -148,8 +166,9 @@ async fn main() -> Result<()> {
     let mut listener_contexts = Vec::with_capacity(bound_listeners.len());
     let mut conn_limits = Vec::with_capacity(bound_listeners.len());
     let mut accept_handles = Vec::with_capacity(bound_listeners.len());
+    let mut chain_apis = Vec::new();
 
-    for (listener_cfg, tcp_listener) in bound_listeners {
+    for (listener_cfg, tcp_listener, chain_api) in bound_listeners {
         let server_config_db: ServerConfigDb = build_config_db(listener_cfg.servers.clone());
         let server_state_db: ServerStateDb = build_state_db_with_chain_id(
             listener_cfg.servers.clone(),
@@ -215,6 +234,23 @@ async fn main() -> Result<()> {
 
         // What every client session of this listener shares.
         let ctx = ListenerCtx::new(&listener_cfg, limits, config.live_lag_blocks, hub.clone());
+
+        // The chain API: its probes and its accept loop. Its connections
+        // drain with the SHiP ones. `chain_apis` lines up with the
+        // listeners.
+        let api_ctx = chain_api.map(|(api, api_listener)| {
+            let api_ctx = chain_api::ChainApiCtx::new(
+                &api,
+                hub.clone(),
+                Duration::from_millis(limits.connect_timeout_ms),
+                limits.handshake_timeout_ms,
+                config.live_lag_blocks,
+            );
+            conn_limits.push((api_ctx.connections.clone(), api_ctx.max_connections()));
+            accept_handles.push(api_ctx.spawn(api_listener, &shutdown_tx));
+            api_ctx
+        });
+        chain_apis.push(api_ctx);
 
         // Periodic block-progress / staleness monitor for this listener's pool.
         spawn(state_monitoring_loop(
@@ -315,7 +351,10 @@ async fn main() -> Result<()> {
     ));
 
     shutdown_signal().await;
-    tracing::info!("shutdown signal received; draining connections");
+    tracing::info!(
+        chain_apis = chain_apis.iter().flatten().count(),
+        "shutdown signal received; draining connections"
+    );
     let _ = shutdown_tx.send(());
     for handle in accept_handles {
         let _ = handle.await;
@@ -589,15 +628,49 @@ fn print_coverage(view: &FleetView, reported: &HashSet<&str>) {
     }
 }
 
+/// `config test`: the chain API of a listener, one line per enabled server.
+/// Returns what `--strict` fails on: an enabled frozen server without
+/// `api_endpoint`, whose blocks only live nodes can then answer.
+fn report_chain_api(listener: &ResolvedListener, api: &ResolvedChainApi) -> Vec<String> {
+    cprintln!(
+        "\n 🔌 <bright-magenta,bold>Chain API</> on <cyan>{}</> ({} upstream API(s))",
+        api.bind,
+        api.upstreams.len()
+    );
+    let mut failures = Vec::new();
+    for server in listener.servers.iter().filter(|s| s.enabled) {
+        let endpoint = server.api_endpoint.as_deref().unwrap_or("-");
+        cprintln!(
+            "    <cyan>{:<16}</> {:<6} {}",
+            server.name,
+            server.role.as_str(),
+            endpoint
+        );
+        if server.role == Role::Frozen && server.api_endpoint.is_none() {
+            failures.push(format!(
+                "frozen server '{}' has no api_endpoint; its blocks are answered by live nodes only",
+                server.name
+            ));
+        }
+    }
+    failures
+}
+
 /// Probe every server of every listener. Returns false when `strict` and a
-/// stitched listener's coverage has a hole or an unreported frozen upstream.
+/// stitched listener's coverage has a hole or an unreported frozen upstream,
+/// or a chain API listener has an enabled frozen server without
+/// `api_endpoint`.
 async fn run_tests(config: &ServerConfig, strict: bool) -> bool {
     let mut total_valid = 0;
     let mut all_listeners_valid = true;
     let mut strict_failures: Vec<String> = Vec::new();
     let bound = Duration::from_millis(config.upstream_connect_timeout_ms());
 
-    for listener in config.resolved_listeners() {
+    for (listener, chain_api) in config
+        .resolved_listeners()
+        .into_iter()
+        .zip(config.resolved_chain_apis())
+    {
         if let Some(name) = &listener.name {
             cprintln!(
                 "\n 🌐 Listener <bright-magenta,bold>{}</> (<cyan>{}</>)",
@@ -692,6 +765,18 @@ async fn run_tests(config: &ServerConfig, strict: bool) -> bool {
                 .unwrap_or_default();
             strict_failures.extend(failures.into_iter().map(|f| format!("{prefix}{f}")));
         }
+        if let Some(api) = &chain_api {
+            let failures = report_chain_api(&listener, api);
+            for failure in &failures {
+                cprintln!("    <yellow>warning: {}</>", failure);
+            }
+            let prefix = listener
+                .name
+                .as_deref()
+                .map(|name| format!("listener '{name}': "))
+                .unwrap_or_default();
+            strict_failures.extend(failures.into_iter().map(|f| format!("{prefix}{f}")));
+        }
     }
     if total_valid > 0 && all_listeners_valid {
         cprintln!("\n ✅  Valid servers: <cyan,bold>{}</>", total_valid);
@@ -701,7 +786,7 @@ async fn run_tests(config: &ServerConfig, strict: bool) -> bool {
     let passed = !strict || strict_failures.is_empty();
     if !passed {
         cprintln!(
-            "\n ❌  <red,bold>--strict: {} coverage problem(s), see the warnings above</>",
+            "\n ❌  <red,bold>--strict: {} coverage or chain API problem(s), see the warnings above</>",
             strict_failures.len()
         );
     }
@@ -749,7 +834,7 @@ fn process_args() -> Result<Option<(Action, ServerConfig)>> {
                             arg!(<CONFIG> "config file to test")
                                 .value_parser(value_parser!(PathBuf)),
                         )
-                        .arg(arg!(--strict "Exit 1 when the configuration is invalid, or a stitched listener's coverage has a hole or a frozen upstream that did not report its ranges")),
+                        .arg(arg!(--strict "Exit 1 when the configuration is invalid, or a stitched listener's coverage has a hole or a frozen upstream that did not report its ranges, or a chain API listener has an enabled frozen server without api_endpoint")),
                 ),
         )
         .subcommand(Command::new("run").about("Start the proxy server (default)"))

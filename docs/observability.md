@@ -225,7 +225,7 @@ fleet_router_too_large_closes_total
 
 - `fleet_router_fleet_head_block` and `fleet_router_fleet_lib_block` are the fleet head and LIB: what the router's status replies report (`0` until known). The LIB never decreases. `fleet_router_fleet_head_age_seconds` is the time since the fleet head last advanced (since startup while none is known).
 - The coverage gauges carry `log` = `trace`, `chain_state` or `finality`. `coverage_begin_block` and `coverage_end_block` bound the top contiguous component of that log's coverage, the range status reports (`0` if none). `coverage_gaps` counts the holes below it. `offline_coverage_blocks` counts the blocks of the top component that no online upstream covers.
-- `fleet_router_fleet_live_overlap_blocks{log}` (trace and chain state only) is the highest frozen end minus the lowest begin of the online live upstreams. Negative means a hole between the archives and the live tier. It is absent while the listener has no frozen upstream or no online live upstream.
+- `fleet_router_fleet_live_overlap_blocks{log}` (trace and chain state only) is informational: the highest frozen end (exclusive) minus the lowest begin of the online live upstreams, so how many archived blocks the live tier also holds. A small value is normal: a live node started from a snapshot at block `S`, after archives that end at `S + 1`, overlaps them by `0` blocks of trace and `1` of chain state (see [Cut-over from a snapshot](operations.md#cut-over-from-a-snapshot)). Negative means a hole between the archives and the live tier, which the gap and offline coverage gauges also show. It is absent while the listener has no frozen upstream or no online live upstream.
 - `fleet_router_fleet_frozen_unreported` counts enabled frozen upstreams that have neither reported nor declared a range. While it is above `0`, a stitched listener holds status requests.
 
 #### Sessions and failovers
@@ -294,13 +294,14 @@ Starting points for a stitched listener:
 
 | Expression | What it means |
 | --- | --- |
-| `fleet_router_fleet_coverage_gaps > 0` | A block range no upstream covers; clients that reach it are closed with 1011. |
-| `fleet_router_fleet_offline_coverage_blocks > 0` for 2 minutes | Archived history with no online upstream; sessions there hold, then close after `gap_wait_ms`. |
-| `fleet_router_fleet_live_overlap_blocks < 1000` | The live tier's first block is close to (or past) the highest archive end. |
+| `fleet_router_fleet_coverage_gaps > 0` | A block range no upstream covers, such as a hole between the archives and the live tier; clients that reach it are closed with 1011. |
+| `fleet_router_fleet_offline_coverage_blocks > 0` for 2 minutes | History with no online upstream, such as the blocks between the archives and the live tier while the live node that holds them is down; sessions there hold, then close after `gap_wait_ms`. |
 | `fleet_router_fleet_head_age_seconds > 30` | The fleet head stopped advancing. |
 | `increase(fleet_router_upstream_contract_violations_total[10m]) > 0` | An archive broke the contract; check its data. |
 | `increase(fleet_router_credit_overruns_total[10m]) > 0` | An upstream sent results beyond the client's credit. |
 | `histogram_quantile(0.99, rate(fleet_router_handoff_latency_seconds_bucket[5m]))` | Slow handoffs between ranges. |
 | `fleet_router_upstream_no_block_log == 1` | An archive serves without blocks; `fetch_block` clients get no `block` where no other upstream holds it. |
+
+Alert on holes with the two coverage gauges, not on `fleet_router_fleet_live_overlap_blocks`: an overlap of `0` or `1` block is the normal shape right after a cut-over, and a hole between the archives and the live tier already shows as a gap or as offline coverage.
 
 For a chain API: `fleet_router_upstream_api_up == 0` and `fleet_router_upstream_api_chain_id_mismatch == 1` per upstream, and a rising share of `fleet_router_api_requests_total{code="5xx"}`.

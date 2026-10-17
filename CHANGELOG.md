@@ -91,9 +91,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New metrics `fleet_router_api_*` and `fleet_router_upstream_api_*`; new
   readiness scope `/ready?scope=api`; a `chain_api` block per listener in
   `/coverage`.
-- `docs/chain-api.md`, and sections on range-split fleets, failover and
-  strikes, readiness scopes, `/coverage`, every new metric and suggested
-  alerts in `docs/operations.md` and `docs/observability.md`.
+- `docs/chain-api.md`, and sections on range-split fleets (including the
+  cut-over to a live node started from a snapshot), failover and strikes,
+  readiness scopes, `/coverage`, every new metric and suggested alerts in
+  `docs/operations.md` and `docs/observability.md`.
 
 ### Changed
 

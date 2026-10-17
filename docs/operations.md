@@ -54,7 +54,7 @@ The fleet head and LIB come from the online live nodes that are not stale or dis
 2. **Keep the block log** with the state-history logs, so requests with `fetch_block` get blocks from the archive (see [fetch_block and block logs](#fetch_block-and-block-logs)), and so its [chain API](chain-api.md) can serve blocks.
 3. **Run two replicas of each range** on separate hosts. Sessions on a failed archive resume on its replica at the next block. Sessions spread over replicas by connections per `weight`.
 4. **Declare each archive** with `"role": "frozen"`, its `range` and a `max_sessions`. The declared range lets the listener answer status and plan routes while the archive is down or still starting.
-5. **Overlap the live tier.** The live nodes' first block should be at or below the highest archive end, so no block falls between the archives and the tip. `fleet_router_fleet_live_overlap_blocks` is that overlap; a negative value is a hole.
+5. **Overlap the live tier.** The live nodes' first block should be at or below the highest archive end, so no block falls between the archives and the tip. `fleet_router_fleet_live_overlap_blocks` is that overlap; a negative value is a hole. An overlap of `0`, where the live node's first block follows the last archived one, is enough (see [Cut-over from a snapshot](#cut-over-from-a-snapshot)).
 6. **Pin `chain_id`.** A stitched listener requires it.
 7. **Check the coverage.** `fleet-router config test --strict <path>` probes every server and prints, per log, the coverage the listener adds up to and its holes, and each upstream's ranges with where they came from (`reported`, `declared` or `unknown`). It exits 1 on a hole in the trace or chain-state coverage, a frozen server that did not report its ranges, or, with a [chain API](chain-api.md), archived blocks that no frozen server with an `api_endpoint` covers.
 
@@ -70,6 +70,13 @@ The fleet head and LIB come from the online live nodes that are not stale or dis
 - drop the TCP connection, with no Close frame, on a data or integrity error.
 
 Toward an archive, the router requests only blocks inside its range (or below the fleet's first block, see below), up to the fleet head + 1 (LIB + 1 with `irreversible_only`), sends no `have_positions`, closes a finished link with Close 1000, and never sends status on a session link: its monitor connection carries status.
+
+### Cut-over from a snapshot
+
+A common way to split a node's history is to archive its logs, then start a live node from a snapshot of the same chain. With the snapshot at block `S`:
+
+- **The last archive ends at `S + 1`.** Serve and declare a `range` for the last frozen range server that ends at `S + 1` (exclusive), so its last block is `S`. The logs copied from the old node may hold blocks after `S` that the live node does not follow: blocks of a fork it abandoned. They must not be served, and the router routes by range: an archive that reaches past `S` would have its blocks there served instead of the live node's.
+- **The live node's first blocks.** A live node started from a snapshot at `S` holds chain-state data from `S`, and traces, finality data and blocks from `S + 1`. With the last archive ending at `S + 1`, the live tier overlaps the archives by `0` blocks of trace and `1` of chain state: no hole, and the normal shape, not a reason to alert (see [Alerts](observability.md#alerts)).
 
 ### Seams and handoffs
 
@@ -121,6 +128,7 @@ A failed dial makes the session avoid that upstream for 2 s, and marks a live up
 An archive may run without a block log. It then sends no `block` in its results, although it has the traces and deltas. The router handles that without counting it against the archive:
 
 - The first result without `block` for a block the archive covers, on a request with `fetch_block`, flags the archive as having no block log, with one warning (`frozen upstream sent no block for a block it covers`). `fleet_router_upstream_no_block_log` is 1 while the flag is set. Missing traces, deltas or finality data are still `missing_field` violations.
+- The router learns this only from a result. So the first `fetch_block` session to reach such an archive (and the first again after the flag clears) pays one failover, `no_block_log`, to an upstream that holds blocks when one can take it; later sessions go to such an upstream from the start.
 - For requests with `fetch_block`, a flagged archive ranks below every upstream that holds blocks, right after online, fresh and below `max_sessions`. A leg on a flagged archive ends where an upstream that holds blocks, is online and is below its `max_sessions` can take over: its range begins, or its quarantine ends. An offline or full holder does not end the leg; the session moves to it once it can take the stream (next item).
 - When an upstream that holds blocks could serve the cursor now, the session moves to it at once, with no strike and no pause (failover reason `no_block_log`, logged at info). If that move ends on an archive without a block log again (the holder refused the session, say), the next move waits 1 s, doubling to 60 s, until a result arrives with every field the request asked for.
 - Otherwise the result is forwarded without `block`, as a node with a pruned block log would send it, and counted in `fleet_router_upstream_results_without_block_total`. The session asks again on every fleet change, where the archive's leg ends, and at least every second.

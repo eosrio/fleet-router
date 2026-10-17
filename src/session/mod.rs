@@ -473,9 +473,13 @@ struct Session {
     predial_for: Option<u32>,
     /// Stitched: the current hold, kept across its retry dials.
     hold: Option<HoldInfo>,
-    /// Stitched: when the last handoff started (the old link's last frame),
-    /// until the new link's first frame.
+    /// Stitched: when the last handoff started (the old link's last frame,
+    /// or the end of a wait or hold before the next leg), until the new
+    /// link's first frame.
     handoff_started: Option<Instant>,
+    /// Stitched: the upstream whose leg the cursor finished, until the next
+    /// leg is served. Served from another upstream, that is a handoff.
+    handoff_from: Option<usize>,
     last_jump_warn: Option<Instant>,
     counts: Counts,
     end_reason: &'static str,
@@ -540,6 +544,7 @@ impl Session {
             predial_for: None,
             hold: None,
             handoff_started: None,
+            handoff_from: None,
             last_jump_warn: None,
             counts: Counts::default(),
             end_reason: "client closed",
@@ -2341,6 +2346,7 @@ impl Session {
     async fn on_stitched_request(&mut self, r: BlocksRequest, pre: u32) -> Flow {
         self.hold = None;
         self.handoff_started = None;
+        self.handoff_from = None;
         self.dial_attempts = 0;
         if request_is_empty(&r) {
             // Spring sends nothing for it; stop the link's old request.
@@ -2475,10 +2481,16 @@ impl Session {
     /// runs out.
     async fn apply_step(&mut self, step: Step, purpose: Purpose, pre: u32) -> Flow {
         match step {
-            Step::Serve(st) => self.serve(st, purpose, pre).await,
+            Step::Serve(st) => {
+                if purpose == Purpose::Handoff {
+                    self.note_handoff(&st);
+                }
+                self.serve(st, purpose, pre).await
+            }
             Step::Done => {
                 self.hold = None;
                 self.handoff_started = None;
+                self.handoff_from = None;
                 self.dial = None;
                 self.retired = None;
                 self.discard_standby();
@@ -2672,39 +2684,44 @@ impl Session {
 
     /// The client's cursor reached the clamped end of the leg: plan the next
     /// leg from the cursor with the outstanding credit. A handoff is never a
-    /// failure: no strike, no budget, no backoff, no exclusion.
-    ///
-    /// When the next leg is on the link's own upstream, the stream goes on
-    /// there with the same request version and flags, on the same socket
-    /// (a frozen link at its end takes a new request): that is no handoff,
-    /// and it is neither counted nor logged as one.
+    /// failure: no strike, no budget, no backoff, no exclusion. It is counted
+    /// when the next leg is served ([`Session::note_handoff`]), which may be
+    /// after a wait for the fleet head or a hold.
     async fn handoff(&mut self) -> Flow {
-        let started = Instant::now();
+        self.handoff_from = self.link.as_ref().map(|l| l.st.up);
         let step = self.plan(self.c.cursor, false);
-        if let (Step::Serve(st), Some(link)) = (&step, self.link.as_ref()) {
-            if st.up == link.st.up {
-                tracing::debug!(
-                    upstream = %link.endpoint,
-                    block = self.c.cursor,
-                    end = st.req_end,
-                    "the next leg stays on the same upstream"
-                );
-                return self.apply_step(step, Purpose::Handoff, self.c.credit).await;
-            }
+        self.apply_step(step, Purpose::Handoff, self.c.credit).await
+    }
+
+    /// The leg after a handoff is served from `st.up`. From another upstream
+    /// than the one whose leg ended, that is a handoff, counted and logged
+    /// once. On the same upstream the stream goes on with the same request
+    /// version and flags, on the same socket when it is still open (a frozen
+    /// link at its end takes a new request): that is no handoff, and it is
+    /// neither counted nor logged as one.
+    fn note_handoff(&mut self, st: &ServeStep) {
+        let Some(from) = self.handoff_from.take() else {
+            return;
+        };
+        if from == st.up {
+            tracing::debug!(
+                upstream = %st.endpoint,
+                block = self.c.cursor,
+                end = st.req_end,
+                "the next leg stays on the same upstream"
+            );
+            return;
         }
         self.ctx.hub.stats.handoffs.fetch_add(1, Ordering::Relaxed);
         self.counts.handoffs += 1;
-        self.handoff_started = Some(started);
-        let from = self.link.as_ref().map(|l| l.name.clone());
-        if let Step::Serve(st) = &step {
-            tracing::info!(
-                from = %from.as_deref().unwrap_or(""),
-                to = %self.view.up(st.up).map_or("", |u| &*u.name),
-                block = self.c.cursor,
-                "handing the stream off to the next upstream"
-            );
-        }
-        self.apply_step(step, Purpose::Handoff, self.c.credit).await
+        self.handoff_started = Some(Instant::now());
+        let name = |up: usize| self.view.up(up).map_or("", |u| &*u.name);
+        tracing::info!(
+            from = %name(from),
+            to = %name(st.up),
+            block = self.c.cursor,
+            "handing the stream off to the next upstream"
+        );
     }
 
     /// Open the next leg's link ahead of the handoff once the cursor is
@@ -5088,6 +5105,116 @@ mod tests {
         assert_eq!(requests[0].0, requests[1].0, "the same socket");
         assert_eq!(mock.sessions_accepted(), 1);
         assert_eq!(harness.hub.stats.handoffs.load(Ordering::Relaxed), 0);
+    }
+
+    /// Give the frozen `endpoint` the head and LIB `num`, and publish the
+    /// view.
+    async fn set_frozen_head(hub: &FleetHub, endpoint: &str, num: u32) {
+        let mut db = hub.state.lock().await;
+        let pos = BlockPos {
+            num,
+            id: mock_ship::fake_block_id(num),
+        };
+        let state = db.get_mut(endpoint).unwrap();
+        state.head = Some(pos);
+        state.lib = Some(pos);
+        hub.rebuild(&db);
+    }
+
+    /// Wait until the session waits for the fleet to reach a block.
+    async fn wait_until_waiting(hub: &FleetHub) {
+        let deadline = Instant::now() + WAIT;
+        while hub.stats.sessions(SessionGauge::Waiting) != 1 {
+            assert!(Instant::now() < deadline, "the session never waited");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Stitched: the client reaches the end of a leg clamped to the fleet
+    /// head before the head moves, so the session waits there; then the next
+    /// leg is on the same archive. The stream goes on over the same socket,
+    /// and that is no handoff, after the wait too.
+    #[tokio::test]
+    async fn a_next_leg_on_the_same_upstream_after_a_wait_is_no_handoff() {
+        let (archive, mock) = start_mock(MockShipConfig::frozen(1, 1001)).await;
+        let harness = start_stitched(&[(&archive, 1, 1001)]).await;
+        set_frozen_head(&harness.hub, &archive, 300).await;
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(1, 1001, 1000)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 300).await,
+            (1..=300).collect::<Vec<_>>()
+        );
+        wait_until_waiting(&harness.hub).await;
+        set_frozen_head(&harness.hub, &archive, 1000).await;
+        assert_eq!(
+            read_block_nums(&mut client, 700).await,
+            (301..=1000).collect::<Vec<_>>()
+        );
+        let requests = blocks_requests(&mock);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|&(session, start, end, _)| (session, start, end))
+                .collect::<Vec<_>>(),
+            [(requests[0].0, 1, 301), (requests[0].0, 301, 1001)],
+            "the same socket"
+        );
+        assert_eq!(mock.sessions_accepted(), 1);
+        assert_eq!(harness.hub.stats.handoffs.load(Ordering::Relaxed), 0);
+    }
+
+    /// Stitched: a client that reaches the top of an archive-only fleet
+    /// waits there for more blocks; no upstream takes the stream, and that
+    /// is no handoff.
+    #[tokio::test]
+    async fn the_top_of_an_archive_only_fleet_is_no_handoff() {
+        let (archive, _mock) = start_mock(MockShipConfig::frozen(1, 1001)).await;
+        let harness = start_stitched(&[(&archive, 1, 1001)]).await;
+        let mut client = connect(&harness.url).await;
+        client
+            .send(blocks_request(1, u32::MAX, 2000))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 1000).await,
+            (1..=1000).collect::<Vec<_>>()
+        );
+        wait_until_waiting(&harness.hub).await;
+        assert_eq!(harness.hub.stats.handoffs.load(Ordering::Relaxed), 0);
+    }
+
+    /// Stitched: the next archive's range begins above the fleet head, so
+    /// the session waits at the end of the first leg. When the head moves
+    /// on, the next leg is on the other archive: one handoff, counted then.
+    #[tokio::test]
+    async fn a_handoff_after_a_wait_is_counted_once_on_the_next_upstream() {
+        let (a, a_mock) = start_mock(MockShipConfig::frozen(1, 301)).await;
+        let (b, b_mock) = start_mock(MockShipConfig::frozen(301, 1001)).await;
+        let harness = start_stitched(&[(&a, 1, 301), (&b, 301, 1001)]).await;
+        set_frozen_head(&harness.hub, &b, 300).await;
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(1, 1001, 1000)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 300).await,
+            (1..=300).collect::<Vec<_>>()
+        );
+        wait_until_waiting(&harness.hub).await;
+        assert_eq!(harness.hub.stats.handoffs.load(Ordering::Relaxed), 0);
+        set_frozen_head(&harness.hub, &b, 1000).await;
+        assert_eq!(
+            read_block_nums(&mut client, 700).await,
+            (301..=1000).collect::<Vec<_>>()
+        );
+        let legs = |mock: &mock_ship::MockShipHandle| {
+            blocks_requests(mock)
+                .iter()
+                .map(|&(_, start, end, _)| (start, end))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(legs(&a_mock), [(1, 301)]);
+        assert_eq!(legs(&b_mock), [(301, 1001)]);
+        assert_eq!(harness.hub.stats.handoffs.load(Ordering::Relaxed), 1);
     }
 
     /// Stitched: the archive that holds blocks breaks the contract at 15 and

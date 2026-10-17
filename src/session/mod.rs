@@ -257,6 +257,9 @@ struct HoldInfo {
     deadline: Option<Instant>,
     /// Retries made so far at this block.
     attempt: u32,
+    /// The retry made when `deadline` came: the hold ends the next time it
+    /// runs out.
+    last_try: bool,
 }
 
 /// Stitched: a link to the next leg's upstream, connected (ABI read) ahead of
@@ -2309,8 +2312,10 @@ impl Session {
                     self.keep_link_if_settled();
                 }
                 let now = Instant::now();
-                let (since, attempt) = match self.hold {
-                    Some(h) if h.block == block => (h.since, h.attempt.saturating_add(1)),
+                let (since, attempt, last_try) = match self.hold {
+                    Some(h) if h.block == block => {
+                        (h.since, h.attempt.saturating_add(1), h.last_try)
+                    }
                     _ => {
                         self.ctx.hub.stats.holds.inc(why);
                         tracing::warn!(
@@ -2319,7 +2324,7 @@ impl Session {
                             bounded,
                             "no upstream can serve the block now; holding"
                         );
-                        (now, 0)
+                        (now, 0, false)
                     }
                 };
                 let deadline =
@@ -2330,6 +2335,7 @@ impl Session {
                     since,
                     deadline,
                     attempt,
+                    last_try,
                 });
                 self.set_phase(Phase::Holding {
                     next_retry: now + jitter(hold_backoff(attempt), self.id, attempt),
@@ -2873,6 +2879,23 @@ impl Session {
         }
         if let Some(hold) = self.hold {
             if hold.deadline.is_some_and(|at| now >= at) {
+                // The retries back off to 3.2 s, and a freed slot or an
+                // expired exclusion publishes no view: one last try before
+                // closing the client.
+                let holding = match self.phase {
+                    Phase::Holding { purpose, .. } => Some(purpose),
+                    _ => None,
+                };
+                if let (Some(purpose), false) = (holding, hold.last_try) {
+                    let step = self.plan(self.c.cursor, true);
+                    if matches!(step, Step::Serve(_)) {
+                        if let Some(h) = self.hold.as_mut() {
+                            h.last_try = true;
+                            h.deadline = None;
+                        }
+                        return self.apply_step(step, purpose, self.c.credit).await;
+                    }
+                }
                 return self.hold_expired(hold).await;
             }
         }
@@ -3080,6 +3103,15 @@ mod tests {
     }
 
     async fn start_stitched_with(archives: &[(&str, u32, u32)], limits: ProxyLimits) -> Harness {
+        start_stitched_tuned(archives, limits, StitchingPolicy::default()).await
+    }
+
+    /// [`start_stitched_with`] under the stitching policy `stitching`.
+    async fn start_stitched_tuned(
+        archives: &[(&str, u32, u32)],
+        limits: ProxyLimits,
+        stitching: StitchingPolicy,
+    ) -> Harness {
         let servers: Vec<Server> = archives
             .iter()
             .enumerate()
@@ -3094,6 +3126,7 @@ mod tests {
             .collect();
         let resolved = ResolvedListener {
             topology: ResolvedTopology::Stitched,
+            stitching,
             ..listener(servers.clone())
         };
         let hub = FleetHub::new(
@@ -4265,6 +4298,61 @@ mod tests {
             2,
             "pre-dialed again after the move"
         );
+    }
+
+    /// Stitched: a session holds for a full archive, and a slot there frees
+    /// up after the last retry before `gap_wait_ms` runs out (the retries
+    /// back off, and a freed slot publishes no view). The hold makes one
+    /// last try at its deadline instead of closing the client.
+    #[tokio::test]
+    async fn a_bounded_hold_tries_once_more_at_its_deadline() {
+        let leg = |begin, end| MockShipConfig {
+            block_delay: Some(Duration::from_millis(1)),
+            ..MockShipConfig::frozen(begin, end)
+        };
+        let (a, _mock_a) = start_mock(leg(1, 1001)).await;
+        let (b, mock_b) = start_mock(leg(1001, 2001)).await;
+        // Retries come about 0.1, 0.3, 0.7 and 1.5 s into the hold (±20 %),
+        // the next one after 2.48 s at the earliest.
+        let policy = StitchingPolicy {
+            gap_wait_ms: 2_400,
+            ..StitchingPolicy::default()
+        };
+        let harness =
+            start_stitched_tuned(&[(&a, 1, 1001), (&b, 1001, 2001)], limits(0), policy).await;
+        let b_slots = {
+            let mut db = harness.hub.state.lock().await;
+            let state = db.get_mut(&b).unwrap();
+            state.max_sessions = Some(1);
+            state.connections.fetch_add(1, Ordering::Relaxed);
+            let slots = state.connections.clone();
+            harness.hub.rebuild(&db);
+            slots
+        };
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(990, 1010, 100)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 11).await,
+            (990..1001).collect::<Vec<_>>()
+        );
+        let held = timeout(WAIT, async {
+            while harness.hub.stats.holds.get(HoldWhy::AtCapacity) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(held.is_ok(), "the session should hold for B");
+        let since = Instant::now();
+
+        // Between the last retry (1.8 s at the latest) and the deadline.
+        tokio::time::sleep_until(since + Duration::from_millis(2_100)).await;
+        b_slots.fetch_sub(1, Ordering::Relaxed);
+        assert_eq!(
+            read_block_nums(&mut client, 9).await,
+            (1001..1010).collect::<Vec<_>>()
+        );
+        assert_eq!(mock_b.sessions_accepted(), 1);
+        assert_eq!(harness.hub.stats.hold_closes.get(HoldWhy::AtCapacity), 0);
     }
 
     /// Whether the control API counts a session at `next_block` on `endpoint`

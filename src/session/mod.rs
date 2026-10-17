@@ -4355,6 +4355,113 @@ mod tests {
         assert_eq!(harness.hub.stats.hold_closes.get(HoldWhy::AtCapacity), 0);
     }
 
+    /// Stitched: an archive replica that goes silent after its ABI is
+    /// failed over to its twin as silent, without a strike, and is not marked
+    /// offline: a frozen upstream is never taken out of the fleet for that.
+    #[tokio::test]
+    async fn a_silent_archive_fails_over_to_its_twin_and_stays_online() {
+        let (dead, dead_task) = dead_upstream().await;
+        let (twin, _twin_mock) = start_mock(MockShipConfig::frozen(1, 2001)).await;
+        let harness =
+            start_stitched_with(&[(&dead, 1, 2001), (&twin, 1, 2001)], liveness(400)).await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&twin).unwrap().priority = 5;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(10, 20, 100)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 10).await,
+            (10..20).collect::<Vec<_>>()
+        );
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Silent), 1);
+        let state = harness.hub.state.lock().await;
+        assert!(
+            state[&dead].online,
+            "a silent archive is not marked offline"
+        );
+        assert_eq!(state[&dead].block_failures, 0, "no strike");
+        drop(state);
+        dead_task.abort();
+    }
+
+    /// Stitched: a live node that goes silent while serving the tip is
+    /// marked offline, and the session fails over to the other live node.
+    #[tokio::test]
+    async fn a_silent_live_node_is_marked_offline_in_a_stitched_fleet() {
+        let (archive, _archive_mock) = start_mock(MockShipConfig::frozen(1, 1001)).await;
+        let (dead, dead_task) = dead_upstream().await;
+        let (live, _live_mock) = start_mock(MockShipConfig::live(900, 1500)).await;
+        let server = |name: &str, endpoint: &str, role: Role| Server {
+            name: name.to_string(),
+            endpoint: endpoint.to_string(),
+            enabled: true,
+            role,
+            range: (role == Role::Frozen).then_some(crate::ship::Range {
+                begin: 1,
+                end: 1001,
+            }),
+            ..Default::default()
+        };
+        let servers = vec![
+            server("archive", &archive, Role::Frozen),
+            server("dead", &dead, Role::Live),
+            server("live", &live, Role::Live),
+        ];
+        let resolved = ResolvedListener {
+            topology: ResolvedTopology::Stitched,
+            ..listener(servers.clone())
+        };
+        let hub = FleetHub::new(
+            &resolved,
+            build_state_db(servers.clone()),
+            build_config_db(servers),
+        );
+        {
+            let abi = Arc::new(crate::abi::AbiEntry::new(mock_ship::SHIP_ABI_JSON));
+            let mut db = hub.state.lock().await;
+            let pos = |num| BlockPos {
+                num,
+                id: mock_ship::fake_block_id(num),
+            };
+            for (endpoint, begin, end, head, lib, priority) in [
+                (&archive, 1, 1001, 1000, 1000, 0),
+                (&dead, 900, 1501, 1500, 1490, 0),
+                (&live, 900, 1501, 1500, 1490, 5),
+            ] {
+                let state = db.get_mut(endpoint.as_str()).unwrap();
+                state.online = true;
+                state.ranges_known = true;
+                state.trace_begin_block = begin;
+                state.trace_end_block = end;
+                state.chain_state_begin_block = begin;
+                state.chain_state_end_block = end;
+                state.head = Some(pos(head));
+                state.lib = Some(pos(lib));
+                state.status_v1 = Some(true);
+                state.abi = Some(abi.clone());
+                state.priority = priority;
+            }
+            hub.rebuild(&db);
+        }
+        let harness = serve_one(&resolved, hub, liveness(400)).await;
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        client.send(blocks_request(1100, 1110, 100)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 10).await,
+            (1100..1110).collect::<Vec<_>>()
+        );
+        assert_eq!(info.upstream(), live);
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Silent), 1);
+        let state = harness.hub.state.lock().await;
+        assert!(!state[&dead].online, "a silent live node is marked offline");
+        assert_eq!(state[&dead].block_failures, 0, "no strike");
+        drop(state);
+        dead_task.abort();
+    }
+
     /// Whether the control API counts a session at `next_block` on `endpoint`
     /// as movable (its drain and move check).
     fn api_counts_movable(hub: &FleetHub, endpoint: &str, next_block: Option<u32>) -> bool {

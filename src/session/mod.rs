@@ -119,7 +119,11 @@ const JUMP_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Stitched: a link kept open with nothing to send is closed after this,
 /// unless a following request reuses its socket first.
+#[cfg(not(test))]
 const LINGER: Duration = Duration::from_secs(30);
+/// Short in unit tests, so a test can watch a linger run out.
+#[cfg(test)]
+const LINGER: Duration = Duration::from_secs(2);
 
 /// Stitched: a pre-dialed standby link that no handoff used is dropped
 /// after this.
@@ -1855,7 +1859,16 @@ impl Session {
             if let Some(link) = self.link.as_ref() {
                 if link.st.req.is_some() {
                     if self.link_quiescent(link, pre) {
-                        return self.send_request(r.end, Purpose::Initial).await;
+                        // Sending clears the linger, yet the link has nothing
+                        // to send: it keeps the linger it had (or starts one),
+                        // so its slot is freed unless a request reuses it.
+                        let linger = link.st.linger_until;
+                        let flow = self.send_request(r.end, Purpose::Initial).await;
+                        if let Some(link) = self.link.as_mut() {
+                            link.st.linger_until =
+                                Some(linger.unwrap_or_else(|| Instant::now() + LINGER));
+                        }
+                        return flow;
                     }
                     self.retire_link(false);
                 }
@@ -1960,7 +1973,11 @@ impl Session {
     ///
     /// Every step but `Serve` leaves the link without a new request, so it is
     /// kept only when nothing of its old request can still arrive (see
-    /// [`Session::keep_link_if_settled`]).
+    /// [`Session::keep_link_if_settled`]). A hold for capacity (a full or
+    /// busy upstream) closes it: the session waits for a slot elsewhere, and
+    /// the slot its idle link fills may be the one another held session waits
+    /// for. Kept, two such links would block both sessions until a linger
+    /// runs out.
     async fn apply_step(&mut self, step: Step, purpose: Purpose, pre: u32) -> Flow {
         match step {
             Step::Serve(st) => self.serve(st, purpose, pre).await,
@@ -2011,7 +2028,11 @@ impl Session {
                 self.retired = None;
                 self.dial_attempts = 0;
                 self.discard_standby();
-                self.keep_link_if_settled();
+                if matches!(why, HoldWhy::AtCapacity | HoldWhy::Busy) {
+                    self.retire_link(false);
+                } else {
+                    self.keep_link_if_settled();
+                }
                 let now = Instant::now();
                 let (since, attempt) = match self.hold {
                     Some(h) if h.block == block => (h.since, h.attempt.saturating_add(1)),
@@ -2663,7 +2684,68 @@ mod tests {
         for endpoint in online {
             set_online(&hub, endpoint).await;
         }
-        let ctx = ListenerCtx::new(&resolved, limits, 1200, hub.clone());
+        serve_one(&resolved, hub, limits).await
+    }
+
+    /// One session of a stitched listener over archives, served in-process.
+    /// Each `(endpoint, begin, end)` is a frozen upstream as the monitor
+    /// would report it: online, trace and chain state `[begin, end)`, head =
+    /// LIB = `end - 1`, and the mock's ABI. The fleet tip is the top archive's.
+    async fn start_stitched(archives: &[(&str, u32, u32)]) -> Harness {
+        let servers: Vec<Server> = archives
+            .iter()
+            .enumerate()
+            .map(|(i, &(endpoint, begin, end))| Server {
+                name: format!("archive-{i}"),
+                endpoint: endpoint.to_string(),
+                enabled: true,
+                role: Role::Frozen,
+                range: Some(crate::ship::Range { begin, end }),
+                ..Default::default()
+            })
+            .collect();
+        let resolved = ResolvedListener {
+            topology: ResolvedTopology::Stitched,
+            ..listener(servers.clone())
+        };
+        let hub = FleetHub::new(
+            &resolved,
+            build_state_db(servers.clone()),
+            build_config_db(servers),
+        );
+        {
+            let abi = Arc::new(crate::abi::AbiEntry::new(mock_ship::SHIP_ABI_JSON));
+            let mut db = hub.state.lock().await;
+            for &(endpoint, begin, end) in archives {
+                let state = db.get_mut(endpoint).unwrap();
+                let last = BlockPos {
+                    num: end - 1,
+                    id: mock_ship::fake_block_id(end - 1),
+                };
+                state.online = true;
+                state.ranges_known = true;
+                state.trace_begin_block = begin;
+                state.trace_end_block = end;
+                state.chain_state_begin_block = begin;
+                state.chain_state_end_block = end;
+                state.head = Some(last);
+                state.lib = Some(last);
+                state.status_v1 = Some(true);
+                state.abi = Some(abi.clone());
+            }
+            hub.rebuild(&db);
+        }
+        serve_one(&resolved, hub, limits(0)).await
+    }
+
+    /// Serve one client of `resolved` with `handle_client` behind a local
+    /// listener.
+    async fn serve_one(
+        resolved: &ResolvedListener,
+        hub: Arc<FleetHub>,
+        limits: ProxyLimits,
+    ) -> Harness {
+        let ctx = ListenerCtx::new(resolved, limits, 1200, hub.clone());
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", tcp.local_addr().unwrap());
         let (shutdown, shutdown_rx) = broadcast::channel(1);
@@ -3196,5 +3278,62 @@ mod tests {
             1,
             "the rewind to 195 is one fork re-delivery"
         );
+    }
+
+    /// Stitched: an empty request after a finished archive range goes out on
+    /// the lingering socket and does not keep it. The archive slot is freed
+    /// when the linger runs out, and a later range dials again.
+    #[tokio::test]
+    async fn an_empty_request_keeps_the_archive_link_only_for_its_linger() {
+        let (archive, mock) = start_mock(MockShipConfig::frozen(1001, 2001)).await;
+        let harness = start_stitched(&[(&archive, 1001, 2001)]).await;
+        let mut client = connect(&harness.url).await;
+        let slots = harness.hub.view().upstreams[0].connections.clone();
+
+        client.send(blocks_request(1001, 1100, 1000)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 99).await,
+            (1001..1100).collect::<Vec<_>>()
+        );
+        let finished = Instant::now();
+        assert_eq!(slots.load(Ordering::Relaxed), 1, "the link lingers");
+
+        // Halfway through the linger, the client stops with an empty request.
+        tokio::time::sleep(LINGER / 2).await;
+        client.send(blocks_request(1100, 1100, 0)).await.unwrap();
+        timeout(WAIT, async {
+            while blocks_requests(&mock).len() < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the empty request reaches the archive");
+        assert_eq!(
+            blocks_requests(&mock),
+            vec![(1, 1001, 1100, vec![]), (1, 1100, 1100, vec![])],
+            "the empty request went out on the lingering socket"
+        );
+
+        timeout(LINGER + WAIT, async {
+            while slots.load(Ordering::Relaxed) > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the empty request kept the archive slot");
+        // The empty request does not restart the linger, which would end
+        // LINGER / 2 later.
+        let freed = finished.elapsed();
+        assert!(
+            freed < LINGER + LINGER * 2 / 5,
+            "freed {freed:?} after the range ended"
+        );
+
+        client.send(blocks_request(1200, 1203, 10)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 3).await,
+            vec![1200, 1201, 1202]
+        );
+        assert_eq!(mock.sessions_accepted(), 2, "the next range dials again");
     }
 }

@@ -1985,6 +1985,57 @@ async fn s20_a_full_archive_range_closes_after_the_gap_wait() {
     );
 }
 
+/// S20 with A and B at `max_sessions: 1`: each client finishes a range on
+/// one archive, whose only slot its lingering link keeps, then asks for the
+/// other archive. A session held for capacity closes its idle link, so the
+/// two never wait for each other's slot.
+#[tokio::test]
+async fn s20_held_sessions_free_the_slot_the_other_waits_for() {
+    let (a, b, c) = default_fleet().await;
+    let router = RouterProcess::start(config(vec![
+        single_slot(&a),
+        single_slot(&b),
+        live_server(&c),
+    ]))
+    .await;
+    wait_ready(&router, &[&a, &b, &c]).await;
+    let (mut w1, mut r1, _) = client(&router).await;
+    let (mut w2, mut r2, _) = client(&router).await;
+    send(&mut w1, blocks(&request(1001, 1100, 1000))).await;
+    let (got, _) = read_blocks(&mut r1, 99, WAIT).await;
+    assert_eq!(nums(&got), (1001..1100).collect::<Vec<_>>());
+    send(&mut w2, blocks(&request(100, 200, 1000))).await;
+    let (got, _) = read_blocks(&mut r2, 100, WAIT).await;
+    assert_eq!(nums(&got), (100..200).collect::<Vec<_>>());
+    for u in [&a, &b] {
+        assert_eq!(
+            metric(&router, &u.series("active_connections", "")).await,
+            1.0,
+            "{} is full",
+            u.name
+        );
+    }
+
+    send(&mut w1, blocks(&request(100, 200, 1000))).await;
+    send(&mut w2, blocks(&request(1001, 1100, 1000))).await;
+    let (got1, close1) = read_blocks(&mut r1, 100, WAIT).await;
+    let (got2, close2) = read_blocks(&mut r2, 99, WAIT).await;
+    assert!(
+        close1.is_none() && close2.is_none(),
+        "{close1:?} {close2:?}"
+    );
+    assert_eq!(nums(&got1), (100..200).collect::<Vec<_>>());
+    assert_eq!(nums(&got2), (1001..1100).collect::<Vec<_>>());
+    assert_eq!(
+        metric(
+            &router,
+            "fleet_router_hold_closes_total{why=\"at_capacity\"}"
+        )
+        .await,
+        0.0
+    );
+}
+
 // ----------------------------------------------------------------------
 // S21: the live tier goes away at the tip
 // ----------------------------------------------------------------------

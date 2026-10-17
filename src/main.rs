@@ -74,6 +74,9 @@ async fn main() -> Result<()> {
 
     // Validate the configuration up front with clear, actionable errors.
     config.validate()?;
+    for warning in config.warnings() {
+        tracing::warn!("{warning}");
+    }
 
     let static_config = StaticConfig {
         upstream_status_ms: config.upstream_status_ms,
@@ -550,6 +553,9 @@ fn test_config(path: &PathBuf) -> Option<(bool, ServerConfig)> {
                     return None;
                 }
                 cprintln!("<green>configuration is valid.</>");
+                for warning in config.warnings() {
+                    cprintln!("<yellow>warning: {}</>", warning);
+                }
                 Some((true, config))
             }
             Err(e) => {

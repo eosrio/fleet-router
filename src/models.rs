@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -6,6 +7,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+
+use crate::abi::{accept_upstream_abi, AbiEntry};
+use crate::ship::{BlockPos, Range};
 
 pub type ServerStateDb = Arc<Mutex<HashMap<String, ServerState>>>;
 pub type ServerConfigDb = Arc<Mutex<HashMap<String, Server>>>;
@@ -43,6 +47,164 @@ fn default_quarantine_ttl_secs() -> u64 {
 }
 fn default_quarantine_range() -> u32 {
     1
+}
+fn default_predial_blocks() -> u32 {
+    2_000
+}
+fn default_gap_wait_ms() -> u64 {
+    30_000
+}
+fn default_patch_head_lib() -> bool {
+    true
+}
+const DEFAULT_STALL_TIMEOUT_MS: u64 = 60_000;
+fn default_stall_timeout_ms() -> u64 {
+    DEFAULT_STALL_TIMEOUT_MS
+}
+fn is_default_stall_timeout_ms(value: &u64) -> bool {
+    *value == DEFAULT_STALL_TIMEOUT_MS
+}
+const DEFAULT_LIVE_LAG_BLOCKS: u32 = 1_200;
+fn default_live_lag_blocks() -> u32 {
+    DEFAULT_LIVE_LAG_BLOCKS
+}
+fn is_default_live_lag_blocks(value: &u32) -> bool {
+    *value == DEFAULT_LIVE_LAG_BLOCKS
+}
+
+/// Upper bound for [`StitchingPolicy::gap_wait_ms`] (one hour).
+const MAX_GAP_WAIT_MS: u64 = 3_600_000;
+
+/// What kind of upstream a server is.
+///
+/// `live` is a node at the chain head (today's only kind). `frozen` is an
+/// archive upstream that serves a fixed block range from archived logs and
+/// never advances. The role is declared, never inferred: a stuck live node
+/// looks exactly like a frozen one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    #[default]
+    Live,
+    Frozen,
+}
+
+impl Role {
+    pub fn is_live(&self) -> bool {
+        matches!(self, Role::Live)
+    }
+
+    /// Label value used on `/metrics`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::Live => "live",
+            Role::Frozen => "frozen",
+        }
+    }
+}
+
+/// How a listener presents its pool to clients.
+///
+/// `pool`: every upstream is a full node and the client talks to one of them
+/// (today's behaviour). `stitched`: the router presents the pool as a single
+/// SHiP node whose history is the union of its upstreams. `auto` picks
+/// `stitched` when any enabled server has `role: "frozen"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Topology {
+    #[default]
+    Auto,
+    Pool,
+    Stitched,
+}
+
+impl Topology {
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Topology::Auto)
+    }
+
+    /// Resolve `auto` against the listener's servers.
+    pub fn resolve(self, servers: &[Server]) -> ResolvedTopology {
+        match self {
+            Topology::Pool => ResolvedTopology::Pool,
+            Topology::Stitched => ResolvedTopology::Stitched,
+            Topology::Auto if has_enabled_frozen(servers) => ResolvedTopology::Stitched,
+            Topology::Auto => ResolvedTopology::Pool,
+        }
+    }
+}
+
+/// [`Topology`] after `auto` has been resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedTopology {
+    Pool,
+    Stitched,
+}
+
+/// Which role serves blocks that both a frozen and a live upstream cover.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoryPreference {
+    /// Prefer frozen upstreams, keeping history reads off the live nodes.
+    #[default]
+    Frozen,
+    /// No role preference; the longest run wins.
+    Any,
+}
+
+/// What to do with an upstream whose ABI differs from the one clients get.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AbiMismatch {
+    /// Log a warning and export the mismatch; keep using the upstream.
+    #[default]
+    Warn,
+    /// Stop routing sessions to the upstream.
+    Exclude,
+}
+
+/// Session policy for a stitched listener. Ignored by pool listeners.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StitchingPolicy {
+    /// Default `frozen`.
+    #[serde(default)]
+    pub history_preference: HistoryPreference,
+    /// Open the next range's upstream this many blocks before a boundary.
+    /// Default 2000. 0 disables pre-dialing.
+    #[serde(default = "default_predial_blocks")]
+    pub predial_blocks: u32,
+    /// How long (ms) a session waits for an offline, busy or full archive
+    /// range before closing with 1011. Default 30000, `1..=3600000`.
+    #[serde(default = "default_gap_wait_ms")]
+    pub gap_wait_ms: u64,
+    /// Rewrite head and LIB in archive results with the fleet's live values.
+    /// Default `true`.
+    #[serde(default = "default_patch_head_lib")]
+    pub patch_head_lib: bool,
+    /// Serve this exact ABI text to clients instead of one taken from an
+    /// upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abi_file: Option<PathBuf>,
+    /// Default `warn`.
+    #[serde(default)]
+    pub abi_mismatch: AbiMismatch,
+}
+
+impl Default for StitchingPolicy {
+    fn default() -> Self {
+        StitchingPolicy {
+            history_preference: HistoryPreference::default(),
+            predial_blocks: default_predial_blocks(),
+            gap_wait_ms: default_gap_wait_ms(),
+            patch_head_lib: default_patch_head_lib(),
+            abi_file: None,
+            abi_mismatch: AbiMismatch::default(),
+        }
+    }
+}
+
+fn has_enabled_frozen(servers: &[Server]) -> bool {
+    servers.iter().any(|s| s.enabled && s.role == Role::Frozen)
 }
 
 /// Opt-in shared exclusion of one upstream for a short block range.
@@ -103,6 +265,7 @@ const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS: u64 = 10_000;
 
 /// A single upstream SHiP node, as declared in `config.json`.
 #[derive(Debug, Deserialize, Serialize, Hash, Eq, PartialEq, Clone)]
+#[cfg_attr(test, derive(Default))]
 pub struct Server {
     /// Human-readable name used in logs and as the `server` label on `/metrics`.
     pub name: String,
@@ -114,6 +277,17 @@ pub struct Server {
     pub endpoint: String,
     /// Whether the router is allowed to use this upstream.
     pub enabled: bool,
+    /// `live` (default) or `frozen`. See [`Role`].
+    #[serde(default, skip_serializing_if = "Role::is_live")]
+    pub role: Role,
+    /// Declared coverage of a frozen server, `[begin, end)`. Used until the
+    /// server reports its ranges, and while it is down. Frozen servers only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<Range>,
+    /// Maximum links the router's sessions open to this upstream. The monitor
+    /// connection is not counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sessions: Option<u32>,
 }
 
 impl Server {
@@ -236,6 +410,12 @@ pub struct ListenerConfig {
     /// See [`BlockFailureQuarantine`].
     #[serde(default)]
     pub block_failure_quarantine: Option<BlockFailureQuarantine>,
+    /// See [`Topology`]. Default `auto`.
+    #[serde(default, skip_serializing_if = "Topology::is_auto")]
+    pub topology: Topology,
+    /// Stitched-listener policy. Ignored (with a warning) by pool listeners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stitching: Option<StitchingPolicy>,
 }
 
 /// A validated, normalized listener ready to be bound and monitored at runtime.
@@ -252,6 +432,12 @@ pub struct ResolvedListener {
     /// See [`BlockFailureQuarantine`]. `None` disables shared quarantine.
     pub block_failure_quarantine: Option<BlockFailureQuarantine>,
     pub servers: Vec<Server>,
+    /// `auto` resolved against [`Self::servers`].
+    pub topology: ResolvedTopology,
+    /// The configured policy, or the defaults when the listener has none.
+    pub stitching: StitchingPolicy,
+    /// Text of [`StitchingPolicy::abi_file`] for a stitched listener.
+    pub abi_pin: Option<String>,
 }
 
 /// The on-disk `config.json` schema.
@@ -297,6 +483,14 @@ pub struct ServerConfig {
     /// See [`BlockFailureQuarantine`].
     #[serde(default)]
     pub block_failure_quarantine: Option<BlockFailureQuarantine>,
+    /// See [`Topology`]. Single-listener mode only. With `listeners`, set it
+    /// on each listener.
+    #[serde(default, skip_serializing_if = "Topology::is_auto")]
+    pub topology: Topology,
+    /// See [`StitchingPolicy`]. Single-listener mode only. With `listeners`,
+    /// set it on each listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stitching: Option<StitchingPolicy>,
     /// Named ingress listeners for multi-port / multi-network deployments.
     #[serde(default)]
     pub listeners: Vec<ListenerConfig>,
@@ -326,6 +520,21 @@ pub struct ServerConfig {
     /// How long (ms) to wait for in-flight connections to drain on shutdown.
     #[serde(default = "default_shutdown_grace_ms")]
     pub shutdown_grace_ms: u64,
+    /// Fail over an upstream that sends no bytes for this long (ms) while it
+    /// owes blocks. Default 60000. 0 disables it; otherwise at least 1000.
+    #[serde(
+        default = "default_stall_timeout_ms",
+        skip_serializing_if = "is_default_stall_timeout_ms"
+    )]
+    pub upstream_stall_timeout_ms: u64,
+    /// A live upstream this many blocks behind the pool's head is not chosen
+    /// for reads above its own head while a closer node is available.
+    /// Default 1200. 0 disables it.
+    #[serde(
+        default = "default_live_lag_blocks",
+        skip_serializing_if = "is_default_live_lag_blocks"
+    )]
+    pub live_lag_blocks: u32,
     /// Optional address for the HTTP health/metrics endpoint. Defaults to `listen_address` (or `"0.0.0.0"`).
     #[serde(default)]
     pub metrics_address: Option<String>,
@@ -452,6 +661,129 @@ fn validate_block_failure_quarantine(
     Ok(())
 }
 
+fn listener_prefix(listener_ctx: Option<&str>) -> String {
+    match listener_ctx {
+        Some(name) => format!("listener '{name}': "),
+        None => String::new(),
+    }
+}
+
+/// `role`, `range` and `max_sessions` of every server, enabled or not.
+fn validate_server_roles(servers: &[Server], listener_ctx: Option<&str>) -> Result<()> {
+    let prefix = listener_prefix(listener_ctx);
+    for s in servers {
+        if let Some(range) = s.range {
+            if s.role != Role::Frozen {
+                bail!(
+                    "{prefix}server '{}': range requires role \"frozen\"",
+                    s.name
+                );
+            }
+            if range.begin == 0 || range.is_empty() {
+                bail!(
+                    "{prefix}server '{}': range.begin must be >= 1 and below range.end",
+                    s.name
+                );
+            }
+        }
+        if s.max_sessions == Some(0) {
+            bail!("{prefix}server '{}': max_sessions must be > 0", s.name);
+        }
+    }
+    Ok(())
+}
+
+/// Topology and stitching rules for one listener (or the single-listener
+/// top level).
+fn validate_topology(
+    topology: Topology,
+    stitching: Option<&StitchingPolicy>,
+    chain_id: Option<&str>,
+    servers: &[Server],
+    listener_ctx: Option<&str>,
+) -> Result<()> {
+    let prefix = listener_prefix(listener_ctx);
+    if topology == Topology::Pool && has_enabled_frozen(servers) {
+        bail!("{prefix}servers with role \"frozen\" require topology \"stitched\" or \"auto\"");
+    }
+    if topology.resolve(servers) == ResolvedTopology::Stitched && chain_id.is_none() {
+        bail!("{prefix}topology \"stitched\" requires chain_id");
+    }
+    if let Some(policy) = stitching {
+        if policy.gap_wait_ms == 0 || policy.gap_wait_ms > MAX_GAP_WAIT_MS {
+            bail!("{prefix}stitching.gap_wait_ms must be between 1 and {MAX_GAP_WAIT_MS}");
+        }
+        if let Some(path) = &policy.abi_file {
+            load_abi_file(path).map_err(|err| anyhow!("{prefix}stitching.abi_file: {err}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Read an `abi_file` and check that it loads like an upstream handshake ABI.
+fn load_abi_file(path: &std::path::Path) -> Result<String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| anyhow!("cannot read '{}': {err}", path.display()))?;
+    accept_upstream_abi(&text)
+        .map_err(|err| anyhow!("'{}' is not a valid SHiP ABI: {err}", path.display()))?;
+    Ok(text)
+}
+
+/// Non-fatal configuration hints for one listener. See
+/// [`ServerConfig::warnings`].
+fn listener_warnings(
+    topology: Topology,
+    stitching: Option<&StitchingPolicy>,
+    servers: &[Server],
+    listener_ctx: Option<&str>,
+) -> Vec<String> {
+    let prefix = listener_prefix(listener_ctx);
+    let mut out = Vec::new();
+    if topology.resolve(servers) == ResolvedTopology::Pool {
+        if stitching.is_some() {
+            out.push(format!("{prefix}stitching is ignored for pool topology"));
+        }
+        return out;
+    }
+    if !servers.iter().any(|s| s.enabled && s.role.is_live()) {
+        out.push(format!(
+            "{prefix}no live server: status head is the newest archived block and sessions idle at the end of history"
+        ));
+    }
+    let frozen: Vec<&Server> = servers
+        .iter()
+        .filter(|s| s.enabled && s.role == Role::Frozen)
+        .collect();
+    for s in &frozen {
+        if s.range.is_none() {
+            out.push(format!(
+                "{prefix}server '{}': declare range so status is not held while this server is down at startup",
+                s.name
+            ));
+        }
+    }
+    let mut declared: Vec<Range> = frozen
+        .iter()
+        .filter_map(|s| s.range)
+        .filter(|r| !r.is_empty())
+        .collect();
+    declared.sort_by_key(|r| (r.begin, r.end));
+    let mut merged: Vec<Range> = Vec::new();
+    for r in declared {
+        match merged.last_mut() {
+            Some(last) if r.begin <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    for pair in merged.windows(2) {
+        out.push(format!(
+            "{prefix}coverage hole [{}, {}) between declared archive ranges",
+            pair[0].end, pair[1].begin
+        ));
+    }
+    out
+}
+
 impl ServerConfig {
     /// Validate the configuration, returning a clear error for any invalid field.
     pub fn validate(&self) -> Result<()> {
@@ -475,6 +807,9 @@ impl ServerConfig {
         }
         if let Some(0) = self.metrics_port {
             bail!("metrics_port must be non-zero when set");
+        }
+        if self.upstream_stall_timeout_ms != 0 && self.upstream_stall_timeout_ms < 1_000 {
+            bail!("upstream_stall_timeout_ms must be 0 or at least 1000");
         }
 
         if !self.servers.is_empty() && !self.listeners.is_empty() {
@@ -500,6 +835,14 @@ impl ServerConfig {
                 validate_block_failure_quarantine(policy, None)?;
             }
             validate_servers(&self.servers, None)?;
+            validate_server_roles(&self.servers, None)?;
+            validate_topology(
+                self.topology,
+                self.stitching.as_ref(),
+                self.chain_id.as_deref(),
+                &self.servers,
+                None,
+            )?;
         } else {
             if self.listen_port != 0 {
                 bail!(
@@ -519,6 +862,16 @@ impl ServerConfig {
             if self.block_failure_quarantine.is_some() {
                 bail!(
                     "top-level 'block_failure_quarantine' cannot be combined with 'listeners'; set 'block_failure_quarantine' on each listener"
+                );
+            }
+            if !self.topology.is_auto() {
+                bail!(
+                    "top-level 'topology' cannot be combined with 'listeners'; set 'topology' on each listener"
+                );
+            }
+            if self.stitching.is_some() {
+                bail!(
+                    "top-level 'stitching' cannot be combined with 'listeners'; set 'stitching' on each listener"
                 );
             }
             let mut seen_names = HashMap::<String, usize>::new();
@@ -581,6 +934,14 @@ impl ServerConfig {
                 bound_listeners.push((name.to_string(), addr, listener.listen_port));
 
                 validate_servers(&listener.servers, Some(name))?;
+                validate_server_roles(&listener.servers, Some(name))?;
+                validate_topology(
+                    listener.topology,
+                    listener.stitching.as_ref(),
+                    listener.chain_id.as_deref(),
+                    &listener.servers,
+                    Some(name),
+                )?;
             }
         }
 
@@ -606,6 +967,8 @@ impl ServerConfig {
     /// or one named [`ResolvedListener`] per entry in `self.listeners`.
     pub fn resolved_listeners(&self) -> Vec<ResolvedListener> {
         if self.listeners.is_empty() {
+            let (topology, stitching, abi_pin) =
+                resolve_stitching(self.topology, self.stitching.as_ref(), &self.servers);
             vec![ResolvedListener {
                 name: None,
                 listen_address: self.listen_address.trim().to_string(),
@@ -618,6 +981,9 @@ impl ServerConfig {
                 require_chain_id: self.require_chain_id,
                 block_failure_quarantine: self.block_failure_quarantine,
                 servers: self.servers.clone(),
+                topology,
+                stitching,
+                abi_pin,
             }]
         } else {
             let default_addr = {
@@ -630,23 +996,51 @@ impl ServerConfig {
             };
             self.listeners
                 .iter()
-                .map(|l| ResolvedListener {
-                    name: Some(l.name.trim().to_string()),
-                    listen_address: l
-                        .listen_address
-                        .as_deref()
-                        .map(str::trim)
-                        .unwrap_or(&default_addr)
-                        .to_string(),
-                    listen_port: l.listen_port,
-                    max_connections: l.max_connections.unwrap_or(self.max_connections),
-                    expected_chain_id: l
-                        .chain_id
-                        .as_deref()
-                        .and_then(|c| parse_chain_id(c, Some(&l.name)).ok()),
-                    require_chain_id: l.require_chain_id,
-                    block_failure_quarantine: l.block_failure_quarantine,
-                    servers: l.servers.clone(),
+                .map(|l| {
+                    let (topology, stitching, abi_pin) =
+                        resolve_stitching(l.topology, l.stitching.as_ref(), &l.servers);
+                    ResolvedListener {
+                        name: Some(l.name.trim().to_string()),
+                        listen_address: l
+                            .listen_address
+                            .as_deref()
+                            .map(str::trim)
+                            .unwrap_or(&default_addr)
+                            .to_string(),
+                        listen_port: l.listen_port,
+                        max_connections: l.max_connections.unwrap_or(self.max_connections),
+                        expected_chain_id: l
+                            .chain_id
+                            .as_deref()
+                            .and_then(|c| parse_chain_id(c, Some(&l.name)).ok()),
+                        require_chain_id: l.require_chain_id,
+                        block_failure_quarantine: l.block_failure_quarantine,
+                        servers: l.servers.clone(),
+                        topology,
+                        stitching,
+                        abi_pin,
+                    }
+                })
+                .collect()
+        }
+    }
+
+    /// Non-fatal configuration hints, one line each, prefixed with
+    /// `listener '<name>': ` in multi-listener mode. Logged at startup and
+    /// printed by `config test`.
+    pub fn warnings(&self) -> Vec<String> {
+        if self.listeners.is_empty() {
+            listener_warnings(self.topology, self.stitching.as_ref(), &self.servers, None)
+        } else {
+            self.listeners
+                .iter()
+                .flat_map(|l| {
+                    listener_warnings(
+                        l.topology,
+                        l.stitching.as_ref(),
+                        &l.servers,
+                        Some(l.name.trim()),
+                    )
                 })
                 .collect()
         }
@@ -696,8 +1090,32 @@ impl ServerConfig {
             idle_timeout_ms: self.idle_timeout_ms,
             max_message_bytes: self.max_message_bytes,
             max_client_message_bytes: self.max_client_message_bytes,
+            stall_timeout_ms: self.upstream_stall_timeout_ms,
+            connect_timeout_ms: self.upstream_connect_timeout_ms(),
         }
     }
+}
+
+/// Resolve a listener's topology and stitching policy. The ABI pin is read
+/// only for a stitched listener; `validate` has already checked the file.
+fn resolve_stitching(
+    topology: Topology,
+    stitching: Option<&StitchingPolicy>,
+    servers: &[Server],
+) -> (ResolvedTopology, StitchingPolicy, Option<String>) {
+    let resolved = topology.resolve(servers);
+    let policy = stitching.cloned().unwrap_or_default();
+    let abi_pin = match (&policy.abi_file, resolved) {
+        (Some(path), ResolvedTopology::Stitched) => match load_abi_file(path) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                tracing::warn!(error = %err, "stitching.abi_file not loaded; serving an upstream ABI");
+                None
+            }
+        },
+        _ => None,
+    };
+    (resolved, policy, abi_pin)
 }
 
 /// Live state tracked per upstream by the monitoring loop and the proxy.
@@ -744,6 +1162,49 @@ pub struct ServerState {
     block_strikes: Vec<BlockStrike>,
     /// Block-range exclusions. Expired entries are ignored by selection and metrics.
     pub quarantines: Vec<BlockQuarantine>,
+    /// Position among the listener's enabled servers, in config order. Dense
+    /// (`0..n`), so it can index per-upstream arrays.
+    pub index: usize,
+    /// Copied from [`Server::role`].
+    pub role: Role,
+    /// Copied from [`Server::range`].
+    pub declared: Option<Range>,
+    /// Copied from [`Server::max_sessions`].
+    pub max_sessions: Option<u32>,
+    /// Head block from the last accepted status result.
+    pub head: Option<BlockPos>,
+    /// Last irreversible block from the last accepted status result.
+    pub lib: Option<BlockPos>,
+    /// Set by the first accepted status with `head_block_num > 0`, and kept
+    /// while the upstream is offline (the ranges above are kept too).
+    pub ranges_known: bool,
+    /// When the last accepted status result arrived.
+    pub status_at: Option<Instant>,
+    /// `Some(true)` after a `get_status_result_v1`; `Some(false)` after a
+    /// `get_status_result_v0`, or once the monitor has fallen back to
+    /// `get_status_request_v0` (the upstream speaks only status v0).
+    pub status_v1: Option<bool>,
+    /// The upstream's handshake ABI, as seen by the monitor.
+    pub abi: Option<Arc<AbiEntry>>,
+    /// When the monitor marked this upstream offline. `None` while online and
+    /// before the first verdict.
+    pub offline_since: Option<Instant>,
+    /// One-time monitor warnings already logged for this upstream.
+    pub warned: MonitorWarnings,
+}
+
+/// Monitor warnings that are logged once, not on every status result.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MonitorWarnings {
+    /// A live upstream that stopped advancing with head == LIB == its last block.
+    pub looks_frozen: bool,
+    /// A frozen upstream whose reported ranges grew.
+    pub frozen_advanced: bool,
+    /// Reported ranges that differ from the declared `range`. Cleared when
+    /// they match again, so a later mismatch is logged again.
+    pub range_mismatch: bool,
+    /// Fingerprint last reported as differing from the rest of the pool.
+    pub abi_fp: Option<u64>,
 }
 
 impl ServerState {
@@ -778,7 +1239,64 @@ impl ServerState {
             block_failures: 0,
             block_strikes: Vec::new(),
             quarantines: Vec::new(),
+            index: 0,
+            role: Role::Live,
+            declared: None,
+            max_sessions: None,
+            head: None,
+            lib: None,
+            ranges_known: false,
+            status_at: None,
+            status_v1: None,
+            abi: None,
+            offline_since: None,
+            warned: MonitorWarnings::default(),
         }
+    }
+
+    /// Record that the monitor lost this upstream.
+    ///
+    /// Clears `online` and the reported `chain_id`. Ranges, head, LIB and the
+    /// ABI are kept, so coverage stays sticky. `offline_since` keeps the first
+    /// instant of an outage.
+    pub fn mark_offline(&mut self, now: Instant) {
+        self.online = false;
+        self.chain_id = None;
+        if self.offline_since.is_none() {
+            self.offline_since = Some(now);
+        }
+    }
+
+    /// Whether this upstream's ranges can be used: reported at least once,
+    /// or declared by a frozen server.
+    pub fn ranges_usable(&self) -> bool {
+        self.ranges_known || (self.role == Role::Frozen && self.declared.is_some())
+    }
+
+    /// Whether reported trace or chain-state ranges differ from the declared
+    /// `range`. False until the first report, and for undeclared servers.
+    pub fn range_mismatch(&self) -> bool {
+        match self.declared {
+            Some(declared) if self.ranges_known => {
+                let trace = Range {
+                    begin: self.trace_begin_block,
+                    end: self.trace_end_block,
+                };
+                let chain_state = Range {
+                    begin: self.chain_state_begin_block,
+                    end: self.chain_state_end_block,
+                };
+                trace != declared || chain_state != declared
+            }
+            _ => false,
+        }
+    }
+
+    /// One past the highest block of any reported log.
+    pub fn reported_end(&self) -> u32 {
+        self.trace_end_block
+            .max(self.chain_state_end_block)
+            .max(self.finality_data_end_block)
     }
 
     /// Count an unclean mid-`get_blocks` drop whose next block is `block`.
@@ -894,6 +1412,14 @@ pub struct ProxyLimits {
     pub max_message_bytes: usize,
     /// Client WebSocket message/frame cap.
     pub max_client_message_bytes: usize,
+    /// [`ServerConfig::upstream_stall_timeout_ms`]. 0 disables stall detection.
+    // Read by the session actor; nothing reads it yet.
+    #[allow(dead_code)]
+    pub stall_timeout_ms: u64,
+    /// Bound for a session's upstream connect. Always non-zero; see
+    /// [`ServerConfig::upstream_connect_timeout_ms`].
+    #[allow(dead_code)]
+    pub connect_timeout_ms: u64,
 }
 
 #[cfg(test)]
@@ -910,9 +1436,14 @@ pub fn build_state_db_with_chain_id(
         servers
             .iter()
             .filter(|s| s.enabled)
-            .map(|s| {
+            .enumerate()
+            .map(|(index, s)| {
                 let mut state = ServerState::with_chain_policy(expected_chain_id, require_chain_id);
                 state.name = s.name.clone();
+                state.index = index;
+                state.role = s.role;
+                state.declared = s.range;
+                state.max_sessions = s.max_sessions;
                 (s.endpoint.clone(), state)
             })
             .collect::<HashMap<String, ServerState>>(),
@@ -1672,5 +2203,712 @@ mod tests {
             only_expired.quarantines.is_empty(),
             "the metrics snapshot must drop expired exclusions"
         );
+    }
+
+    const CHAIN_ID: &str = "aca376f206b8fc25a6ed44dbdc66547c36c6c33e3a119ffbeaef943642f0e906";
+    const SHIP_ABI_JSON: &str = include_str!("../mock-ship/src/ship_abi.json");
+
+    /// Config files shipped with the repository.
+    const FIXTURES: [(&str, &str); 3] = [
+        (
+            "example.config.json",
+            include_str!("../example.config.json"),
+        ),
+        (
+            "docker/fleet-router.json",
+            include_str!("../docker/fleet-router.json"),
+        ),
+        ("config sample", crate::config_sample::CONFIG_SAMPLE),
+    ];
+
+    /// The stitched example from the design: two archive replicas of one
+    /// range, one archive of the next range, two live nodes.
+    fn stitched_example() -> serde_json::Value {
+        serde_json::json!({
+            "listen_address": "0.0.0.0",
+            "upstream_reconnect_ms": 3000,
+            "upstream_monitoring_ms": 5000,
+            "upstream_status_ms": 1000,
+            "metrics_port": 9090,
+            "listeners": [{
+                "name": "main",
+                "listen_port": 17000,
+                "chain_id": CHAIN_ID,
+                "stitching": { "history_preference": "frozen", "predial_blocks": 2000, "gap_wait_ms": 30000 },
+                "servers": [
+                    { "name": "archive-0a", "endpoint": "10.0.3.10:8080", "enabled": true, "role": "frozen", "range": { "begin": 2, "end": 50000001 }, "max_sessions": 64 },
+                    { "name": "archive-0b", "endpoint": "10.0.3.11:8080", "enabled": true, "role": "frozen", "range": { "begin": 2, "end": 50000001 }, "max_sessions": 64 },
+                    { "name": "archive-1a", "endpoint": "10.0.3.12:8080", "enabled": true, "role": "frozen", "range": { "begin": 50000001, "end": 100000001 } },
+                    { "name": "live-1", "endpoint": "10.0.1.10:8080", "enabled": true },
+                    { "name": "live-2", "endpoint": "10.0.1.11:8080", "enabled": true }
+                ]
+            }]
+        })
+    }
+
+    /// Single-listener config with `servers` and extra top-level fields.
+    fn single(servers: serde_json::Value, extra: serde_json::Value) -> ServerConfig {
+        let mut value = minimal_config();
+        value["servers"] = servers;
+        for (key, item) in extra.as_object().unwrap() {
+            value[key] = item.clone();
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// Multi-listener config with one listener named `eos`.
+    fn multi(listener: serde_json::Value, extra: serde_json::Value) -> ServerConfig {
+        let mut listener_value = serde_json::json!({ "name": "eos", "listen_port": 17000 });
+        for (key, item) in listener.as_object().unwrap() {
+            listener_value[key] = item.clone();
+        }
+        let mut value = serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "listeners": [listener_value]
+        });
+        for (key, item) in extra.as_object().unwrap() {
+            value[key] = item.clone();
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn validation_error(cfg: &ServerConfig) -> String {
+        cfg.validate().unwrap_err().to_string()
+    }
+
+    fn frozen(name: &str, port: u16, range: Option<(u32, u32)>) -> serde_json::Value {
+        let mut server = serde_json::json!({
+            "name": name,
+            "endpoint": format!("127.0.0.1:{port}"),
+            "enabled": true,
+            "role": "frozen"
+        });
+        if let Some((begin, end)) = range {
+            server["range"] = serde_json::json!({ "begin": begin, "end": end });
+        }
+        server
+    }
+
+    fn live(name: &str, port: u16) -> serde_json::Value {
+        serde_json::json!({ "name": name, "endpoint": format!("127.0.0.1:{port}"), "enabled": true })
+    }
+
+    // M1
+    #[test]
+    fn existing_config_fixtures_parse_and_serialize_without_new_fields() {
+        for (name, text) in FIXTURES {
+            let cfg: ServerConfig = serde_json::from_str(text)
+                .unwrap_or_else(|err| panic!("{name} does not parse: {err}"));
+            cfg.validate()
+                .unwrap_or_else(|err| panic!("{name} does not validate: {err}"));
+            assert!(cfg.warnings().is_empty(), "{name}: {:?}", cfg.warnings());
+            for listener in cfg.resolved_listeners() {
+                assert_eq!(listener.topology, ResolvedTopology::Pool, "{name}");
+                assert_eq!(listener.stitching, StitchingPolicy::default(), "{name}");
+                assert_eq!(listener.abi_pin, None, "{name}");
+            }
+
+            // Every field the file sets serializes back unchanged, and the new
+            // fields are skipped at their defaults (servers included).
+            let original: serde_json::Value = serde_json::from_str(text).unwrap();
+            let reserialized = serde_json::to_value(&cfg).unwrap();
+            for (key, value) in original.as_object().unwrap() {
+                assert_eq!(&reserialized[key], value, "{name}: field {key}");
+            }
+            for key in [
+                "topology",
+                "stitching",
+                "upstream_stall_timeout_ms",
+                "live_lag_blocks",
+            ] {
+                assert!(
+                    reserialized.get(key).is_none(),
+                    "{name}: {key} must be skipped at its default"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stitched_example_parses_resolves_and_round_trips() {
+        let cfg: ServerConfig = serde_json::from_value(stitched_example()).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+
+        let resolved = cfg.resolved_listeners();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].topology, ResolvedTopology::Stitched);
+        assert_eq!(resolved[0].stitching, StitchingPolicy::default());
+        assert_eq!(resolved[0].abi_pin, None);
+        let servers = &resolved[0].servers;
+        assert_eq!(servers[0].role, Role::Frozen);
+        assert_eq!(
+            servers[0].range,
+            Some(Range {
+                begin: 2,
+                end: 50_000_001
+            })
+        );
+        assert_eq!(servers[0].max_sessions, Some(64));
+        assert_eq!(servers[2].max_sessions, None);
+        assert_eq!(servers[3].role, Role::Live);
+        assert_eq!(servers[3].range, None);
+
+        let original = stitched_example();
+        let reserialized = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            reserialized["listeners"][0]["servers"],
+            original["listeners"][0]["servers"]
+        );
+        let policy = &reserialized["listeners"][0]["stitching"];
+        assert_eq!(policy["predial_blocks"], 2000);
+        assert!(policy.get("abi_file").is_none());
+    }
+
+    // M2: V1
+    #[test]
+    fn range_requires_role_frozen() {
+        let mut server = live("a", 18080);
+        server["range"] = serde_json::json!({ "begin": 2, "end": 10 });
+        let cfg = single(serde_json::json!([server.clone()]), serde_json::json!({}));
+        assert_eq!(
+            validation_error(&cfg),
+            "server 'a': range requires role \"frozen\""
+        );
+
+        let cfg = multi(
+            serde_json::json!({ "servers": [server] }),
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            validation_error(&cfg),
+            "listener 'eos': server 'a': range requires role \"frozen\""
+        );
+    }
+
+    // M2: V2
+    #[test]
+    fn range_must_start_at_one_and_be_non_empty() {
+        for (begin, end) in [(0, 10), (10, 10), (11, 10)] {
+            let cfg = single(
+                serde_json::json!([frozen("a", 18080, Some((begin, end)))]),
+                serde_json::json!({ "chain_id": CHAIN_ID }),
+            );
+            assert_eq!(
+                validation_error(&cfg),
+                "server 'a': range.begin must be >= 1 and below range.end",
+                "range [{begin}, {end})"
+            );
+        }
+        let ok = single(
+            serde_json::json!([frozen("a", 18080, Some((1, 2)))]),
+            serde_json::json!({ "chain_id": CHAIN_ID }),
+        );
+        ok.validate().unwrap();
+    }
+
+    // M2: V3
+    #[test]
+    fn max_sessions_must_be_positive() {
+        let mut server = live("a", 18080);
+        server["max_sessions"] = serde_json::json!(0);
+        let cfg = single(serde_json::json!([server.clone()]), serde_json::json!({}));
+        assert_eq!(
+            validation_error(&cfg),
+            "server 'a': max_sessions must be > 0"
+        );
+
+        let cfg = multi(
+            serde_json::json!({ "servers": [server] }),
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            validation_error(&cfg),
+            "listener 'eos': server 'a': max_sessions must be > 0"
+        );
+
+        let mut one = live("a", 18080);
+        one["max_sessions"] = serde_json::json!(1);
+        let cfg = single(serde_json::json!([one]), serde_json::json!({}));
+        cfg.validate().unwrap();
+        assert_eq!(cfg.servers[0].max_sessions, Some(1));
+    }
+
+    // M2: V4
+    #[test]
+    fn pool_topology_rejects_enabled_frozen_servers() {
+        let servers =
+            serde_json::json!([live("live", 18080), frozen("arc", 18081, Some((2, 1001)))]);
+        let cfg = single(
+            servers.clone(),
+            serde_json::json!({ "topology": "pool", "chain_id": CHAIN_ID }),
+        );
+        assert_eq!(
+            validation_error(&cfg),
+            "servers with role \"frozen\" require topology \"stitched\" or \"auto\""
+        );
+
+        let cfg = multi(
+            serde_json::json!({ "topology": "pool", "chain_id": CHAIN_ID, "servers": servers }),
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            validation_error(&cfg),
+            "listener 'eos': servers with role \"frozen\" require topology \"stitched\" or \"auto\""
+        );
+
+        // A disabled frozen server does not make the pool stitched.
+        let mut disabled = frozen("arc", 18081, Some((2, 1001)));
+        disabled["enabled"] = serde_json::json!(false);
+        let cfg = single(
+            serde_json::json!([live("live", 18080), disabled]),
+            serde_json::json!({ "topology": "pool" }),
+        );
+        cfg.validate().unwrap();
+        assert_eq!(cfg.resolved_listeners()[0].topology, ResolvedTopology::Pool);
+    }
+
+    // M2: V5
+    #[test]
+    fn stitched_listener_requires_chain_id() {
+        let auto = single(
+            serde_json::json!([live("live", 18080), frozen("arc", 18081, Some((2, 1001)))]),
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            validation_error(&auto),
+            "topology \"stitched\" requires chain_id"
+        );
+
+        let explicit = multi(
+            serde_json::json!({ "topology": "stitched", "servers": [live("live", 18080)] }),
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            validation_error(&explicit),
+            "listener 'eos': topology \"stitched\" requires chain_id"
+        );
+
+        let pinned = multi(
+            serde_json::json!({ "topology": "stitched", "chain_id": CHAIN_ID, "servers": [live("live", 18080)] }),
+            serde_json::json!({}),
+        );
+        pinned.validate().unwrap();
+    }
+
+    // M2: V6 and M5
+    #[test]
+    fn topology_and_stitching_are_per_listener_with_listeners() {
+        let listener =
+            serde_json::json!({ "chain_id": CHAIN_ID, "servers": [live("live", 18080)] });
+
+        let top_topology = multi(
+            listener.clone(),
+            serde_json::json!({ "topology": "stitched" }),
+        );
+        assert_eq!(
+            validation_error(&top_topology),
+            "top-level 'topology' cannot be combined with 'listeners'; set 'topology' on each listener"
+        );
+
+        let top_stitching = multi(listener.clone(), serde_json::json!({ "stitching": {} }));
+        assert_eq!(
+            validation_error(&top_stitching),
+            "top-level 'stitching' cannot be combined with 'listeners'; set 'stitching' on each listener"
+        );
+
+        // The same fields on the listener, or at the top level without
+        // `listeners`, are fine.
+        let mut per_listener = listener.clone();
+        per_listener["topology"] = serde_json::json!("stitched");
+        per_listener["stitching"] = serde_json::json!({ "gap_wait_ms": 500 });
+        let cfg = multi(per_listener, serde_json::json!({}));
+        cfg.validate().unwrap();
+        let resolved = cfg.resolved_listeners();
+        assert_eq!(resolved[0].topology, ResolvedTopology::Stitched);
+        assert_eq!(resolved[0].stitching.gap_wait_ms, 500);
+
+        let top_single = single(
+            serde_json::json!([live("live", 18080)]),
+            serde_json::json!({ "topology": "stitched", "chain_id": CHAIN_ID, "stitching": { "gap_wait_ms": 500 } }),
+        );
+        top_single.validate().unwrap();
+        let resolved = top_single.resolved_listeners();
+        assert_eq!(resolved[0].topology, ResolvedTopology::Stitched);
+        assert_eq!(resolved[0].stitching.gap_wait_ms, 500);
+    }
+
+    // M2: V7
+    #[test]
+    fn gap_wait_ms_must_be_within_one_hour() {
+        for bad in [0u64, 3_600_001] {
+            let cfg = single(
+                serde_json::json!([live("live", 18080)]),
+                serde_json::json!({ "stitching": { "gap_wait_ms": bad } }),
+            );
+            assert_eq!(
+                validation_error(&cfg),
+                "stitching.gap_wait_ms must be between 1 and 3600000",
+                "gap_wait_ms {bad}"
+            );
+            let cfg = multi(
+                serde_json::json!({ "stitching": { "gap_wait_ms": bad }, "servers": [live("live", 18080)] }),
+                serde_json::json!({}),
+            );
+            assert_eq!(
+                validation_error(&cfg),
+                "listener 'eos': stitching.gap_wait_ms must be between 1 and 3600000"
+            );
+        }
+        for ok in [1u64, 3_600_000] {
+            let cfg = single(
+                serde_json::json!([live("live", 18080)]),
+                serde_json::json!({ "stitching": { "gap_wait_ms": ok } }),
+            );
+            cfg.validate().unwrap();
+        }
+    }
+
+    // M2: V8
+    #[test]
+    fn stall_timeout_is_zero_or_at_least_one_second() {
+        for bad in [1u64, 999] {
+            let cfg = single(
+                serde_json::json!([live("live", 18080)]),
+                serde_json::json!({ "upstream_stall_timeout_ms": bad }),
+            );
+            assert_eq!(
+                validation_error(&cfg),
+                "upstream_stall_timeout_ms must be 0 or at least 1000"
+            );
+        }
+        for ok in [0u64, 1_000, 120_000] {
+            let cfg = single(
+                serde_json::json!([live("live", 18080)]),
+                serde_json::json!({ "upstream_stall_timeout_ms": ok }),
+            );
+            cfg.validate().unwrap();
+            assert_eq!(cfg.proxy_limits().stall_timeout_ms, ok);
+            // A non-default value is written back.
+            assert_eq!(
+                serde_json::to_value(&cfg).unwrap()["upstream_stall_timeout_ms"],
+                ok
+            );
+        }
+    }
+
+    // M2: V9
+    #[test]
+    fn abi_file_must_be_readable_and_a_valid_abi() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("ship_abi.json");
+        std::fs::write(&good, SHIP_ABI_JSON).unwrap();
+        let garbage = dir.path().join("garbage.json");
+        std::fs::write(&garbage, "{").unwrap();
+        let missing = dir.path().join("missing.json");
+
+        let with_file = |path: &std::path::Path, topology: &str| {
+            multi(
+                serde_json::json!({
+                    "topology": topology,
+                    "chain_id": CHAIN_ID,
+                    "stitching": { "abi_file": path },
+                    "servers": [live("live", 18080)]
+                }),
+                serde_json::json!({}),
+            )
+        };
+
+        let err = validation_error(&with_file(&missing, "stitched"));
+        assert!(
+            err.starts_with("listener 'eos': stitching.abi_file: cannot read '"),
+            "unexpected error: {err}"
+        );
+        let err = validation_error(&with_file(&garbage, "stitched"));
+        assert!(
+            err.starts_with("listener 'eos': stitching.abi_file: '")
+                && err.contains("is not a valid SHiP ABI"),
+            "unexpected error: {err}"
+        );
+        // Checked even where it is ignored: the config is wrong either way.
+        let err = validation_error(&with_file(&garbage, "pool"));
+        assert!(
+            err.contains("stitching.abi_file: "),
+            "unexpected error: {err}"
+        );
+
+        let single_missing = single(
+            serde_json::json!([live("live", 18080)]),
+            serde_json::json!({ "stitching": { "abi_file": missing } }),
+        );
+        assert!(validation_error(&single_missing).starts_with("stitching.abi_file: cannot read '"));
+
+        let stitched = with_file(&good, "stitched");
+        stitched.validate().unwrap();
+        assert_eq!(
+            stitched.resolved_listeners()[0].abi_pin.as_deref(),
+            Some(SHIP_ABI_JSON)
+        );
+        // A pool listener ignores the pin.
+        let pool = with_file(&good, "pool");
+        pool.validate().unwrap();
+        assert_eq!(pool.resolved_listeners()[0].abi_pin, None);
+    }
+
+    // M3
+    #[test]
+    fn auto_topology_resolves_from_enabled_frozen_servers() {
+        let only_live = single(
+            serde_json::json!([live("a", 18080), live("b", 18081)]),
+            serde_json::json!({}),
+        );
+        only_live.validate().unwrap();
+        assert_eq!(
+            only_live.resolved_listeners()[0].topology,
+            ResolvedTopology::Pool
+        );
+
+        let with_frozen = single(
+            serde_json::json!([live("a", 18080), frozen("arc", 18081, Some((2, 1001)))]),
+            serde_json::json!({ "chain_id": CHAIN_ID }),
+        );
+        with_frozen.validate().unwrap();
+        assert_eq!(
+            with_frozen.resolved_listeners()[0].topology,
+            ResolvedTopology::Stitched
+        );
+
+        let stitched = single(
+            serde_json::json!([live("a", 18080)]),
+            serde_json::json!({ "topology": "stitched", "chain_id": CHAIN_ID }),
+        );
+        stitched.validate().unwrap();
+        assert_eq!(
+            stitched.resolved_listeners()[0].topology,
+            ResolvedTopology::Stitched
+        );
+
+        let servers: Vec<Server> = serde_json::from_value(serde_json::json!([
+            live("a", 18080),
+            { "name": "arc", "endpoint": "127.0.0.1:18081", "enabled": false, "role": "frozen" }
+        ]))
+        .unwrap();
+        assert_eq!(Topology::Auto.resolve(&servers), ResolvedTopology::Pool);
+        assert_eq!(Topology::Pool.resolve(&servers), ResolvedTopology::Pool);
+        assert_eq!(
+            Topology::Stitched.resolve(&servers),
+            ResolvedTopology::Stitched
+        );
+    }
+
+    // M4
+    #[test]
+    fn new_fields_default_to_todays_behaviour() {
+        let policy = StitchingPolicy::default();
+        assert_eq!(policy.history_preference, HistoryPreference::Frozen);
+        assert_eq!(policy.predial_blocks, 2000);
+        assert_eq!(policy.gap_wait_ms, 30_000);
+        assert!(policy.patch_head_lib);
+        assert_eq!(policy.abi_file, None);
+        assert_eq!(policy.abi_mismatch, AbiMismatch::Warn);
+        let parsed: StitchingPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed, policy);
+
+        let cfg: ServerConfig = serde_json::from_value(minimal_config()).unwrap();
+        assert_eq!(cfg.upstream_stall_timeout_ms, 60_000);
+        assert_eq!(cfg.live_lag_blocks, 1200);
+        assert_eq!(cfg.topology, Topology::Auto);
+        assert_eq!(cfg.stitching, None);
+        assert_eq!(cfg.servers[0].role, Role::Live);
+        assert_eq!(cfg.servers[0].range, None);
+        assert_eq!(cfg.servers[0].max_sessions, None);
+
+        let limits = cfg.proxy_limits();
+        assert_eq!(limits.stall_timeout_ms, 60_000);
+        assert_eq!(limits.connect_timeout_ms, cfg.upstream_connect_timeout_ms());
+        assert_eq!(limits.connect_timeout_ms, 10_000);
+
+        let mut no_handshake = minimal_config();
+        no_handshake["handshake_timeout_ms"] = serde_json::json!(0);
+        let cfg: ServerConfig = serde_json::from_value(no_handshake).unwrap();
+        assert_eq!(cfg.proxy_limits().connect_timeout_ms, 10_000);
+
+        let parsed: StitchingPolicy = serde_json::from_value(serde_json::json!({
+            "history_preference": "any",
+            "predial_blocks": 0,
+            "patch_head_lib": false,
+            "abi_mismatch": "exclude"
+        }))
+        .unwrap();
+        assert_eq!(parsed.history_preference, HistoryPreference::Any);
+        assert_eq!(parsed.predial_blocks, 0);
+        assert!(!parsed.patch_head_lib);
+        assert_eq!(parsed.abi_mismatch, AbiMismatch::Exclude);
+        assert_eq!(parsed.gap_wait_ms, 30_000);
+    }
+
+    #[test]
+    fn unknown_role_and_topology_values_are_rejected() {
+        let mut value = minimal_config();
+        value["servers"][0]["role"] = serde_json::json!("archive");
+        assert!(serde_json::from_value::<ServerConfig>(value).is_err());
+        let mut value = minimal_config();
+        value["topology"] = serde_json::json!("mesh");
+        assert!(serde_json::from_value::<ServerConfig>(value).is_err());
+    }
+
+    #[test]
+    fn warnings_cover_ignored_stitching_and_archive_hints() {
+        let pool = single(
+            serde_json::json!([live("a", 18080)]),
+            serde_json::json!({ "topology": "pool", "stitching": {} }),
+        );
+        pool.validate().unwrap();
+        assert_eq!(
+            pool.warnings(),
+            vec!["stitching is ignored for pool topology".to_string()]
+        );
+
+        let archive_only = multi(
+            serde_json::json!({
+                "chain_id": CHAIN_ID,
+                "servers": [
+                    frozen("arc-0", 18080, Some((2, 1001))),
+                    frozen("arc-1", 18081, None),
+                    frozen("arc-2", 18082, Some((1101, 2001))),
+                    frozen("arc-3", 18083, Some((3001, 4001)))
+                ]
+            }),
+            serde_json::json!({}),
+        );
+        archive_only.validate().unwrap();
+        assert_eq!(
+            archive_only.warnings(),
+            vec![
+                "listener 'eos': no live server: status head is the newest archived block and sessions idle at the end of history".to_string(),
+                "listener 'eos': server 'arc-1': declare range so status is not held while this server is down at startup".to_string(),
+                "listener 'eos': coverage hole [1001, 1101) between declared archive ranges".to_string(),
+                "listener 'eos': coverage hole [2001, 3001) between declared archive ranges".to_string(),
+            ]
+        );
+
+        // Touching and overlapping declared ranges leave no hole, and a live
+        // server silences the archive-only hint.
+        let contiguous = single(
+            serde_json::json!([
+                live("live", 18080),
+                frozen("arc-0", 18081, Some((2, 1001))),
+                frozen("arc-1", 18082, Some((1001, 2001))),
+                frozen("arc-2", 18083, Some((1500, 2500)))
+            ]),
+            serde_json::json!({ "chain_id": CHAIN_ID }),
+        );
+        contiguous.validate().unwrap();
+        assert!(
+            contiguous.warnings().is_empty(),
+            "{:?}",
+            contiguous.warnings()
+        );
+    }
+
+    #[test]
+    fn state_db_copies_role_range_and_a_dense_index() {
+        let servers: Vec<Server> = serde_json::from_value(serde_json::json!([
+            frozen("arc", 18080, Some((2, 1001))),
+            { "name": "off", "endpoint": "127.0.0.1:18081", "enabled": false },
+            { "name": "live", "endpoint": "127.0.0.1:18082", "enabled": true, "max_sessions": 8 }
+        ]))
+        .unwrap();
+        let db = build_state_db_with_chain_id(servers, None, false);
+        let db = db.try_lock().unwrap();
+        assert_eq!(db.len(), 2);
+        let arc = &db["127.0.0.1:18080"];
+        assert_eq!(arc.index, 0);
+        assert_eq!(arc.role, Role::Frozen);
+        assert_eq!(
+            arc.declared,
+            Some(Range {
+                begin: 2,
+                end: 1001
+            })
+        );
+        assert_eq!(arc.max_sessions, None);
+        let live = &db["127.0.0.1:18082"];
+        assert_eq!(live.index, 1, "disabled servers do not take an index");
+        assert_eq!(live.role, Role::Live);
+        assert_eq!(live.declared, None);
+        assert_eq!(live.max_sessions, Some(8));
+    }
+
+    #[test]
+    fn mark_offline_keeps_ranges_head_lib_and_abi() {
+        let mut state = ServerState::new();
+        state.online = true;
+        state.chain_id = Some([0xAB; 32]);
+        state.trace_begin_block = 2;
+        state.trace_end_block = 1001;
+        state.head = Some(BlockPos {
+            num: 1000,
+            id: [1; 32],
+        });
+        state.lib = Some(BlockPos {
+            num: 990,
+            id: [2; 32],
+        });
+        state.ranges_known = true;
+        state.abi = Some(Arc::new(AbiEntry::new(SHIP_ABI_JSON)));
+
+        let t0 = Instant::now();
+        state.mark_offline(t0);
+        assert!(!state.online);
+        assert_eq!(state.chain_id, None);
+        assert_eq!(state.offline_since, Some(t0));
+        assert_eq!(state.trace_end_block, 1001);
+        assert_eq!(state.head.map(|h| h.num), Some(1000));
+        assert_eq!(state.lib.map(|l| l.num), Some(990));
+        assert!(state.ranges_known);
+        assert!(state.abi.is_some());
+
+        state.mark_offline(t0 + Duration::from_secs(5));
+        assert_eq!(
+            state.offline_since,
+            Some(t0),
+            "a repeated verdict keeps the start of the outage"
+        );
+    }
+
+    #[test]
+    fn declared_ranges_count_as_known_and_mismatches_are_detected() {
+        let mut state = ServerState::new();
+        assert!(!state.ranges_usable());
+        state.ranges_known = true;
+        assert!(state.ranges_usable());
+        assert!(!state.range_mismatch(), "nothing declared");
+
+        let mut frozen = ServerState::new();
+        frozen.role = Role::Frozen;
+        frozen.declared = Some(Range {
+            begin: 2,
+            end: 1001,
+        });
+        assert!(
+            frozen.ranges_usable(),
+            "a declared range is usable before any report"
+        );
+        assert!(!frozen.range_mismatch(), "no report yet");
+
+        frozen.ranges_known = true;
+        frozen.trace_begin_block = 2;
+        frozen.trace_end_block = 1001;
+        frozen.chain_state_begin_block = 2;
+        frozen.chain_state_end_block = 1001;
+        assert!(!frozen.range_mismatch());
+        frozen.chain_state_end_block = 900;
+        assert!(frozen.range_mismatch());
+        assert_eq!(frozen.reported_end(), 1001);
+        frozen.finality_data_end_block = 1100;
+        assert_eq!(frozen.reported_end(), 1100);
     }
 }

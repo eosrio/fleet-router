@@ -1437,6 +1437,66 @@ async fn s13_a_coverage_hole_closes_at_once() {
     assert!(legs(&a.mock).is_empty() && legs(&b.mock).is_empty());
 }
 
+/// Stream `900..` through A into the hole that follows it: A is asked only
+/// up to its own end, and at the seam the hole closes the client at once,
+/// long before a silent A would count as stalled, striking nobody.
+async fn stream_into_a_hole(a: &Up, rest: &[&Up], servers: Vec<Value>) {
+    let mut cfg = config(servers);
+    cfg["upstream_stall_timeout_ms"] = json!(3000);
+    let router = RouterProcess::start(cfg).await;
+    let mut all = vec![a];
+    all.extend_from_slice(rest);
+    wait_ready(&router, &all).await;
+    let (mut w, mut r, _) = client(&router).await;
+
+    let asked = Instant::now();
+    send(&mut w, blocks(&request(900, u32::MAX, 1000))).await;
+    let (got, close) = read_blocks(&mut r, 200, WAIT).await;
+    assert_eq!(nums(&got), (900..1001).collect::<Vec<_>>());
+    let close = close.expect("the hole closes the client");
+    assert_eq!(close.code, CloseCode::Error);
+    assert_eq!(
+        close.reason.as_str(),
+        "block 1001 unavailable on all upstreams"
+    );
+    assert!(
+        asked.elapsed() < Duration::from_secs(2),
+        "closed after {:?}",
+        asked.elapsed()
+    );
+    let la = legs(&a.mock);
+    assert_eq!(
+        la.iter().map(|l| (l.start, l.end)).collect::<Vec<_>>(),
+        [(900, 1001)]
+    );
+    for u in rest {
+        assert!(legs(&u.mock).is_empty(), "{} was asked", u.name);
+    }
+    for series in ["upstream_block_failures_total", "upstream_stalls_total"] {
+        let series = a.series(series, "");
+        assert_eq!(metric(&router, &series).await, 0.0, "{series}");
+    }
+}
+
+/// S13, streamed into: the hole after A ends the run at A's end.
+#[tokio::test]
+async fn s13_a_stream_into_a_hole_ends_at_the_archive_end() {
+    let a = up("a", frozen_mock(A_RANGE)).await;
+    let b = up("b", frozen_mock((1101, 2001))).await;
+    let c = up("c", live_mock(C_BEGIN, C_HEAD)).await;
+    let servers = vec![frozen_server(&a), frozen_server(&b), live_server(&c)];
+    stream_into_a_hole(&a, &[&b, &c], servers).await;
+}
+
+/// The same hole between the top archive and a pruned live tier.
+#[tokio::test]
+async fn s13_a_stream_into_a_hole_before_the_live_tier_ends_at_the_archive_end() {
+    let a = up("a", frozen_mock(A_RANGE)).await;
+    let c = up("c", live_mock(1101, C_HEAD)).await;
+    let servers = vec![frozen_server(&a), live_server(&c)];
+    stream_into_a_hole(&a, &[&c], servers).await;
+}
+
 /// S14: a request below the fleet's first block goes to the archive that
 /// owns it, which answers id-less below its range; that is no violation.
 #[tokio::test]

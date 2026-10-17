@@ -257,7 +257,15 @@ fn breakpoints(v: &FleetView, u: &UpstreamView, now: Instant) -> Vec<u32> {
 /// union: a range end or begin anywhere in the fleet, a quarantine bound, or
 /// (frozen) its own end. Eligibility is constant between breakpoints, so the
 /// run stops exactly where the field set changes in a way `u` cannot serve.
+///
+/// A frozen upstream's run never goes past its own end (the highest end of
+/// its logs), even where nothing in the fleet covers the blocks after it: it
+/// has nothing to send there, so a request past it would only go silent.
 pub fn run_end(v: &FleetView, u: &UpstreamView, need: Need, from: u32, now: Instant) -> u32 {
+    let cap = match u.role {
+        Role::Frozen => u.max_end(),
+        Role::Live => u32::MAX,
+    };
     let mut bps: Vec<u32> = breakpoints(v, u, now)
         .into_iter()
         .filter(|&b| b > from)
@@ -265,14 +273,14 @@ pub fn run_end(v: &FleetView, u: &UpstreamView, need: Need, from: u32, now: Inst
     bps.sort_unstable();
     bps.dedup();
     for b in bps {
+        if b >= cap {
+            return cap;
+        }
         if !eligible(v, u, need, b, Union::Sticky, now) {
             return b;
         }
     }
-    match u.role {
-        Role::Frozen => u.max_end(),
-        Role::Live => u32::MAX,
-    }
+    cap
 }
 
 /// True when every upstream that could serve `from` is live (the tip
@@ -808,6 +816,32 @@ mod tests {
         assert_eq!(run_end(&v, &v.upstreams[0], all(), 2, now), 1001);
         assert_eq!(served_by(&plan(&v, fin, 2)), (0, 2, 950));
         assert_eq!(served_by(&plan(&v, fin, 950)), (1, 950, u32::MAX));
+
+        // A hole after an archive: its run still ends at its own end, never
+        // at the next upstream's begin (it has nothing to send in the hole).
+        let v = view(vec![
+            frozen(0, 2, 1001),
+            frozen(1, 1101, 2001),
+            live(2, 1900, 2300),
+        ]);
+        assert_eq!(run_end(&v, &v.upstreams[0], all(), 900, now), 1001);
+        assert_eq!(served_by(&plan(&v, all(), 900)), (0, 900, 1001));
+        assert_eq!(plan(&v, all(), 1001), Step::Gap { block: 1001 });
+        // The same between the top archive and a pruned live tier.
+        let v = view(vec![frozen(0, 2, 1001), live(1, 1101, 2300)]);
+        assert!(v.live_overlap[0].is_some_and(|o| o < 0));
+        assert_eq!(run_end(&v, &v.upstreams[0], all(), 900, now), 1001);
+        assert_eq!(served_by(&plan(&v, all(), 900)), (0, 900, 1001));
+        assert_eq!(plan(&v, all(), 1001), Step::Gap { block: 1001 });
+        // A log that goes on past another log's end is still served there.
+        let mut longer = frozen(0, 2, 1001);
+        longer.chain_state_end_block = 1101;
+        let v = view(vec![longer, frozen(1, 1201, 2001)]);
+        let deltas = Need {
+            deltas: true,
+            ..Default::default()
+        };
+        assert_eq!(run_end(&v, &v.upstreams[0], deltas, 900, now), 1101);
     }
 
     #[test]

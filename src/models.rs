@@ -375,6 +375,10 @@ pub struct DashboardConfig {
     /// File holding the control API token. Surrounding whitespace is ignored.
     #[serde(default)]
     pub control_token_file: Option<String>,
+    /// Host names the dashboard answers to besides IP literals and
+    /// `localhost`, for access through a reverse proxy that keeps the name.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 impl DashboardConfig {
@@ -1214,6 +1218,7 @@ mod tests {
             enabled: true,
             control_token: None,
             control_token_file: Some(file.path().display().to_string()),
+            allowed_hosts: Vec::new(),
         };
         // The environment variable takes precedence; only check the file
         // when it is not set in this test environment.

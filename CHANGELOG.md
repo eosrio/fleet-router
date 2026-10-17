@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clear its quarantines, and move or close a single session. A drain moves
   live sessions to other upstreams with the normal failover, so clients stay
   connected. Runtime changes are not written back to the config.
+- `dashboard.allowed_hosts`: dashboard routes answer only requests addressed
+  by IP, `localhost`, or a listed name, which blocks DNS rebinding. At most 32
+  live streams are open at once.
 - New gauge `fleet_router_upstream_operator_disabled`.
 
 - Optional per-server `priority` (default `0`, lower is preferred) and
@@ -41,8 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The health/metrics endpoint now runs on hyper (via axum) instead of a
   hand-written HTTP loop. Paths and response bodies are unchanged. Request
-  headers must arrive within 5 s, and at most 256 connections are served at
-  once. A request to an unknown path with a method other than `GET` now
+  headers must arrive within 5 s, at most 256 connections are served at
+  once, and each connection serves one request (as before). A request to an unknown path with a method other than `GET` now
   returns `404` instead of `405`.
 - `fleet_router_upstream_priority` and `fleet_router_upstream_weight` report
   the values in effect, which can differ from the config after a control API

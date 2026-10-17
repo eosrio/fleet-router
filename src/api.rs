@@ -18,8 +18,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::Stream;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{broadcast, Semaphore};
 
 use crate::health::ListenerHealthState;
 use crate::models::{Server, ServerConfigDb, ServerState};
@@ -51,7 +51,16 @@ pub struct AppState {
     pub health: Vec<ListenerHealthState>,
     pub dashboard: bool,
     pub control_token: Option<String>,
+    /// Extra `Host` names the dashboard answers to, lowercased. IP literals
+    /// and `localhost` are always accepted.
+    pub allowed_hosts: Vec<String>,
+    /// Open `/api/v1/stream` connections. Bounded well below the HTTP
+    /// connection cap so streams cannot starve health and readiness probes.
+    pub streams: Arc<Semaphore>,
 }
+
+/// Concurrent `/api/v1/stream` connections.
+pub const MAX_STREAMS: usize = 32;
 
 pub type SharedState = Arc<AppState>;
 
@@ -429,16 +438,24 @@ async fn get_events(Query(query): Query<EventsQuery>) -> Json<serde_json::Value>
 }
 
 /// One `snapshot` per second plus every new event, until the client goes away.
+/// At most [`MAX_STREAMS`] at once; further requests get 503.
 async fn get_stream(
     State(app): State<SharedState>,
-) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    let Ok(permit) = app.streams.clone().try_acquire_owned() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many open dashboard streams",
+        ));
+    };
     let events = telemetry::global().subscribe();
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // The permit lives in the stream state and is released when it drops.
     let stream = futures::stream::unfold(
-        (app, events, ticker),
-        |(app, mut events, mut ticker)| async move {
+        (app, events, ticker, permit),
+        |(app, mut events, mut ticker, permit)| async move {
             loop {
                 let next = tokio::select! {
                     _ = ticker.tick() => {
@@ -452,7 +469,7 @@ async fn get_stream(
                     },
                 };
                 match next {
-                    Ok(sse) => return Some((Ok(sse), (app, events, ticker))),
+                    Ok(sse) => return Some((Ok(sse), (app, events, ticker, permit))),
                     Err(e) => {
                         tracing::debug!(error = %e, "failed to encode SSE payload");
                         continue;
@@ -461,11 +478,11 @@ async fn get_stream(
             }
         },
     );
-    Sse::new(stream).keep_alive(
+    Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keepalive"),
-    )
+    ))
 }
 
 // ---------------------------------------------------------------------------

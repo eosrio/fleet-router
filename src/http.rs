@@ -14,8 +14,11 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use std::net::IpAddr;
+
+use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::Router;
@@ -74,9 +77,12 @@ pub async fn serve(listener: TcpListener, app: SharedState, mut shutdown: broadc
                 let mut conn_shutdown = shutdown.resubscribe();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    // One request per connection, as before the move to hyper:
+                    // idle keep-alive connections must not hold slots.
                     let conn = http1::Builder::new()
                         .timer(TokioTimer::new())
                         .header_read_timeout(HEADER_READ_TIMEOUT)
+                        .keep_alive(false)
                         .serve_connection(TokioIo::new(stream), service);
                     // Dashboard streams never end on their own, so shutdown
                     // drops the connection instead of waiting for it.
@@ -108,18 +114,50 @@ pub fn router(app: SharedState) -> Router {
         .route("/readyz/{name}", get(ready_listener))
         .route("/metrics", get(metrics));
     if app.dashboard {
-        router = router
+        let dashboard = Router::new()
             .route("/", get(to_dashboard))
             .route("/ui", get(to_dashboard))
             .route("/ui/", get(ui_index))
             .route("/ui/{*path}", get(ui_asset))
             .route("/status", get(status_page))
-            .nest("/api/v1", api::router());
+            .nest("/api/v1", api::router())
+            .route_layer(middleware::from_fn_with_state(app.clone(), check_host));
+        router = router.merge(dashboard);
     }
     router
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(app)
+}
+
+/// Whether the dashboard answers to this `Host` header value. IP literals and
+/// `localhost` always pass, other names only when listed in
+/// `dashboard.allowed_hosts`. This stops DNS rebinding: a page on an
+/// attacker's domain that resolves to this router still sends its own name.
+fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    let name = match host.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => host
+            .rsplit_once(':')
+            .map_or(host.as_str(), |(name, _)| name),
+    };
+    name == "localhost" || name.parse::<IpAddr>().is_ok() || allowed.iter().any(|a| a == name)
+}
+
+async fn check_host(State(app): State<SharedState>, request: Request, next: Next) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    match host {
+        Some(host) if !host_allowed(host, &app.allowed_hosts) => text(
+            "403 Forbidden",
+            "text/plain",
+            "host not allowed: add it to dashboard.allowed_hosts\n".to_string(),
+        ),
+        _ => next.run(request).await,
+    }
 }
 
 fn text(status: &str, content_type: &'static str, body: String) -> Response {
@@ -393,6 +431,8 @@ mod tests {
             health: vec![health],
             dashboard,
             control_token: token.map(str::to_string),
+            allowed_hosts: vec!["router.internal".to_string()],
+            streams: Arc::new(Semaphore::new(api::MAX_STREAMS)),
         })
     }
 
@@ -527,6 +567,38 @@ mod tests {
         assert!(html.contains("&lt;eos&gt;"));
         assert!(!html.contains("<eos>"));
         assert!(html.contains("Up 1h 1m"));
+    }
+
+    #[test]
+    fn host_check_accepts_ip_literals_localhost_and_listed_names_only() {
+        let allowed = vec!["router.internal".to_string()];
+        for host in [
+            "127.0.0.1:9090",
+            "10.0.0.5",
+            "[::1]:9090",
+            "LOCALHOST:9090",
+            "router.internal:9090",
+        ] {
+            assert!(host_allowed(host, &allowed), "{host} should pass");
+        }
+        for host in [
+            "evil.example",
+            "evil.example:9090",
+            "router.internal.evil.example",
+        ] {
+            assert!(!host_allowed(host, &allowed), "{host} should be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn dashboard_rejects_a_foreign_host_but_metrics_does_not() {
+        let raw = |path: &str| {
+            format!("GET {path} HTTP/1.1\r\nHost: evil.example:9090\r\nConnection: close\r\n\r\n")
+        };
+        let resp = request(app(true, None).await, &raw("/api/v1/sessions")).await;
+        assert!(resp.starts_with("HTTP/1.1 403"), "resp: {resp}");
+        let resp = request(app(true, None).await, &raw("/metrics")).await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "resp: {resp}");
     }
 
     #[test]

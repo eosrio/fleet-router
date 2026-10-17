@@ -287,6 +287,13 @@ async fn main() -> Result<()> {
             health: health_states,
             dashboard: config.dashboard.enabled,
             control_token,
+            allowed_hosts: config
+                .dashboard
+                .allowed_hosts
+                .iter()
+                .map(|host| host.trim().to_ascii_lowercase())
+                .collect(),
+            streams: Arc::new(tokio::sync::Semaphore::new(api::MAX_STREAMS)),
         });
         if app.dashboard {
             spawn(api::run_sampler(app.clone(), shutdown_tx.subscribe()));

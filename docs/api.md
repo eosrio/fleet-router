@@ -218,6 +218,8 @@ Upstreams disabled in the config file (`"enabled": false`) are not monitored and
 
 - Nothing here is served unless `dashboard.enabled` is `true`. Upgrading does not expose new data on an existing `metrics_port`.
 - Once enabled, read endpoints, the dashboard and the live stream need no token, like `/metrics`, and they show client IP addresses. Bind `metrics_address` to a private interface, or put the port behind a reverse proxy with access control.
+- Dashboard routes only answer requests addressed by IP, `localhost`, or a name listed in `dashboard.allowed_hosts`, so a page on another domain that rebinds its DNS to this router cannot read the API.
+- At most 32 live streams are open at once (`503` beyond that), and every HTTP connection serves one request, so the dashboard cannot crowd out health and readiness probes.
 - Control endpoints accept only the `Authorization` header (no cookies or query strings), so a cross-site page cannot send them on a visitor's behalf.
 - The token is compared in constant time and must be at least 16 characters. Prefer `dashboard.control_token_file` or the `FLEET_ROUTER_CONTROL_TOKEN` environment variable to keep it out of the config file.
 - The router logs a warning at startup when the control API is enabled on a non-loopback address.

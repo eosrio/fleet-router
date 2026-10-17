@@ -175,6 +175,13 @@ fn live_server(up: &Up) -> Value {
     server(&up.name, &up.ep)
 }
 
+/// A frozen server entry with `max_sessions: 1`.
+fn single_slot(up: &Up) -> Value {
+    let mut s = frozen_server(up);
+    s["max_sessions"] = json!(1);
+    s
+}
+
 /// A stitched single-listener config with `chain_id` pinned and
 /// `gap_wait_ms` 1000. Status is polled every 300 ms.
 fn config(servers: Vec<Value>) -> Value {
@@ -1024,6 +1031,60 @@ async fn s7_irreversible_only_waits_for_lib_on_the_same_socket() {
     assert!(legs(&c.mock).is_empty());
 }
 
+/// S7 with B at `max_sessions: 1`: the session's own link fills B, which
+/// neither turns the wait at LIB into a capacity hold nor keeps the socket
+/// from being reused when LIB moves.
+#[tokio::test]
+async fn s7_a_single_slot_archive_waits_for_lib_on_its_one_socket() {
+    let a = up("a", frozen_mock(A_RANGE)).await;
+    let b = up("b", frozen_mock(B_RANGE)).await;
+    let c = up(
+        "c",
+        MockShipConfig {
+            lib_block: 1500,
+            ..live_mock(C_BEGIN, C_HEAD)
+        },
+    )
+    .await;
+    let cfg = config(vec![frozen_server(&a), single_slot(&b), live_server(&c)]);
+    let router = RouterProcess::start(cfg).await;
+    wait_ready(&router, &[&a, &b, &c]).await;
+    let (mut w, mut r, _) = client(&router).await;
+
+    send(
+        &mut w,
+        blocks(&BlocksReq {
+            irreversible_only: true,
+            ..request(1001, u32::MAX, 1000)
+        }),
+    )
+    .await;
+    let (got, _) = read_blocks(&mut r, 500, WAIT).await;
+    assert_eq!(nums(&got), (1001..1501).collect::<Vec<_>>());
+    wait_metric(
+        router.metrics(),
+        "fleet_router_sessions{state=\"waiting\"} 1",
+        WAIT,
+    )
+    .await;
+    // Longer than gap_wait_ms: a capacity hold would have closed by now.
+    let (more, close) = read_blocks(&mut r, 1, Duration::from_millis(1500)).await;
+    assert!(close.is_none(), "{close:?}");
+    assert!(more.is_empty(), "a block above LIB: {:?}", nums(&more));
+
+    c.mock.set_head(2300, 1800);
+    let (got2, close) = read_blocks(&mut r, 300, WAIT).await;
+    assert!(close.is_none(), "{close:?}");
+    assert_eq!(nums(&got2), (1501..1801).collect::<Vec<_>>());
+    let lb = legs(&b.mock);
+    assert_eq!(lb.len(), 2, "{lb:?}");
+    assert_eq!(lb[0].session, lb[1].session, "the same socket");
+    assert_eq!(
+        metric(&router, "fleet_router_holds_total{why=\"at_capacity\"}").await,
+        0.0
+    );
+}
+
 // ----------------------------------------------------------------------
 // S8: positions
 // ----------------------------------------------------------------------
@@ -1569,6 +1630,45 @@ async fn s16_the_next_leg_is_pre_dialed() {
     assert!(metric(&router, "fleet_router_handoff_latency_seconds_count").await >= 1.0);
 }
 
+/// S16 with B at `max_sessions: 1`: the standby link is the session's own
+/// slot on B, so the handoff uses it instead of holding for capacity and
+/// dialing B again.
+#[tokio::test]
+async fn s16_a_standby_to_a_single_slot_archive_is_used() {
+    let (a, b, c) = default_fleet().await;
+    let mut cfg = config(vec![frozen_server(&a), single_slot(&b), live_server(&c)]);
+    cfg["stitching"]["predial_blocks"] = json!(200);
+    let router = RouterProcess::start(cfg).await;
+    wait_ready(&router, &[&a, &b, &c]).await;
+    let (mut w, mut r, _) = client(&router).await;
+
+    send(&mut w, blocks(&request(700, 1100, 250))).await;
+    let (got, _) = read_blocks(&mut r, 250, WAIT).await;
+    assert_eq!(nums(&got), (700..950).collect::<Vec<_>>());
+    wait_for("the pre-dialed link to B", WAIT, || {
+        link_sessions(&b.mock) == 1
+    })
+    .await;
+
+    send(&mut w, ack(1000)).await;
+    let (rest, close) = read_blocks(&mut r, 150, WAIT).await;
+    assert!(close.is_none(), "{close:?}");
+    assert_eq!(nums(&rest), (950..1100).collect::<Vec<_>>());
+    assert_eq!(
+        link_sessions(&b.mock),
+        1,
+        "the handoff used the standby link"
+    );
+    for (result, want) in [("used", 1.0), ("discarded", 0.0)] {
+        let series = format!("fleet_router_predials_total{{result=\"{result}\"}}");
+        assert_eq!(metric(&router, &series).await, want, "{series}");
+    }
+    assert_eq!(
+        metric(&router, "fleet_router_holds_total{why=\"at_capacity\"}").await,
+        0.0
+    );
+}
+
 /// S17: a client out of credit exactly at the seam: the next leg is asked
 /// with `max_messages_in_flight` 0 and sends only what later acks allow.
 #[tokio::test]
@@ -1882,6 +1982,34 @@ async fn s23_back_to_back_ranges_reuse_one_archive_socket() {
     let la = legs(&a.mock);
     assert_eq!(la.len(), 2);
     assert_eq!(la[0].session, la[1].session);
+}
+
+/// S23 with B at `max_sessions: 1`: the session's own lingering link is
+/// the only one on B, and the next range reuses it instead of holding for
+/// capacity (and closing after `gap_wait_ms`).
+#[tokio::test]
+async fn s23_the_next_range_reuses_the_only_slot_of_an_archive() {
+    let (a, b, c) = default_fleet().await;
+    let cfg = config(vec![frozen_server(&a), single_slot(&b), live_server(&c)]);
+    let router = RouterProcess::start(cfg).await;
+    wait_ready(&router, &[&a, &b, &c]).await;
+    let (mut w, mut r, _) = client(&router).await;
+
+    for (start, end) in [(1001, 1100), (1100, 1200)] {
+        send(&mut w, blocks(&request(start, end, 1000))).await;
+        let n = (end - start) as usize;
+        let (got, close) = read_blocks(&mut r, n, WAIT).await;
+        assert!(close.is_none(), "{close:?}");
+        assert_eq!(nums(&got), (start..end).collect::<Vec<_>>());
+    }
+    assert_eq!(link_sessions(&b.mock), 1, "one socket for both ranges");
+    let lb = legs(&b.mock);
+    assert_eq!(lb.len(), 2, "{lb:?}");
+    assert_eq!(lb[0].session, lb[1].session);
+    assert_eq!(
+        metric(&router, "fleet_router_holds_total{why=\"at_capacity\"}").await,
+        0.0
+    );
 }
 
 /// S24: a new request while the old one is still streaming gets a fresh

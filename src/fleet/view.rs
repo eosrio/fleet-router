@@ -229,8 +229,16 @@ impl UpstreamView {
     }
 
     pub fn at_capacity(&self) -> bool {
+        self.at_capacity_besides(0)
+    }
+
+    /// At `max_sessions` without the `own` slots the asking session holds
+    /// here itself (its link, dial or standby). Serving from this upstream
+    /// reuses or replaces such a slot, so it opens no extra connection.
+    pub fn at_capacity_besides(&self, own: usize) -> bool {
         self.max_sessions.is_some_and(|max| {
-            self.connections.load(Ordering::Relaxed) >= usize::try_from(max).unwrap_or(usize::MAX)
+            self.connections.load(Ordering::Relaxed).saturating_sub(own)
+                >= usize::try_from(max).unwrap_or(usize::MAX)
         })
     }
 
@@ -1487,6 +1495,11 @@ mod tests {
         capped.connections.store(1, Ordering::Relaxed);
         let v = view(vec![capped]);
         assert!(v.upstreams[0].at_capacity());
+        assert!(
+            !v.upstreams[0].at_capacity_besides(1),
+            "the asking session's own slot is not counted"
+        );
+        assert!(v.upstreams[0].at_capacity_besides(0));
         assert_eq!(v.up(0).map(|u| u.index), Some(0));
         assert!(v.up(5).is_none());
 

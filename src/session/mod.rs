@@ -1228,6 +1228,7 @@ impl Session {
                 &Shape::of(creq),
                 k,
                 &ex,
+                &self.own_slots(),
                 self.id,
                 &self.ctx.stitching,
                 self.ctx.live_lag_blocks,
@@ -1863,7 +1864,9 @@ impl Session {
 
     /// The planner's next step for the client's request at block `from`.
     ///
-    /// A hold at capacity that only the slot of the link that just ended
+    /// The slots of this session's link, dial and standby never count
+    /// against an upstream's `max_sessions` (see [`Session::own_slots`]). A
+    /// hold at capacity that only the slot of the link that just ended
     /// causes is planned again without that slot. A hold blamed on
     /// exclusions is reported as busy only while an upstream that answered
     /// 503 is among them; otherwise its upstreams are unreachable (offline).
@@ -1909,12 +1912,30 @@ impl Session {
             shape,
             from,
             &self.ex,
+            &self.own_slots(),
             self.id,
             &self.ctx.stitching,
             self.ctx.live_lag_blocks,
             allow_offline,
             std_now(),
         )
+    }
+
+    /// The upstream of every connection slot this session holds: its link,
+    /// its dial, its standby link and its pre-dial. A plan that serves from
+    /// one of them reuses or replaces that slot (the socket, the standby, the
+    /// dial in progress, or a new dial after the old link is closed), so the
+    /// planner does not count it against the upstream's `max_sessions`.
+    fn own_slots(&self) -> Vec<usize> {
+        [
+            self.link.as_ref().map(|l| l.st.up),
+            self.dial.as_ref().map(|d| d.target().up),
+            self.standby.as_ref().map(|s| s.link.st.up),
+            self.standby_dial.as_ref().map(|d| d.target().up),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// Plan again from the client's cursor: after a failover backoff, a

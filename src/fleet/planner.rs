@@ -297,8 +297,13 @@ pub fn tip_region(v: &FleetView, from: u32) -> bool {
 /// `tip` is `hub.fresh_tip(v)`. A frozen upstream's request is clamped to its
 /// run end and to the gate + 1 (fleet head, or fleet LIB for
 /// `irreversible_only`). A gate below `from` gives [`Step::Wait`], never an
-/// empty request. `allow_offline` lets a bounded hold's retry dial an offline
-/// but enabled covering upstream.
+/// empty request; it is checked before capacity, so a session waiting for the
+/// fleet to reach `from` waits unbounded even while the archive is full.
+/// `own` lists the upstream (by index) of every connection slot the session
+/// holds itself: its link, dial, standby link and pre-dial. Serving from such
+/// an upstream reuses or replaces that slot, so it does not count against
+/// the upstream's `max_sessions`. `allow_offline` lets a bounded hold's retry
+/// dial an offline but enabled covering upstream.
 #[allow(clippy::too_many_arguments)]
 pub fn next_step(
     v: &FleetView,
@@ -306,6 +311,7 @@ pub fn next_step(
     sh: &Shape,
     from: u32,
     ex: &Excludes,
+    own: &[usize],
     sid: u64,
     pol: &StitchingPolicy,
     lag: u32,
@@ -327,6 +333,10 @@ pub fn next_step(
             Step::Gap { block: from }
         };
     }
+    let full = |u: &UpstreamView| {
+        let mine = own.iter().filter(|&&i| i == u.index).count();
+        u.at_capacity_besides(mine)
+    };
     let cands: Vec<&UpstreamView> = v
         .upstreams
         .iter()
@@ -359,7 +369,7 @@ pub fn next_step(
             (
                 u8::from(!u.online),
                 u8::from(u.stale || lagging_for(v, u, from, lag)),
-                u8::from(u.at_capacity()),
+                u8::from(full(u)),
                 match (pol.history_preference, u.role) {
                     (HistoryPreference::Frozen, Role::Live) => 1u8,
                     _ => 0,
@@ -378,13 +388,6 @@ pub fn next_step(
             bounded: !tip_region(v, from),
         };
     }
-    if best.at_capacity() {
-        return Step::Hold {
-            block: from,
-            why: HoldWhy::AtCapacity,
-            bounded: !tip_region(v, from),
-        };
-    }
     let mut req_end = run_end(v, best, sh.need, from, now).min(sh.end);
     if best.role == Role::Frozen {
         let (head, lib) = tip;
@@ -393,6 +396,13 @@ pub fn next_step(
             Some(g) if from <= g.num => req_end = req_end.min(g.num.saturating_add(1)),
             _ => return Step::Wait { block: from },
         }
+    }
+    if full(best) {
+        return Step::Hold {
+            block: from,
+            why: HoldWhy::AtCapacity,
+            bounded: !tip_region(v, from),
+        };
     }
     debug_assert!(req_end > from, "a Serve step is never empty");
     Step::Serve(ServeStep {
@@ -513,6 +523,7 @@ mod tests {
             &shape(need, u32::MAX),
             from,
             &Excludes::default(),
+            &[],
             1,
             &StitchingPolicy::default(),
             1200,
@@ -662,6 +673,7 @@ mod tests {
                 &shape(all(), 10),
                 10,
                 &Excludes::default(),
+                &[],
                 1,
                 &StitchingPolicy::default(),
                 0,
@@ -687,6 +699,7 @@ mod tests {
             &shape(all(), u32::MAX),
             1950,
             &Excludes::default(),
+            &[],
             1,
             &any,
             1200,
@@ -716,6 +729,7 @@ mod tests {
             &shape(all(), u32::MAX),
             10,
             &Excludes::default(),
+            &[],
             sid,
             &StitchingPolicy::default(),
             1200,
@@ -855,6 +869,7 @@ mod tests {
             &shape(all(), u32::MAX),
             500,
             &Excludes::default(),
+            &[],
             1,
             &StitchingPolicy::default(),
             1200,
@@ -882,6 +897,7 @@ mod tests {
                 },
                 from,
                 &Excludes::default(),
+                &[],
                 1,
                 &pol,
                 1200,
@@ -907,6 +923,7 @@ mod tests {
             &shape(all(), u32::MAX),
             10,
             &Excludes::default(),
+            &[],
             1,
             &pol,
             1200,
@@ -1030,6 +1047,7 @@ mod tests {
                 },
                 from,
                 &ex,
+                &[],
                 rng.next(),
                 &StitchingPolicy::default(),
                 if rng.chance(50) { 0 } else { 200 },
@@ -1086,6 +1104,7 @@ mod tests {
             &shape(all(), u32::MAX),
             4000,
             &ex,
+            &[],
             1,
             &StitchingPolicy::default(),
             1200,
@@ -1146,6 +1165,7 @@ mod tests {
                 &shape(all(), u32::MAX),
                 10,
                 ex,
+                &[],
                 1,
                 &StitchingPolicy::default(),
                 1200,
@@ -1178,6 +1198,7 @@ mod tests {
                 &shape(all(), u32::MAX),
                 10,
                 &Excludes::default(),
+                &[],
                 sid,
                 &StitchingPolicy::default(),
                 1200,
@@ -1197,6 +1218,7 @@ mod tests {
                 &shape(all(), u32::MAX),
                 10,
                 &soft,
+                &[],
                 sid,
                 &StitchingPolicy::default(),
                 1200,
@@ -1217,6 +1239,7 @@ mod tests {
             &shape(all(), u32::MAX),
             10,
             &soft,
+            &[],
             1,
             &StitchingPolicy::default(),
             1200,
@@ -1224,6 +1247,78 @@ mod tests {
             now(),
         );
         assert_eq!(served_by(&step).0, 0);
+    }
+
+    /// `next_step` with the default policy and `own` slots.
+    fn plan_owning(v: &FleetView, from: u32, irreversible_only: bool, own: &[usize]) -> Step {
+        next_step(
+            v,
+            tip_of(v),
+            &Shape {
+                need: all(),
+                end: u32::MAX,
+                irreversible_only,
+            },
+            from,
+            &Excludes::default(),
+            own,
+            1,
+            &StitchingPolicy::default(),
+            1200,
+            false,
+            now(),
+        )
+    }
+
+    #[test]
+    fn the_sessions_own_slots_never_fill_an_upstream() {
+        // B has max_sessions 1 and the only connection on it is the
+        // session's own (its lingering link, or its pre-dialed standby).
+        let mut b = frozen(1, 1001, 2001);
+        b.max_sessions = Some(1);
+        b.connections.store(1, Ordering::Relaxed);
+        let mut c = live(2, 1900, 2300);
+        c.lib = Some(pos(1500));
+        let v = view(vec![frozen(0, 2, 1001), b, c]);
+        let at_capacity = Step::Hold {
+            block: 1100,
+            why: HoldWhy::AtCapacity,
+            bounded: true,
+        };
+        assert_eq!(plan_owning(&v, 1100, false, &[]), at_capacity);
+        assert_eq!(
+            served_by(&plan_owning(&v, 1100, false, &[1])),
+            (1, 1100, 2001)
+        );
+        // A slot on another upstream does not help.
+        assert_eq!(plan_owning(&v, 1100, false, &[0, 2]), at_capacity);
+        // irreversible_only at LIB: the session waits (unbounded) for LIB,
+        // and serves on its own slot once LIB has moved.
+        assert_eq!(
+            plan_owning(&v, 1501, true, &[1]),
+            Step::Wait { block: 1501 }
+        );
+        assert_eq!(
+            served_by(&plan_owning(&v, 1001, true, &[1])),
+            (1, 1001, 1501)
+        );
+        // Another session's slot still counts.
+        v.upstreams[1].connections.store(2, Ordering::Relaxed);
+        assert_eq!(plan_owning(&v, 1100, false, &[1]), at_capacity);
+        // Above the gate, a full archive is waited for like a free one:
+        // capacity matters once there is something to send.
+        assert_eq!(plan_owning(&v, 1501, true, &[]), Step::Wait { block: 1501 });
+        // Ranking discounts the own slot too: a full replica loses to the
+        // one the session already holds.
+        let mut b = frozen(0, 1001, 2001);
+        b.max_sessions = Some(1);
+        b.connections.store(1, Ordering::Relaxed);
+        let mut b2 = frozen(1, 1001, 2001);
+        b2.max_sessions = Some(1);
+        b2.connections.store(1, Ordering::Relaxed);
+        let v = view(vec![b, b2, live(2, 1900, 2300)]);
+        assert_eq!(served_by(&plan_owning(&v, 1100, false, &[1])).0, 1);
+        assert_eq!(served_by(&plan_owning(&v, 1100, false, &[0])).0, 0);
     }
 
     // PL12: every routing test of `functions.rs`, ported to `pool_pick`.

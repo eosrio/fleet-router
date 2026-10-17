@@ -36,9 +36,29 @@ pub fn is_empty_content(body: &[u8]) -> bool {
             .all(|&b| b == b' ' || b == b'\t')
 }
 
+/// The block a body names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hint {
+    /// The block number: the number given, or an id's first four bytes.
+    pub num: u32,
+    /// The body names the block by id, which nodeos finds only if it is the
+    /// id of its block `num`.
+    pub by_id: bool,
+}
+
+impl Hint {
+    fn num(num: u32) -> Hint {
+        Hint { num, by_id: false }
+    }
+
+    fn id(num: u32) -> Hint {
+        Hint { num, by_id: true }
+    }
+}
+
 /// The block `body` names for endpoint `ep`, or `None` when the router must
 /// not route on it.
-pub fn hint(ep: BlockEndpoint, body: &[u8]) -> Option<u32> {
+pub fn hint(ep: BlockEndpoint, body: &[u8]) -> Option<Hint> {
     if is_empty_content(body) || body.contains(&b'\\') {
         return None;
     }
@@ -47,18 +67,18 @@ pub fn hint(ep: BlockEndpoint, body: &[u8]) -> Option<u32> {
         _ => "block_num_or_id",
     };
     let value = top_level_value(body, key)?;
+    let number = decimal(&value).map(Hint::num);
     match ep {
-        BlockEndpoint::BlockInfo => decimal(&value),
-        BlockEndpoint::BlockHeaderState => decimal(&value).or_else(|| match &value {
-            Value::Str(s) if s.len() == 64 => hex_block_num(s),
+        BlockEndpoint::BlockInfo => number,
+        BlockEndpoint::BlockHeaderState => number.or_else(|| match &value {
+            Value::Str(s) if s.len() == 64 => hex_block_num(s).map(Hint::id),
             _ => None,
         }),
-        BlockEndpoint::Block | BlockEndpoint::BlockHeader | BlockEndpoint::RawBlock => {
-            decimal(&value).or_else(|| match &value {
-                Value::Str(s) => hex_block_num(s),
+        BlockEndpoint::Block | BlockEndpoint::BlockHeader | BlockEndpoint::RawBlock => number
+            .or_else(|| match &value {
+                Value::Str(s) => hex_block_num(s).map(Hint::id),
                 _ => None,
-            })
-        }
+            }),
     }
 }
 
@@ -305,7 +325,12 @@ mod tests {
     const BHS: BlockEndpoint = BlockEndpoint::BlockHeaderState;
 
     fn h(ep: BlockEndpoint, body: &str) -> Option<u32> {
-        hint(ep, body.as_bytes())
+        hint(ep, body.as_bytes()).map(|h| h.num)
+    }
+
+    /// Whether the body names its block by id.
+    fn by_id(ep: BlockEndpoint, body: &str) -> Option<bool> {
+        hint(ep, body.as_bytes()).map(|h| h.by_id)
     }
 
     /// An id of block 480385480 (0x1ca219c8).
@@ -413,6 +438,26 @@ mod tests {
             h(RAW, r#"{"block_num_or_id":"1234567890123456789012"}"#),
             Some(0x1234_5678)
         );
+    }
+
+    // A wrong id of an archived block is answered by the archive that holds
+    // the block: the router must know a body names its block by id.
+    #[test]
+    fn a_hint_tells_an_id_from_a_number() {
+        let body = |value: &str| format!(r#"{{"block_num_or_id":"{value}"}}"#);
+        for ep in [BlockEndpoint::Block, BlockEndpoint::BlockHeader, RAW, BHS] {
+            assert_eq!(by_id(ep, &body(SAMPLE_ID)), Some(true), "{ep:?}");
+            assert_eq!(by_id(ep, r#"{"block_num_or_id":5}"#), Some(false), "{ep:?}");
+            assert_eq!(by_id(ep, &body("5")), Some(false), "{ep:?}");
+            // 64 digits that fit u64 are a number to fc, not an id.
+            let padded = format!("{}5", "0".repeat(63));
+            assert_eq!(by_id(ep, &body(&padded)), Some(false), "{ep:?}");
+        }
+        // Shorter ids, and digits above u64::MAX, are ids where nodeos takes
+        // them as such.
+        assert_eq!(by_id(RAW, &body("0a")), Some(true));
+        assert_eq!(by_id(RAW, &body("99999999999999999999")), Some(true));
+        assert_eq!(by_id(INFO, r#"{"block_num":"5"}"#), Some(false));
     }
 
     // CU2: fc reads any digit string whose value fits u64 as a number,

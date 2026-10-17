@@ -1104,6 +1104,57 @@ async fn an_archived_block_never_ends_on_an_unknown_block_from_a_node_without_ea
     assert!(answer.text().contains("3100002"));
 }
 
+// An id whose first four bytes name an archived block but that is not its
+// id: the archive that holds the block answers Unknown Block, as nodeos
+// does, and that is the answer. Busy would send a retrying client round
+// forever. By number, an archive's Unknown Block for a block it holds is
+// still never the answer.
+#[tokio::test]
+async fn a_wrong_id_of_an_archived_block_gets_the_archives_unknown_block() {
+    let archive = frozen_node("archive-a", (2, 1001), (1, 1001), 4).await;
+    let late = live_node("live-late", 3000, 5000).await;
+    let (_router, port) = start(config(&[archive.frozen((2, 1001)), late.live()], json!({}))).await;
+    wait_served(port, RAW_BLOCK, &raw(500), "archive-a").await;
+    let wrong = hex(&block_id_seeded(500, 7));
+    assert_eq!(&wrong[..8], &hex(&block_id(500))[..8], "names block 500");
+    for (target, body) in [
+        (RAW_BLOCK, format!(r#"{{"block_num_or_id":"{wrong}"}}"#)),
+        (
+            "/v1/chain/get_block_header",
+            format!(r#"{{"block_num_or_id":"{wrong}","include_extensions":false}}"#),
+        ),
+    ] {
+        archive.api.clear_requests();
+        let answer = post(port, target, &body).await;
+        let genuine = direct(&archive, target, &body).await;
+        assert_eq!(genuine.status, 400, "{target}: {}", genuine.text());
+        assert!(genuine.text().contains("3100002"), "{}", genuine.text());
+        assert_eq!(
+            (answer.status, answer.text()),
+            (400, genuine.text()),
+            "{target}"
+        );
+        assert_eq!(archive.hits(target), 2, "{target}: the router's and ours");
+    }
+    // The right id is still served.
+    let right = format!(r#"{{"block_num_or_id":"{}"}}"#, hex(&block_id(500)));
+    assert_eq!(
+        post(port, RAW_BLOCK, &right).await.body,
+        ok("archive-a", 500)
+    );
+    // By number, an archive's Unknown Block for a block it holds breaks its
+    // contract: Busy, and the client retries.
+    archive
+        .api
+        .set_fault(Some(RAW_BLOCK), Some(Fault::UnknownBlock));
+    let answer = post(port, RAW_BLOCK, &raw(500)).await;
+    assert_eq!(
+        (answer.status, answer.text()),
+        (503, NO_UPSTREAM.to_string())
+    );
+    assert_eq!(late.hits(RAW_BLOCK), 0);
+}
+
 // CA19
 #[tokio::test]
 async fn probe_churn_never_changes_the_fleet_view() {

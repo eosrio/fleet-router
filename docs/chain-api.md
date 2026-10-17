@@ -77,7 +77,9 @@ An **irreversible** block goes through candidate tiers:
 
 With [`block_source`](configuration.md#chain-api) `"frozen_first"` (the default) the order is F, L, U, X; with `"live_first"` it is L, F, U, X. `get_block` uses L, U, X. Inside a tier, candidates with a free slot come first, then the lower `priority`, then fewer requests in flight per unit of `weight`, then a hash of the block's 4096-block chunk, so nearby blocks go to the same replica and its page cache stays warm. The list is cut to `max_attempts`. When it holds no live node but a live node is a candidate, and `max_attempts` is at least 2, the last place goes to a live node, so that a real nodeos writes the final error.
 
-For `get_block_info`, `get_block_header` and `get_raw_block`, a block that a frozen range server claims (it is in its served blocks once verified, in its declared `range` before that) exists. Tier X is then left out, and an Unknown Block from any upstream is not kept as the answer: when no attempt serves the block, the client gets another kept answer if there is one (a `404`), else `503 No chain API upstream available`, and can retry.
+For `get_block_info`, `get_block_header` and `get_raw_block`, a block that a frozen range server claims (it is in its served blocks once verified, in its declared `range` before that) exists. Tier X is then left out, and an Unknown Block is not kept as the answer: when no attempt serves the block, the client gets another kept answer if there is one (a `404`), else `503 No chain API upstream available`, and can retry.
+
+A request **by id** is the exception. A verified frozen range server that serves block `n` looks the id up as its own block `n`, and answers Unknown Block when the ids differ. Block `n` is irreversible, so no upstream holds another block `n`: the id names no block, and that Unknown Block is the answer, as on nodeos. By number, an Unknown Block from such a server for a block it serves breaks its contract, so the next candidate is tried as above.
 
 Each attempt's answer decides what happens next:
 
@@ -85,7 +87,7 @@ Each attempt's answer decides what happens next:
 | --- | --- | --- |
 | The connection failed, or no response head within `upstream_timeout_ms` | Next candidate; the API is down until its next good probe | The same |
 | `503` | Next candidate; the API is skipped for 2 s | The same |
-| `400` with nodeos's Unknown Block (`error.code` 3100002) | Final | Next candidate; the answer is kept |
+| `400` with nodeos's Unknown Block (`error.code` 3100002) | Final | Next candidate; the answer is kept. Final from a verified frozen range server that serves the block, for a request by id |
 | `404` | Final | Next candidate; the answer is kept |
 | Anything else | Final | Final |
 
@@ -151,7 +153,7 @@ The router relies on this behaviour of an archive's chain API:
   ```
 
   `last` is the head its SHiP endpoint reports. `blocks` is the half-open range of blocks it serves. `apis` lists the endpoints it serves; without it, none are used. `max_in_flight` caps the requests the router sends it at once.
-- For every block in `blocks`, each listed endpoint answers byte for byte as a nodeos node that holds the block. A block outside `blocks` gets nodeos's Unknown Block (`400`, `error.code` 3100002).
+- For every block in `blocks`, each listed endpoint answers byte for byte as a nodeos node that holds the block. A block outside `blocks` gets nodeos's Unknown Block (`400`, `error.code` 3100002), and so does an id whose first four bytes name a block in `blocks` but that is not that block's id. The router passes that answer on as final.
 - An internal failure answers `503`, so the router tries another candidate. Apart from Unknown Block and `404`, any other status is passed to the client as the answer.
 
 The router sends a frozen range server only block requests for blocks in its `blocks`, on endpoints it lists. It never sends it `get_info`, state, exec, push, or a block request without a block number, and never forwards client requests to `/v1/archive/*`.

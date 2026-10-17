@@ -11,8 +11,10 @@
 //! Reversible blocks go to live nodes only, highest head first, and their
 //! first HTTP answer is final: fork answers must come from one node.
 //! Irreversible blocks go through candidate tiers, and an Unknown Block or a
-//! 404 moves on to the next candidate. When a live node is a candidate, one
-//! attempt is kept for it, so a real nodeos writes the final error.
+//! 404 moves on to the next candidate, unless the block was asked for by an
+//! id that a verified frozen range server holding the block refused. When a
+//! live node is a candidate, one attempt is kept for it, so a real nodeos
+//! writes the final error.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -26,6 +28,7 @@ use crate::models::{BlockSource, Role};
 use crate::ship::Range;
 
 use super::errors::UNKNOWN_BLOCK_CODE;
+use super::hint::Hint;
 use super::route::BlockEndpoint;
 
 /// How long an upstream API that answered 503 is skipped.
@@ -182,7 +185,7 @@ pub fn region(n: u32, fleet_lib: Option<u32>, apis: &[ApiView<'_>]) -> Region {
 pub struct BlockQuery {
     pub endpoint: BlockEndpoint,
     /// The body's routing hint ([`super::hint::hint`]).
-    pub hint: Option<u32>,
+    pub hint: Option<Hint>,
     /// The fleet LIB of the listener's SHiP view.
     pub ship_lib: Option<u32>,
     pub block_source: BlockSource,
@@ -199,20 +202,24 @@ pub enum BlockPlan {
     /// long. Empty when no API is a candidate: the client gets Busy.
     /// `claimed`: an irreversible block a frozen range server claims for
     /// this endpoint ([`claimed`]), so no Unknown Block is the answer
-    /// ([`keeps`]).
+    /// ([`keeps`]), except from one of `id_holders` ([`settles`]).
     Routed {
         n: u32,
         region: Region,
         order: Vec<usize>,
         claimed: bool,
+        /// For a block requested by id, the APIs in `order` whose Unknown
+        /// Block is the answer ([`id_holders`]).
+        id_holders: Vec<usize>,
     },
 }
 
 /// Plan a block request.
 pub fn plan_block(q: &BlockQuery, apis: &[ApiView<'_>]) -> BlockPlan {
-    let Some(n) = q.hint else {
+    let Some(hint) = q.hint else {
         return BlockPlan::Unhinted;
     };
+    let n = hint.num;
     let cap = usize::try_from(q.max_attempts.max(1)).unwrap_or(usize::MAX);
     let region = region(n, fleet_lib(q.ship_lib, apis), apis);
     let (order, claimed) = match region {
@@ -222,12 +229,30 @@ pub fn plan_block(q: &BlockQuery, apis: &[ApiView<'_>]) -> BlockPlan {
             (irreversible_order(n, q, claimed, apis, cap), claimed)
         }
     };
+    let id_holders = if hint.by_id {
+        id_holders(n, &order, apis)
+    } else {
+        Vec::new()
+    };
     BlockPlan::Routed {
         n,
         region,
         order,
         claimed,
+        id_holders,
     }
+}
+
+/// For a block requested by id: the verified frozen APIs in `order` whose
+/// blocks hold `n`. Such an API looks the id up as its own block `n` and
+/// answers Unknown Block when the ids differ. Its block `n` is irreversible,
+/// so no upstream holds another block `n`: the id names no block, and that
+/// Unknown Block is the answer ([`settles`]).
+fn id_holders(n: u32, order: &[usize], apis: &[ApiView<'_>]) -> Vec<usize> {
+    apis.iter()
+        .filter(|a| a.archives(n) && order.contains(&a.index))
+        .map(|a| a.index)
+        .collect()
 }
 
 /// Whether a frozen range server claims block `n` for `endpoint`: an
@@ -637,6 +662,14 @@ pub fn keeps(reason: RetryReason, claimed: bool) -> bool {
     !(claimed && reason == RetryReason::UnknownBlock)
 }
 
+/// Whether an answer [`classify`] moves on from is the final answer after
+/// all: an Unknown Block from one of the plan's `id_holders`, for a block
+/// requested by id. By number, such an API answers every block it holds,
+/// so its Unknown Block there is still retried.
+pub fn settles(reason: RetryReason, id_holder: bool) -> bool {
+    id_holder && reason == RetryReason::UnknownBlock
+}
+
 /// The answer once every attempt is used: the last kept answer from a live
 /// API, else the last kept answer. `None` (nothing kept) means Busy.
 pub fn exhausted<T>(kept: &[(Role, T)]) -> Option<&T> {
@@ -733,7 +766,10 @@ mod tests {
     fn query(endpoint: BlockEndpoint, n: u32) -> BlockQuery {
         BlockQuery {
             endpoint,
-            hint: Some(n),
+            hint: Some(Hint {
+                num: n,
+                by_id: false,
+            }),
             ship_lib: None,
             block_source: BlockSource::FrozenFirst,
             max_attempts: 3,
@@ -1013,6 +1049,73 @@ mod tests {
         assert!(!keeps(RetryReason::UnknownBlock, true));
         assert!(keeps(RetryReason::UnknownBlock, false));
         assert!(keeps(RetryReason::NotFound, true));
+    }
+
+    // An id whose first four bytes name an archived block, but which is not
+    // that block's id: the verified archive that holds the block answers
+    // Unknown Block, and that is the answer, as on nodeos. By number, or
+    // from anyone else, an Unknown Block is still retried.
+    #[test]
+    fn an_unknown_block_by_id_from_a_verified_holder_is_the_answer() {
+        let by_id = |ep, n| BlockQuery {
+            hint: Some(Hint {
+                num: n,
+                by_id: true,
+            }),
+            max_attempts: 8,
+            ..query(ep, n)
+        };
+        let holders = |q: &BlockQuery, apis: &[ApiView<'_>]| match plan_block(q, apis) {
+            BlockPlan::Routed { id_holders, .. } => id_holders,
+            BlockPlan::Unhinted => panic!("unhinted"),
+        };
+        let replicas = [frozen(0, 1, 1001), frozen(1, 1, 1001)];
+        let other = frozen(2, 1001, 2001);
+        let l = live(4, Some(1), 5000, 6000);
+        let apis = [replicas[0], replicas[1], other, l];
+        for ep in [BlockEndpoint::RawBlock, BlockEndpoint::BlockHeader] {
+            let mut h = holders(&by_id(ep, 500), &apis);
+            h.sort_unstable();
+            assert_eq!(h, vec![0, 1], "{ep:?}");
+            // By number: none.
+            let by_number = BlockQuery {
+                max_attempts: 8,
+                ..query(ep, 500)
+            };
+            assert!(holders(&by_number, &apis).is_empty(), "{ep:?}");
+        }
+        // Only APIs the request goes to: not a busy, down or unverified
+        // archive, and never a live node.
+        let busy = ApiView {
+            busy: true,
+            ..replicas[0]
+        };
+        let down = ApiView {
+            up: false,
+            ..replicas[1]
+        };
+        let unverified = ApiView {
+            verified: false,
+            ..frozen(3, 1, 1001)
+        };
+        let raw_id = by_id(BlockEndpoint::RawBlock, 500);
+        assert!(holders(&raw_id, &[busy, down, unverified, l]).is_empty());
+        assert_eq!(holders(&raw_id, &[busy, replicas[1], l]), vec![1]);
+        // get_block is the live nodes' alone.
+        assert!(holders(&by_id(BlockEndpoint::Block, 500), &apis).is_empty());
+        // Outside every archive: none.
+        assert!(holders(&by_id(BlockEndpoint::RawBlock, 3000), &apis).is_empty());
+
+        assert!(settles(RetryReason::UnknownBlock, true));
+        assert!(!settles(RetryReason::UnknownBlock, false));
+        for reason in [
+            RetryReason::NotFound,
+            RetryReason::Busy,
+            RetryReason::Connect,
+            RetryReason::Timeout,
+        ] {
+            assert!(!settles(reason, true), "{reason:?}");
+        }
     }
 
     // Once an archive is verified, its `blocks` are its exact claim: a
@@ -1348,6 +1451,7 @@ mod tests {
                 region: Region::Reversible,
                 order: vec![],
                 claimed: false,
+                id_holders: vec![],
             }
         );
     }

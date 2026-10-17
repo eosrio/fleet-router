@@ -67,8 +67,8 @@ use directory::{ApiDirectory, ApiSlot, Snapshot};
 use errors::{Busy, RouterError, OPTIONS_BODY};
 use pick::{
     classify, exhausted, info_order, info_primary, keeps, needs_peek, next_attempt, plan_block,
-    push_targets, state_order, Answer, ApiView, BlockPlan, BlockQuery, NextAttempt, Outcome,
-    Region, RetryReason, StateQuery, PEEK_LIMIT,
+    push_targets, settles, state_order, Answer, ApiView, BlockPlan, BlockQuery, NextAttempt,
+    Outcome, Region, RetryReason, StateQuery, PEEK_LIMIT,
 };
 use route::{BlockEndpoint, Route};
 use socket::Socket;
@@ -213,11 +213,16 @@ fn busy(why: Busy) -> Response<ApiBody> {
 
 /// How the attempts of one request move on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Policy {
+enum Policy<'a> {
     /// A hinted block request in a region ([`classify`]). `claimed`: a
     /// frozen range server claims the block, so no Unknown Block is kept
-    /// as the answer ([`keeps`]).
-    Block { region: Region, claimed: bool },
+    /// as the answer ([`keeps`]). An Unknown Block from one of `id_holders`
+    /// is the answer ([`settles`]).
+    Block {
+        region: Region,
+        claimed: bool,
+        id_holders: &'a [usize],
+    },
     /// State calls and unhinted block bodies: a transport failure or a 503
     /// moves on, any other answer is final.
     State,
@@ -667,6 +672,7 @@ impl ChainApiCtx {
                 region,
                 order,
                 claimed,
+                id_holders,
             } => {
                 drop(views);
                 let answered = if order.is_empty() {
@@ -675,7 +681,11 @@ impl ChainApiCtx {
                     self.attempts(
                         call,
                         &order,
-                        Policy::Block { region, claimed },
+                        Policy::Block {
+                            region,
+                            claimed,
+                            id_holders: &id_holders,
+                        },
                         Busy::NoUpstream,
                         deadline,
                         permit,
@@ -730,7 +740,7 @@ impl ChainApiCtx {
         &self,
         call: &Call,
         path: &str,
-        policy: Policy,
+        policy: Policy<'_>,
         deadline: Instant,
         permit: &mut Option<RequestPermit>,
     ) -> Answered {
@@ -758,7 +768,7 @@ impl ChainApiCtx {
         &self,
         call: &Call,
         order: &[usize],
-        policy: Policy,
+        policy: Policy<'_>,
         exhausted_why: Busy,
         deadline: Instant,
         permit: &mut Option<RequestPermit>,
@@ -844,9 +854,13 @@ impl ChainApiCtx {
                 }
             };
             let status = response.status().as_u16();
-            let (region, claimed) = match policy {
-                Policy::Block { region, claimed } => (region, claimed),
-                Policy::State | Policy::Info | Policy::Exec => (Region::Reversible, false),
+            let (region, claimed, id_holders) = match policy {
+                Policy::Block {
+                    region,
+                    claimed,
+                    id_holders,
+                } => (region, claimed, id_holders),
+                Policy::State | Policy::Info | Policy::Exec => (Region::Reversible, false, &[][..]),
             };
             let more = order.iter().any(|i| !tried.contains(i));
             // get_info fails over on any 5xx while another node may answer.
@@ -935,6 +949,15 @@ impl ChainApiCtx {
                 }
                 Outcome::Next { reason, keep } => {
                     slot.results.inc(result_of(status, Some(reason)));
+                    if settles(reason, id_holders.contains(&slot.index)) {
+                        // An archive that holds the block refused the id:
+                        // no upstream holds a block with that id.
+                        return self.answered(
+                            buffered.into_response(self.hold(permit, Some(guard))),
+                            &slot,
+                            tried.len(),
+                        );
+                    }
                     self.moved_on(&slot, reason, false);
                     if keep && keeps(reason, claimed) {
                         kept.push((slot.role, buffered));

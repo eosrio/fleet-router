@@ -4,14 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>fleet-router: Antelope SHiP reverse proxy and load balancer</title>
-  <meta name="description" content="fleet-router is a Rust reverse proxy and load balancer for Antelope SHiP WebSockets. One endpoint for Hyperion, Atomic and other indexers, with mid-stream failover, block de-duplication and multi-network listeners. By EOS Rio and Rio Blocks.">
+  <meta name="description" content="fleet-router is a Rust reverse proxy and load balancer for Antelope SHiP WebSockets. One endpoint for Hyperion, Atomic and other indexers, with mid-stream failover, block de-duplication, multi-network listeners and an opt-in live dashboard. By EOS Rio and Rio Blocks.">
   <meta name="color-scheme" content="dark light">
   <meta name="theme-color" content="#050505" media="(prefers-color-scheme: dark)">
   <meta name="theme-color" content="#f6f6f3" media="(prefers-color-scheme: light)">
   <link rel="canonical" href="https://eosrio.github.io/fleet-router/">
   <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
   <meta property="og:title" content="fleet-router: Antelope SHiP load balancer">
-  <meta property="og:description" content="One WebSocket in front of the whole SHiP fleet. Range-aware routing, transparent failover, multi-network listeners, Prometheus metrics.">
+  <meta property="og:description" content="One WebSocket in front of the whole SHiP fleet. Range-aware routing, transparent failover, multi-network listeners, a live dashboard and Prometheus metrics.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://eosrio.github.io/fleet-router/">
   <meta property="og:site_name" content="fleet-router">
@@ -53,6 +53,7 @@
         <a href="#install">Install</a>
         <a href="#config">Config</a>
         <a href="#metrics">Metrics</a>
+        <a href="#dashboard">Dashboard</a>
       </nav>
       <div class="mast-actions">
         <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Switch to light theme" title="Theme">
@@ -73,7 +74,7 @@
         <figure class="panel" id="panel">
           <div class="panel-plate">
             <span class="plate-name">fleet-router</span>
-            <span class="plate-meta">listener <code>eos</code> · <code>0.0.0.0:17000</code> · <code>v0.5.0</code></span>
+            <span class="plate-meta">listener <code>eos</code> · <code>0.0.0.0:17000</code> · <code>v0.6.0</code></span>
           </div>
           <ul class="panel-legend" aria-label="Panel states">
             <li><i class="key key-set"></i>route set</li>
@@ -130,11 +131,11 @@
           </li>
           <li>
             <h3>Route</h3>
-            <p>Selection prefers an upstream whose trace range covers the requested block, then the least-loaded healthy node. A <code>get_blocks_request_v1</code> with <code>fetch_finality_data</code> only goes to a node whose finality range covers that block.</p>
+            <p>Selection prefers an upstream whose trace range covers the requested block, then the lowest <code>priority</code> tier, then the fewest connections per unit of <code>weight</code>. A <code>get_blocks_request_v1</code> with <code>fetch_finality_data</code> only goes to a node whose finality range covers that block.</p>
           </li>
           <li>
             <h3>Fail over</h3>
-            <p>When the active upstream drops, the client socket stays open. The router re-sends the in-flight <code>get_blocks</code> from the next block on another suitable node and replays the client frames buffered during the swap.</p>
+            <p>When the active upstream closes, errors or goes silent, the client socket stays open. A quiet upstream is pinged and abandoned if nothing comes back within 4 s. The router re-sends the in-flight <code>get_blocks</code> from the next block on another suitable node and replays the client frames buffered during the swap.</p>
           </li>
           <li>
             <h3>De-duplicate</h3>
@@ -157,14 +158,18 @@
         <dl class="legend">
           <div><dt>Single resilient endpoint<small><i class="key key-set"></i><code>ws://router:17000</code></small></dt><dd>Hyperion, Atomic and other indexers share one WebSocket instead of each consumer pinning itself to one SHiP node.</dd></div>
           <div><dt>Range-aware least-connections<small><code>trace_begin_block … trace_end_block</code></small></dt><dd>Prefers an upstream whose trace range covers the requested block, then the least-loaded healthy node. Finality-data requests go only to a node whose finality range covers that block.</dd></div>
-          <div><dt>Transparent failover<small><i class="key key-failover"></i><code>resume at next block</code></small></dt><dd>On upstream loss the router reconnects to another suitable node, resumes <code>get_blocks</code> at the next block, de-duplicates replayed blocks and replays buffered client frames.</dd></div>
+          <div><dt>Upstream preference<small><code>priority · weight</code></small></dt><dd>Among nodes that can serve a request equally well, the router uses the lowest <code>priority</code> tier, then the fewest connections per unit of <code>weight</code>. A high priority makes a node a last resort, and failover still moves off a failed preferred node to a backup that covers the block.</dd></div>
+          <div><dt>Transparent failover<small><i class="key key-failover"></i><code>resume at next block</code></small></dt><dd>On upstream loss the router reconnects to another suitable node, resumes <code>get_blocks</code> at the next block, de-duplicates replayed blocks and replays buffered client frames. That includes a node that goes silent without closing the connection, such as a pulled cable or a frozen VM: a quiet upstream is pinged and abandoned after <code>upstream_liveness_timeout_ms</code> (4 s by default).</dd></div>
           <div><dt>Stale-upstream deprioritization<small><i class="key key-stale"></i><code>upstream_stale = 1</code></small></dt><dd>An upstream that stops advancing its chain state is flagged stale and deprioritized when routing. It is not hard-excluded.</dd></div>
           <div><dt>Many networks, one process<small><code>listeners[] · /ready/&lt;name&gt;</code></small></dt><dd><code>listeners</code> serves each chain on its own port with its own upstream pool, <code>chain_id</code>, connection cap and <code>/ready/&lt;name&gt;</code> check.</dd></div>
           <div><dt><code>chain_id</code> verification<small><i class="key key-offline"></i><code>require_chain_id</code></small></dt><dd>An upstream whose reported <code>chain_id</code> disagrees with the pin or the rest of its pool stays offline. Nodes that omit <code>chain_id</code>, such as FIO and other EOSIO 2.0 builds, stay usable unless <code>require_chain_id</code> is set.</dd></div>
           <div><dt>Bounded failover and quarantine<small><i class="key key-quarantine"></i><code>block_failure_quarantine</code></small></dt><dd>Repeated unclean drops at the same next block are bounded: the session closes with code 1011 after five. Opt-in <code>block_failure_quarantine</code> skips a corrupted SHiP log range without marking the node offline.</dd></div>
+          <div><dt>Live dashboard<small><code>/ui/ · /status · /api/v1</code></small></dt><dd>Opt-in fleet view with block ranges, sessions, throughput, failovers and an event log, plus a no-JavaScript status page and a JSON API with a server-sent events stream. Off by default.</dd></div>
+          <div><dt>Operator controls<small><code>drain · disable · move</code></small></dt><dd>With a control token set, drain an upstream for maintenance, disable or enable it, change its priority and weight at runtime, clear its quarantines, or move a single session. A drain uses the normal failover, so clients stay connected.</dd></div>
           <div><dt>Prometheus metrics<small><code>/metrics · server, endpoint, listener</code></small></dt><dd>Per-upstream series carry <code>server</code> and <code>endpoint</code> labels, plus <code>listener</code> in multi-listener mode, with gauges for the start and end of each SHiP range.</dd></div>
           <div><dt>Upstream <code>wss://</code><small><code>wss://host:port</code></small></dt><dd>Optional TLS to SHiP nodes, verified with rustls against the OS trust store. A bare <code>host:port</code> stays <code>ws://</code>. The client listener remains plaintext.</dd></div>
           <div><dt>Resource safety<small><code>max_connections · idle_timeout_ms</code></small></dt><dd>Connection cap, handshake and idle timeouts, and a bounded maximum WebSocket message size.</dd></div>
+          <div><dt>Runs as a service<small><code>systemd · Docker · launchd</code></small></dt><dd>Ships systemd units for one process or one process per network, with a raised open-file limit and basic sandboxing. The operations guide also covers the Docker restart policy, launchd on macOS and a service wrapper on Windows.</dd></div>
           <div><dt>Graceful shutdown<small><code>SIGINT · SIGTERM</code></small></dt><dd>Handles <code>SIGINT</code> and <code>SIGTERM</code> with a bounded drain and WebSocket close frames to connected clients. Written in Rust on tokio and tokio-tungstenite; ABI checks use pure-Rust <code>rs_abieos</code>, so <code>libclang</code> is not required.</dd></div>
         </dl>
       </div>
@@ -240,10 +245,11 @@
             </div>
           </li>
         </ol>
+        <p class="after-terminal">To keep it running across reboots, install the systemd unit from <code>deploy/</code>. See <a href="https://github.com/eosrio/fleet-router/blob/main/docs/operations.md#run-as-a-service">Run as a service</a> for systemd, Docker, launchd and Windows.</p>
 
         <aside class="notice" aria-label="Security notice">
           <i class="key key-failover" aria-hidden="true"></i>
-          <p><strong>Do not expose fleet-router directly to the public internet.</strong> The client listener is plaintext <code>ws://</code> and unauthenticated. Terminate TLS and add access control on a reverse proxy in front of it.</p>
+          <p><strong>Do not expose fleet-router directly to the public internet.</strong> The client listener is plaintext <code>ws://</code> and unauthenticated. Terminate TLS and add access control on a reverse proxy in front of it. Keep <code>metrics_port</code>, and the dashboard it can serve, on a private network.</p>
         </aside>
       </div>
     </section>
@@ -273,7 +279,8 @@
       "chain_id": "aca376f206b8fc25a6ed44dbdc66547c36c6c33e3a119ffbeaef943642f0e906",
       "servers": [
         { "name": "EOS SHiP 1", "endpoint": "10.0.1.10:8080", "enabled": true },
-        { "name": "EOS SHiP 2", "endpoint": "10.0.1.11:8080", "enabled": true }
+        { "name": "EOS SHiP 2", "endpoint": "10.0.1.11:8080", "enabled": true, "weight": 2 },
+        { "name": "EOS SHiP backup", "endpoint": "10.0.1.12:8080", "enabled": true, "priority": 10 }
       ]
     },
     {
@@ -292,8 +299,9 @@
             <div><dt><code>listeners[]</code></dt><dd>One ingress port per network, each with an isolated upstream pool and its own <code>/ready/&lt;name&gt;</code>.</dd></div>
             <div><dt><code>chain_id</code></dt><dd>Upstreams reporting a different <code>chain_id</code> are kept offline. Older nodes that omit it stay usable unless <code>require_chain_id</code> is set.</dd></div>
             <div><dt><code>endpoint</code></dt><dd>A bare <code>host:port</code> is dialed as <code>ws://</code>. Use <code>wss://host:port</code> when the node serves TLS.</dd></div>
+            <div><dt><code>priority</code> · <code>weight</code></dt><dd>Optional per server. Lower <code>priority</code> is preferred (default <code>0</code>); <code>weight</code> (default <code>1</code>) shares load within a tier. Here SHiP 2 takes twice the sessions of SHiP 1, and the backup serves only when neither can.</dd></div>
             <div><dt><code>*_ms</code> intervals</dt><dd>Reconnect, monitoring and status polling. Lower values detect failures faster at the cost of more polling traffic.</dd></div>
-            <div><dt><code>metrics_port</code></dt><dd>Enables the HTTP endpoint for <code>/health</code>, <code>/ready</code> and <code>/metrics</code>. Omit it to run without one.</dd></div>
+            <div><dt><code>metrics_port</code></dt><dd>Enables the HTTP endpoint for <code>/health</code>, <code>/ready</code> and <code>/metrics</code>, and for the <a href="#dashboard">dashboard</a> when it is enabled. Omit it to run without one.</dd></div>
             <div><dt>Single-port mode</dt><dd>Replace <code>listeners</code> with top-level <code>listen_port</code> and <code>servers</code> for one chain. The two modes are mutually exclusive.</dd></div>
           </dl>
         </div>
@@ -304,7 +312,7 @@
       <div class="wrap">
         <div class="section-head">
           <h2 id="metrics-title">Health and metrics</h2>
-          <p>Set <code>metrics_port</code> and the same five states the panel shows become HTTP answers and Prometheus series.</p>
+          <p>Set <code>metrics_port</code> and the five states the panel shows, plus operator-disabled, become HTTP answers and Prometheus series.</p>
         </div>
         <div class="metrics">
           <table class="endpoints">
@@ -312,9 +320,10 @@
             <thead><tr><th scope="col">Endpoint</th><th scope="col">Answer</th></tr></thead>
             <tbody>
               <tr><th scope="row"><code>/health</code></th><td>200 while the process is running.</td></tr>
-              <tr><th scope="row"><code>/ready</code></th><td>200 when at least one upstream is online. In multi-listener mode, when every listener has one. Otherwise 503.</td></tr>
+              <tr><th scope="row"><code>/ready</code></th><td>200 when at least one upstream is online and not disabled by an operator. In multi-listener mode, when every listener has one. Otherwise 503.</td></tr>
               <tr><th scope="row"><code>/ready/&lt;name&gt;</code></th><td>200 or 503 for that listener, or 404 if the name is unknown.</td></tr>
               <tr><th scope="row"><code>/metrics</code></th><td>Prometheus text exposition of router and upstream state.</td></tr>
+              <tr><th scope="row"><code>/ui/</code><br><code>/status</code><br><code>/api/v1</code></th><td>The <a href="#dashboard">dashboard</a>, status page and JSON API, only with <code>dashboard.enabled</code>.</td></tr>
             </tbody>
           </table>
           <div class="series">
@@ -331,7 +340,10 @@ fleet_router_upstream_finality_data_begin_block{endpoint,server}
 fleet_router_upstream_finality_data_end_block{endpoint,server}
 fleet_router_upstream_block_failures_total{endpoint,server}
 fleet_router_upstream_quarantined{endpoint,server}
-fleet_router_upstream_quarantine_block{endpoint,server}</code></pre>
+fleet_router_upstream_quarantine_block{endpoint,server}
+fleet_router_upstream_operator_disabled{endpoint,server}
+fleet_router_upstream_priority{endpoint,server}
+fleet_router_upstream_weight{endpoint,server}</code></pre>
           </div>
           <dl class="states">
             <div><dt><i class="key key-set"></i>route set</dt><dd><code>upstream_up</code> is 1 and the stream is on this node.</dd></div>
@@ -339,9 +351,45 @@ fleet_router_upstream_quarantine_block{endpoint,server}</code></pre>
             <div><dt><i class="key key-stale"></i>stale</dt><dd><code>upstream_stale</code> is 1: chain state stopped advancing. Deprioritized, still online.</dd></div>
             <div><dt><i class="key key-offline"></i>offline</dt><dd><code>upstream_up</code> is 0: unreachable, a missed status deadline, or a <code>chain_id</code> mismatch.</dd></div>
             <div><dt><i class="key key-quarantine"></i>quarantined</dt><dd><code>upstream_quarantined</code> is 1 and <code>quarantine_block</code> names the skipped block. Online for every other range.</dd></div>
+            <div><dt><i class="key key-disabled"></i>disabled</dt><dd><code>upstream_operator_disabled</code> is 1: drained or disabled through the control API. Takes no new sessions until enabled.</dd></div>
           </dl>
         </div>
         <p class="logging">Logging is <code>tracing</code>, controlled with <code>RUST_LOG</code> (default <code>info</code>).</p>
+      </div>
+    </section>
+
+    <section class="section" id="dashboard" aria-labelledby="dashboard-title">
+      <div class="wrap">
+        <div class="section-head">
+          <h2 id="dashboard-title">Live dashboard and controls</h2>
+          <p>Opt-in. Set <code>dashboard.enabled</code> and the metrics port also serves a live fleet view, a plain status page and a JSON API. Add a control token to manage the fleet from the same page.</p>
+        </div>
+        <figure class="shot">
+          <img class="shot-dark" src="assets/img/dashboard-dark.webp" width="1280" height="556" loading="lazy" decoding="async" alt="The fleet-router dashboard listing four upstreams with their block ranges, priority and weight, sessions, throughput, head and failovers.">
+          <img class="shot-light" src="assets/img/dashboard-light.webp" width="1280" height="556" loading="lazy" decoding="async" alt="The fleet-router dashboard listing four upstreams with their block ranges, priority and weight, sessions, throughput, head and failovers.">
+          <figcaption>Four upstreams on one listener. Each row shows the node's trace range up to the head, its priority and weight, sessions, throughput and failovers. The Sessions and Events tabs list every client stream and the router's event log.</figcaption>
+        </figure>
+        <div class="config">
+          <div class="codeblock">
+            <div class="codeblock-bar">
+              <span>config.json</span>
+              <button type="button" class="copy" data-copy-target="dashboard-json" aria-label="Copy the dashboard config"><span class="copy-label"><span>Copy</span><span>Copied</span><span>Failed</span></span></button>
+            </div>
+            <pre tabindex="0"><code id="dashboard-json">"metrics_address": "127.0.0.1",
+"metrics_port": 9090,
+"dashboard": {
+  "enabled": true,
+  "control_token_file": "/etc/fleet-router/control.token"
+}</code></pre>
+          </div>
+          <dl class="config-notes">
+            <div><dt>Drain</dt><dd>Moves live sessions off an upstream with the normal failover, so clients stay connected. A session moves only to a node whose range covers its next block, so draining the only archive node leaves its history readers in place.</dd></div>
+            <div><dt>Disable, enable, tune</dt><dd>Take an upstream out of rotation, bring it back, change its priority and weight, or clear its quarantines. Runtime changes are not written back to the config.</dd></div>
+            <div><dt>Move or close a session</dt><dd>Send one client stream to another upstream at its next block, or close it.</dd></div>
+            <div><dt>Access</dt><dd>Read views need no token. Controls need the bearer token from <code>control_token_file</code> or <code>FLEET_ROUTER_CONTROL_TOKEN</code>. Dashboard routes answer only to an IP address, <code>localhost</code> or a name in <code>allowed_hosts</code>, which blocks DNS rebinding.</dd></div>
+          </dl>
+        </div>
+        <p class="logging">The full contract is in the <a href="https://github.com/eosrio/fleet-router/blob/main/docs/api.md">API reference</a>.</p>
       </div>
     </section>
   </main>

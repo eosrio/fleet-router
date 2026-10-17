@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
-use crate::models::ServerStateDb;
+use crate::models::{Role, ServerStateDb};
 
 /// Health and metrics state for a single ingress listener.
 #[derive(Clone)]
@@ -244,6 +244,7 @@ struct MetricSnapshot {
     stale: bool,
     connections: usize,
     trace_begin_block: u32,
+    trace_end_block: u32,
     chain_state_begin_block: u32,
     chain_state_end_block: u32,
     finality_data_begin_block: u32,
@@ -251,6 +252,13 @@ struct MetricSnapshot {
     block_failures: u64,
     quarantined: bool,
     quarantine_block: u32,
+    role: Role,
+    head_block: u32,
+    lib_block: u32,
+    ranges_known: bool,
+    /// Fingerprint (16 hex) and compatibility of the monitor's ABI, if seen.
+    abi: Option<(String, bool)>,
+    range_mismatch: bool,
 }
 
 async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
@@ -265,6 +273,7 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
                 stale: state.stale,
                 connections: state.connections.load(Ordering::Relaxed),
                 trace_begin_block: state.trace_begin_block,
+                trace_end_block: state.trace_end_block,
                 chain_state_begin_block: state.chain_state_begin_block,
                 chain_state_end_block: state.chain_state_end_block,
                 finality_data_begin_block: state.finality_data_begin_block,
@@ -272,6 +281,12 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
                 block_failures: state.block_failures,
                 quarantined: state.any_quarantine_active(now),
                 quarantine_block: state.active_quarantine_block(now).unwrap_or(0),
+                role: state.role,
+                head_block: state.head.map_or(0, |head| head.num),
+                lib_block: state.lib.map_or(0, |lib| lib.num),
+                ranges_known: state.ranges_usable(),
+                abi: state.abi.as_ref().map(|abi| (abi.fp_hex(), abi.compatible)),
+                range_mismatch: state.range_mismatch(),
             });
         }
     }
@@ -321,6 +336,15 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
         out.push_str(&format!(
             "fleet_router_upstream_trace_begin_block{{{}}} {}\n",
             s.labels, s.trace_begin_block
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_trace_end_block One past the last block with trace data reported by an upstream (0 until a status result arrives).\n");
+    out.push_str("# TYPE fleet_router_upstream_trace_end_block gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_trace_end_block{{{}}} {}\n",
+            s.labels, s.trace_end_block
         ));
     }
 
@@ -388,6 +412,77 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
         ));
     }
 
+    out.push_str("# HELP fleet_router_upstream_head_block Head block reported by an upstream (0 until a status result arrives).\n");
+    out.push_str("# TYPE fleet_router_upstream_head_block gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_head_block{{{}}} {}\n",
+            s.labels, s.head_block
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_lib_block Last irreversible block reported by an upstream (0 until a status result arrives).\n");
+    out.push_str("# TYPE fleet_router_upstream_lib_block gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_lib_block{{{}}} {}\n",
+            s.labels, s.lib_block
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_info Configured role of an upstream (always 1).\n");
+    out.push_str("# TYPE fleet_router_upstream_info gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_info{{{},role=\"{}\"}} 1\n",
+            s.labels,
+            s.role.as_str()
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_ranges_known Whether an upstream's block ranges are known (1): reported at least once, or declared by a frozen server.\n");
+    out.push_str("# TYPE fleet_router_upstream_ranges_known gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_ranges_known{{{}}} {}\n",
+            s.labels,
+            u8::from(s.ranges_known)
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_range_mismatch Whether a frozen server's reported trace or chain-state range differs from its declared range (1) or not (0).\n");
+    out.push_str("# TYPE fleet_router_upstream_range_mismatch gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_range_mismatch{{{}}} {}\n",
+            s.labels,
+            u8::from(s.range_mismatch)
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_abi_info Fingerprint of the ABI an upstream sent its monitor (always 1; absent until an ABI arrives).\n");
+    out.push_str("# TYPE fleet_router_upstream_abi_info gauge\n");
+    for s in &snapshots {
+        if let Some((fingerprint, _)) = &s.abi {
+            out.push_str(&format!(
+                "fleet_router_upstream_abi_info{{{},fingerprint=\"{fingerprint}\"}} 1\n",
+                s.labels
+            ));
+        }
+    }
+
+    out.push_str("# HELP fleet_router_upstream_abi_compatible Whether an upstream ABI's request and result variants are a prefix of Spring's (1) or not (0). Absent until an ABI arrives.\n");
+    out.push_str("# TYPE fleet_router_upstream_abi_compatible gauge\n");
+    for s in &snapshots {
+        if let Some((_, compatible)) = &s.abi {
+            out.push_str(&format!(
+                "fleet_router_upstream_abi_compatible{{{}}} {}\n",
+                s.labels,
+                u8::from(*compatible)
+            ));
+        }
+    }
+
     out
 }
 
@@ -412,6 +507,7 @@ mod tests {
             name: "s1".to_string(),
             endpoint: "127.0.0.1:18080".to_string(),
             enabled: true,
+            ..Default::default()
         }]);
         let listeners = vec![ListenerHealthState {
             name: None,
@@ -447,11 +543,13 @@ mod tests {
             name: "eos-1".to_string(),
             endpoint: "127.0.0.1:18080".to_string(),
             enabled: true,
+            ..Default::default()
         }]);
         let db_wax = build_state_db(vec![Server {
             name: "wax-1".to_string(),
             endpoint: "127.0.0.1:28080".to_string(),
             enabled: true,
+            ..Default::default()
         }]);
 
         db_eos
@@ -520,11 +618,13 @@ mod tests {
             name: nasty.to_string(),
             endpoint: "127.0.0.1:18080".to_string(),
             enabled: true,
+            ..Default::default()
         }]);
         let named = build_state_db(vec![Server {
             name: "wax node".to_string(),
             endpoint: "10.0.0.2:8080".to_string(),
             enabled: true,
+            ..Default::default()
         }]);
         {
             let mut db = legacy.lock().await;
@@ -585,6 +685,7 @@ mod tests {
             name: "eos-1".to_string(),
             endpoint: "127.0.0.1:18080".to_string(),
             enabled: true,
+            ..Default::default()
         }]);
         db_eos
             .lock()
@@ -649,11 +750,13 @@ mod tests {
             name: "s1".to_string(),
             endpoint: "127.0.0.1:18080".to_string(),
             enabled: true,
+            ..Default::default()
         }]);
         let named = build_state_db(vec![Server {
             name: "wax-1".to_string(),
             endpoint: "127.0.0.1:28080".to_string(),
             enabled: true,
+            ..Default::default()
         }]);
         {
             let mut db = legacy.lock().await;
@@ -769,11 +872,13 @@ mod tests {
                 name: "bad".to_string(),
                 endpoint: "127.0.0.1:18080".to_string(),
                 enabled: true,
+                ..Default::default()
             },
             Server {
                 name: "good".to_string(),
                 endpoint: "127.0.0.1:18081".to_string(),
                 enabled: true,
+                ..Default::default()
             },
         ]);
         {
@@ -840,5 +945,127 @@ mod tests {
         )));
         assert!(!metrics.contains("block=\"115\""));
         assert!(metrics.contains("fleet_router_upstream_up{"));
+    }
+
+    #[tokio::test]
+    async fn role_tip_range_and_abi_series_render_per_upstream() {
+        use std::sync::Arc;
+
+        use crate::abi::AbiEntry;
+        use crate::models::Role;
+        use crate::ship::{BlockPos, Range};
+
+        let db = build_state_db(vec![
+            Server {
+                name: "live".to_string(),
+                endpoint: "127.0.0.1:18080".to_string(),
+                enabled: true,
+                ..Default::default()
+            },
+            Server {
+                name: "archive".to_string(),
+                endpoint: "127.0.0.1:18081".to_string(),
+                enabled: true,
+                role: Role::Frozen,
+                range: Some(Range {
+                    begin: 2,
+                    end: 1001,
+                }),
+                ..Default::default()
+            },
+        ]);
+        let abi = Arc::new(AbiEntry::new(include_str!(
+            "../mock-ship/src/ship_abi.json"
+        )));
+        {
+            let mut guard = db.lock().await;
+            let live = guard.get_mut("127.0.0.1:18080").unwrap();
+            live.online = true;
+            live.ranges_known = true;
+            live.trace_begin_block = 900;
+            live.trace_end_block = 2301;
+            live.head = Some(BlockPos {
+                num: 2300,
+                id: [1; 32],
+            });
+            live.lib = Some(BlockPos {
+                num: 2290,
+                id: [2; 32],
+            });
+            live.abi = Some(abi.clone());
+            // The archive has not reported yet: its declared range counts as
+            // known, and a mismatch cannot be judged.
+        }
+        let listeners_for = |name: Option<&str>| {
+            vec![ListenerHealthState {
+                name: name.map(str::to_string),
+                state_db: db.clone(),
+            }]
+        };
+
+        for listener in [None, Some("main")] {
+            let metrics = render_metrics(&listeners_for(listener)).await;
+            let prefix = listener
+                .map(|name| format!("listener=\"{name}\","))
+                .unwrap_or_default();
+            let live = format!("{prefix}endpoint=\"127.0.0.1:18080\",server=\"live\"");
+            let archive = format!("{prefix}endpoint=\"127.0.0.1:18081\",server=\"archive\"");
+            for line in [
+                format!("fleet_router_upstream_trace_end_block{{{live}}} 2301\n"),
+                format!("fleet_router_upstream_trace_end_block{{{archive}}} 0\n"),
+                format!("fleet_router_upstream_head_block{{{live}}} 2300\n"),
+                format!("fleet_router_upstream_lib_block{{{live}}} 2290\n"),
+                format!("fleet_router_upstream_head_block{{{archive}}} 0\n"),
+                format!("fleet_router_upstream_lib_block{{{archive}}} 0\n"),
+                format!("fleet_router_upstream_info{{{live},role=\"live\"}} 1\n"),
+                format!("fleet_router_upstream_info{{{archive},role=\"frozen\"}} 1\n"),
+                format!("fleet_router_upstream_ranges_known{{{live}}} 1\n"),
+                format!("fleet_router_upstream_ranges_known{{{archive}}} 1\n"),
+                format!("fleet_router_upstream_range_mismatch{{{live}}} 0\n"),
+                format!("fleet_router_upstream_range_mismatch{{{archive}}} 0\n"),
+                format!(
+                    "fleet_router_upstream_abi_info{{{live},fingerprint=\"{}\"}} 1\n",
+                    abi.fp_hex()
+                ),
+                format!("fleet_router_upstream_abi_compatible{{{live}}} 1\n"),
+            ] {
+                assert!(metrics.contains(&line), "missing {line} in:\n{metrics}");
+            }
+            for name in [
+                "fleet_router_upstream_trace_end_block",
+                "fleet_router_upstream_head_block",
+                "fleet_router_upstream_lib_block",
+                "fleet_router_upstream_info",
+                "fleet_router_upstream_ranges_known",
+                "fleet_router_upstream_range_mismatch",
+                "fleet_router_upstream_abi_info",
+                "fleet_router_upstream_abi_compatible",
+            ] {
+                assert!(
+                    metrics.contains(&format!("# TYPE {name} gauge\n")),
+                    "missing TYPE for {name}"
+                );
+            }
+            assert!(
+                !metrics.contains(&format!("fleet_router_upstream_abi_info{{{archive}")),
+                "no ABI series before the archive's monitor saw one"
+            );
+            assert!(!metrics.contains(&format!("fleet_router_upstream_abi_compatible{{{archive}")));
+        }
+
+        // The archive reports a range that differs from its declaration.
+        {
+            let mut guard = db.lock().await;
+            let archive = guard.get_mut("127.0.0.1:18081").unwrap();
+            archive.ranges_known = true;
+            archive.trace_begin_block = 2;
+            archive.trace_end_block = 900;
+            archive.chain_state_begin_block = 2;
+            archive.chain_state_end_block = 900;
+        }
+        let metrics = render_metrics(&listeners_for(None)).await;
+        assert!(metrics.contains(
+            "fleet_router_upstream_range_mismatch{endpoint=\"127.0.0.1:18081\",server=\"archive\"} 1\n"
+        ));
     }
 }

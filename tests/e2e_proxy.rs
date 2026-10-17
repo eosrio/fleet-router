@@ -667,8 +667,12 @@ async fn e2e_proxy_load_balancing_distribution() {
         sleep(Duration::from_millis(50)).await;
     }
 
-    let count_3000 = clients.iter().filter(|(_, _, h)| *h == 3000).count() as u32;
-    let count_4000 = clients.iter().filter(|(_, _, h)| *h == 4000).count() as u32;
+    // The router answers status from the fleet view, so every reply carries
+    // the fleet head. Each upstream's share is its open connections instead,
+    // minus the router's monitor connection.
+    assert!(clients.iter().all(|(_, _, h)| *h == 4000));
+    let count_3000 = h1.connection_count().await.saturating_sub(1);
+    let count_4000 = h2.connection_count().await.saturating_sub(1);
 
     println!(
         "  Distribution: upstream-3000={}, upstream-4000={} (of {})",

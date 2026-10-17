@@ -29,18 +29,16 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::Instrument;
 
 use crate::config_sample::CONFIG_SAMPLE;
-use crate::connection_handler::handle_client;
 use crate::fleet::FleetHub;
 use crate::models::{
     build_config_db, build_state_db_with_chain_id, format_bind_addr, ServerConfig, ServerConfigDb,
     ServerStateDb, StaticConfig,
 };
+use crate::session::{handle_client, ListenerCtx};
 use crate::tasks::{monitoring_connection, state_monitoring_loop, upstream_ws_config};
 
 mod abi;
 mod config_sample;
-mod connection_handler;
-mod errors;
 mod fleet;
 mod functions;
 mod health;
@@ -178,6 +176,9 @@ async fn main() -> Result<()> {
             ));
         }
 
+        // What every client session of this listener shares.
+        let ctx = ListenerCtx::new(&listener_cfg, limits, config.live_lag_blocks, hub.clone());
+
         // Periodic block-progress / staleness monitor for this listener's pool.
         spawn(state_monitoring_loop(
             hub,
@@ -218,8 +219,7 @@ async fn main() -> Result<()> {
 
                         tracing::debug!(%client_addr, "accepted tcp connection");
 
-                        let s_state_db = server_state_db.clone();
-                        let s_config_db = server_config_db.clone();
+                        let ctx = ctx.clone();
                         let shutdown_rx = listener_shutdown_tx.subscribe();
                         let span = match &listener_name {
                             Some(name) => tracing::info_span!("client", listener = %name, addr = %client_addr),
@@ -229,16 +229,7 @@ async fn main() -> Result<()> {
                         spawn(
                             async move {
                                 let _permit = permit; // released when this task ends
-                                handle_client(
-                                    client_stream,
-                                    client_addr,
-                                    s_state_db,
-                                    s_config_db,
-                                    limits,
-                                    listener_cfg.block_failure_quarantine,
-                                    shutdown_rx,
-                                )
-                                .await;
+                                handle_client(client_stream, client_addr, ctx, shutdown_rx).await;
                             }
                             .instrument(span),
                         );

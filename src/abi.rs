@@ -91,8 +91,6 @@ pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
 ///
 /// The text is parsed as JSON and written back with object keys sorted, then
 /// hashed with [`fnv1a64`]. Text that is not JSON is hashed as raw bytes.
-// For a session that fingerprints a dialed upstream; the monitor uses AbiEntry.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn abi_fingerprint(text: &str) -> u64 {
     match serde_json::from_str::<Value>(text) {
         Ok(value) => fingerprint_value(&value),

@@ -1125,7 +1125,7 @@ pub struct ServerState {
     /// `/metrics` can emit a `server` label.
     pub name: String,
     /// Active client connections currently routed to this upstream.
-    /// `Arc<AtomicUsize>` so [`crate::connection_handler::ConnectionGuard`] can
+    /// `Arc<AtomicUsize>` so [`crate::session::ConnectionGuard`] can
     /// decrement synchronously on drop without locking the whole map.
     pub connections: Arc<AtomicUsize>,
     pub enabled: bool,
@@ -1413,12 +1413,9 @@ pub struct ProxyLimits {
     /// Client WebSocket message/frame cap.
     pub max_client_message_bytes: usize,
     /// [`ServerConfig::upstream_stall_timeout_ms`]. 0 disables stall detection.
-    // Read by the session actor; nothing reads it yet.
-    #[allow(dead_code)]
     pub stall_timeout_ms: u64,
     /// Bound for a session's upstream connect. Always non-zero; see
     /// [`ServerConfig::upstream_connect_timeout_ms`].
-    #[allow(dead_code)]
     pub connect_timeout_ms: u64,
 }
 

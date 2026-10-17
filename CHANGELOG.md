@@ -7,6 +7,153 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- Pool listeners now answer `get_status_request_v0` and `_v1` themselves,
+  with the fleet's head, LIB and block ranges, instead of relaying one
+  upstream's reply. Until the fleet head is known, the request is still
+  relayed to the session's upstream.
+- Two new checks are on by default: `upstream_stall_timeout_ms` (60 s) fails
+  over an upstream that stops sending blocks it owes, and `live_lag_blocks`
+  (1200) ranks a live node that far behind the fleet head like a stale one
+  for blocks above its own head. Set either to `0` to turn it off.
+- The upstream liveness check now counts bytes as they arrive, so the 0.6.0
+  advice to raise `upstream_liveness_timeout_ms` for large blocks on a slow
+  link no longer applies.
+- `max_connections`, at the top level and per listener, must be at most
+  1000000. A larger value fails validation.
+- Existing config files stay valid, and a listener without frozen servers
+  stays a pool listener.
+
+### Added
+
+- Range-split fleets. A server can be marked `"role": "frozen"`: a frozen
+  range server, an archive upstream that serves a fixed block range from
+  archived state-history and block logs with no nodeos behind it. A listener
+  with an enabled frozen server (or `"topology": "stitched"`) presents its
+  upstreams as one SHiP node whose history is the union of their ranges. The
+  router sends the listener's ABI without dialing, answers `get_status`
+  itself, plans each `get_blocks` by start block and requested data, hands
+  the stream from one upstream to the next at range boundaries without
+  counting it as a failure, connects to the next upstream ahead of the
+  boundary, and replaces head and LIB in archive results so they never move
+  backwards. Archived blocks whose upstreams are all down are held for up to
+  `gap_wait_ms`; a hole in the configured coverage closes the client with
+  1011 `block K unavailable on all upstreams`. See "Range-split fleets" in
+  `docs/operations.md`.
+- Per-server `role`, `range` (the archive's declared coverage, used until it
+  reports and while it is down) and `max_sessions`; per-listener `topology`
+  and `stitching` (`history_preference`, `predial_blocks`, `gap_wait_ms`,
+  `patch_head_lib`, `abi_file`, `abi_mismatch`); global
+  `upstream_stall_timeout_ms` and `live_lag_blocks`.
+- Results from a frozen range server are checked against the archive
+  contract (block sequence, ids, requested fields, credit, continuity at
+  seams). A violation fails the session over to another upstream and counts
+  as a block failure.
+- A frozen range server without a block log is supported. Requests with
+  `fetch_block` prefer an upstream that holds blocks and move to it with no
+  strike; otherwise results are forwarded without `block`. A frozen result
+  without `prev_block`, right after a block the session delivered, gets it
+  filled in from that block.
+- `example.stitched.config.json`, a stitched listener with two archived
+  ranges, two live nodes and a chain API.
+- `config test --strict`: exits 1 when the config is invalid, a stitched
+  listener's coverage has a hole or a frozen server did not report its
+  ranges, or a chain API listener has an enabled frozen server without
+  `api_endpoint`. `config test` prints each stitched listener's coverage and
+  each chain API listener's servers.
+- `GET /coverage` and `/coverage/<listener>` on the metrics port (fleet tip,
+  canonical ABI, per-log coverage and the upstreams of each segment), and
+  `/ready?scope=history`, which also requires complete, online archive
+  coverage. Plain `/ready` still means the tip can be served.
+- `/metrics`: per-upstream `fleet_router_upstream_trace_end_block`,
+  `_head_block`, `_lib_block`, `_info{role}`, `_ranges_known`,
+  `_range_mismatch`, `_abi_info`, `_abi_compatible`, `_abi_match`,
+  `_links_total`, `_dial_failures_total`, `_stalls_total`,
+  `_sequence_jumps_total`, `_contract_violations_total`, `_no_block_log`,
+  `_results_without_block_total` and `_prev_blocks_filled_total`; per
+  listener the fleet head, LIB and head age, coverage, gap, offline and
+  live-overlap gauges, sessions by state, and counters for status replies,
+  handoffs, failovers by reason, reroutes, dropped duplicates, fork
+  re-deliveries, keep-alives, credit overruns, patched results, holds,
+  pre-dials, client protocol errors and too-large closes, with
+  `fleet_router_handoff_latency_seconds`.
+- An opt-in HTTP chain API listener per listener (`chain_api`), with a
+  per-server `api_endpoint`. Block endpoints are routed by block number:
+  irreversible blocks go to the frozen range server that holds them, falling
+  back to live nodes (`block_source` picks who goes first), and reversible
+  blocks go to live nodes only. `get_info` and read-only state calls are
+  proxied unchanged to live nodes. Push and exec are off by default; a push
+  is never resent. The router answers with nodeos-shaped errors, nodeos's
+  404 for unknown endpoints, and its own `get_supported_apis`, and never
+  invents a parameter error or an Unknown Block. See `docs/chain-api.md`.
+- New metrics `fleet_router_api_*` and `fleet_router_upstream_api_*`; new
+  readiness scope `/ready?scope=api`; a `chain_api` block per listener in
+  `/coverage`.
+- `docs/chain-api.md`, and sections on range-split fleets, failover and
+  strikes, readiness scopes, `/coverage`, every new metric and suggested
+  alerts in `docs/operations.md` and `docs/observability.md`.
+
+### Changed
+
+- Pool routing checks each `get_blocks` against the session's upstream
+  before it is forwarded, and moves it to an upstream that serves it better
+  when needed. An upstream must have the start block in every log the
+  request asks for (deltas-only requests use the chain-state range), a live
+  node counts as covering the next block at its head, lagging live nodes
+  rank like stale ones, `max_sessions` is honoured, and ties are broken by a
+  per-session hash.
+- An upstream WebSocket close frame is no longer forwarded to the client;
+  the session fails over without the client noticing.
+- `idle_timeout_ms` fails over a silent upstream only while it owes blocks,
+  so a client waiting at the chain tip no longer causes reconnects. On the
+  client side it still closes a connection that sends nothing.
+- Malformed client requests close the client with WebSocket code 1007
+  instead of being forwarded. A request variant the router does not know is
+  still forwarded in a pool listener; a stitched listener closes the client
+  with 1003.
+- An upstream that answers the WebSocket upgrade with HTTP 503 is treated as
+  busy: the session avoids it for 2 s and it is not marked offline.
+- The liveness check and the 1 s probe after the monitor loses an upstream
+  count bytes as they arrive, so a large message on its way is not taken for
+  silence. A silent upstream is marked offline only when it is a live node.
+- `fleet_router_active_connections` counts the connections sessions hold to
+  an upstream, which in a stitched listener includes pre-dialed standby
+  links; a stitched client that only asks for status holds none.
+- A control API drain or move counts only an upstream below its
+  `max_sessions` and not quarantined at the session's next block. A moved
+  session returns to the upstream it left when the target cannot take it,
+  and a dial that lands on an upstream disabled meanwhile goes to another
+  upstream when one can take the session. Disable, drain, priority and weight
+  also apply to the chain API.
+- Dashboard and `/api/v1/status`: a listener's `ready` is what
+  `/ready/<listener>` answers; a listener's `sessions` (and the total) count
+  client sessions, while an upstream's `sessions` count the connections held
+  to it. The session list shows no upstream while a session has no link.
+
+### Fixed
+
+- Failover now resumes with the client's outstanding credit instead of its
+  original `max_messages_in_flight`, and acks sent during the swap are no
+  longer replayed on top of it.
+- Replayed blocks are de-duplicated by block number and id, dropped
+  duplicates are refunded upstream with an ack, and fork re-deliveries are
+  forwarded.
+- Head keep-alive results from EOSIO 2.0 and Leap 3 nodes no longer move the
+  resume block.
+- A new `get_blocks` mid-stream no longer inherits the previous request's
+  resume point, a new request on a link that still has blocks in flight
+  opens a fresh upstream link, and status requests are no longer lost during
+  a failover.
+- Head and LIB in results never move backwards within a session.
+- An upstream that stays connected and answers pings but stops sending the
+  blocks it owes is failed over after `upstream_stall_timeout_ms`.
+- A message larger than `max_message_bytes` closes the client with 1011 and
+  the reason `block K exceeds max_message_bytes` instead of striking the
+  upstream.
+- Session upstream dials now time out (`handshake_timeout_ms`, 10 s when
+  `0`).
+
 ## [0.6.0] - 2026-10-17
 
 ### Upgrade notes

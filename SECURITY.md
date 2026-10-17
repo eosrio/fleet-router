@@ -63,8 +63,17 @@ be treated as such.**
   server certificate with rustls against the OS trust store. It does not
   authenticate the client listener.
 - **Optional metrics endpoint is unauthenticated.** When enabled
-  (`metrics_port`), the HTTP `/health`, `/ready`, and `/metrics` endpoints are
-  served over plaintext HTTP with no authentication.
+  (`metrics_port`), the HTTP `/health`, `/ready`, `/coverage`, and `/metrics`
+  endpoints are served over plaintext HTTP with no authentication.
+- **Optional chain API is unauthenticated.** When a listener sets
+  `chain_api`, its port answers nodeos-style chain API requests over
+  plaintext HTTP with no authentication, like a nodeos HTTP port. Transaction
+  push (`"push"` in `chain_api.allow`) and read-only transaction execution
+  (`"exec"`) are off by default. With `"push"` allowed, anyone who can reach
+  the port can relay transactions through your live nodes; the router writes
+  each push to one node at most once and never resends it. The router logs a
+  warning at startup when push is allowed or the port listens on every
+  interface.
 
 Because of the above, fleet-router **must not be exposed directly to the public
 internet**. Deploy it on a trusted/internal network and/or place it behind a
@@ -75,7 +84,9 @@ encryption and access control.
 
 Upstream SHiP nodes are part of the trust boundary. fleet-router parses bytes
 received from upstreams via `rs_abieos` (pure-Rust backend). Only point
-fleet-router at upstream nodes you operate or otherwise trust.
+fleet-router at upstream nodes you operate or otherwise trust. The same holds
+for frozen range servers and for upstream chain APIs (`api_endpoint`), which
+are dialed over plain `http://`: the router passes their data on to clients.
 
 ### In scope
 
@@ -86,15 +97,19 @@ scope, including (non-exhaustively):
   input that is within the documented protocol.
 - Resource-exhaustion vectors that bypass the configured safeguards
   (`max_connections`, `handshake_timeout_ms`, `idle_timeout_ms`,
-  `max_message_bytes`, `max_client_message_bytes`, and the 64 KiB per-session
-  failover buffer).
+  `max_message_bytes`, `max_client_message_bytes`, the 64 KiB per-session
+  failover buffer, and the chain API's `max_connections`, `max_in_flight`,
+  `max_body_bytes` and request timeouts).
+- A chain API request that makes the router send a transaction push twice,
+  or send a push or exec request when its class is not in `chain_api.allow`.
 - Logic flaws in failover, de-duplication, or shutdown that lead to data
   corruption or unexpected disclosure between client connections.
 
 ### Out of scope
 
-- The absence of TLS, client authentication, or authorization on the listener
-  and metrics endpoint (see the design limitations above).
+- The absence of TLS, client authentication, or authorization on the listener,
+  the chain API port, and the metrics endpoint (see the design limitations
+  above).
 - Issues that require a malicious or compromised upstream that you have
   explicitly configured and trusted, beyond the memory-safety expectations
   noted above.
@@ -104,8 +119,9 @@ scope, including (non-exhaustively):
 
 ## See Also
 
-- [docs/operations.md](docs/operations.md) for deployment and security guidance, and
-  [docs/configuration.md](docs/configuration.md) for the configuration reference.
+- [docs/operations.md](docs/operations.md) for deployment and security guidance,
+  [docs/configuration.md](docs/configuration.md) for the configuration reference,
+  and [docs/chain-api.md](docs/chain-api.md) for the chain API.
 - [CONTRIBUTING.md](CONTRIBUTING.md) for development and pull-request workflow.
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
 - [CHANGELOG.md](CHANGELOG.md) for release history.

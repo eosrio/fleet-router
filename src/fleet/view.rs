@@ -747,7 +747,8 @@ fn anchor_max(
 /// The fleet head and LIB, and the anchors they came from.
 ///
 /// Anchors are the online live upstreams that are not stale (all online live
-/// ones when every one is stale). An archive-only listener uses the newest
+/// ones when every one is stale). An upstream an operator took out of service
+/// is no anchor, as if it were offline. An archive-only listener uses the newest
 /// frozen head. With live servers configured but none online, the last tip is
 /// kept. The LIB never goes below the listener's high-water mark, and never
 /// above the head.
@@ -760,7 +761,7 @@ fn fleet_tip(
     let live_on: Vec<usize> = upstreams
         .iter()
         .enumerate()
-        .filter(|(_, u)| u.enabled && u.role == Role::Live && u.online)
+        .filter(|(_, u)| u.routable() && u.role == Role::Live && u.online)
         .map(|(pos, _)| pos)
         .collect();
     let fresh: Vec<usize> = live_on
@@ -836,7 +837,8 @@ fn live_overlap(upstreams: &[UpstreamView], log: Log) -> Option<i64> {
 /// The `abi_file` pin wins. Otherwise a live upstream's ABI, sticky while an
 /// online live upstream still serves it, else the ABI of the online live
 /// upstream with the highest head. Without any live ABI, the most common
-/// frozen ABI is used provisionally until a live one appears.
+/// frozen ABI is used provisionally until a live one appears. An upstream an
+/// operator took out of service counts as offline here.
 fn canonical_abi(
     ctx: &BuildCtx<'_>,
     upstreams: &[UpstreamView],
@@ -884,7 +886,7 @@ fn choose_canonical(
         upstreams
             .iter()
             .zip(abis)
-            .filter(move |(u, abi)| u.enabled && u.online && u.role == role && abi.is_some())
+            .filter(move |(u, abi)| u.routable() && u.online && u.role == role && abi.is_some())
     };
     if let Some((entry, AbiSource::Live(_))) = &current {
         if online_with_abi(Role::Live).any(|(u, _)| u.abi_fp == Some(entry.fp)) {
@@ -1463,6 +1465,35 @@ mod tests {
             Instant::now(),
         );
         assert!(v.abi.is_none());
+    }
+
+    #[test]
+    fn an_operator_disabled_live_node_anchors_neither_the_tip_nor_the_abi() {
+        // A disabled node far ahead (on a fork, say) sets neither the fleet
+        // head nor the LIB.
+        let a = frozen(0, 2, 1001);
+        let mut ahead = live(1, 900, 5000);
+        ahead.operator_disabled = true;
+        let behind = live(2, 900, 1500);
+        let v = build(&[a.dup(), ahead, behind.dup()], &tips(3), &mut mem());
+        assert_eq!(v.head, Some(pos(1500)));
+        assert_eq!(v.anchors, vec![2]);
+
+        // Disabling the node whose ABI is canonical switches to the other
+        // live node's ABI, as if it had gone offline.
+        let mut m = mem();
+        let x = with_abi(live(1, 900, 2000), &abi_text("x"));
+        let y = with_abi(live(2, 900, 1900), &abi_text("y"));
+        let v = build(&[a.dup(), x.dup(), y.dup()], &tips(3), &mut m);
+        assert_eq!(v.abi_source, Some(AbiSource::Live(1)));
+        let mut x_disabled = x.dup();
+        x_disabled.operator_disabled = true;
+        let v = build(&[a.dup(), x_disabled, y.dup()], &tips(3), &mut m);
+        assert_eq!(v.abi_source, Some(AbiSource::Live(2)));
+        assert_eq!(
+            v.abi.as_ref().map(|abi| abi.fp),
+            Some(AbiEntry::new(&abi_text("y")).fp)
+        );
     }
 
     #[test]

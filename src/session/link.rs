@@ -677,7 +677,8 @@ fn host_port(url: &str) -> Result<(String, u16), DialError> {
 /// Connect to `url`, upgrade (TLS for `wss://`) and read the ABI.
 ///
 /// The TCP connect and the upgrade share one `connect_timeout_ms` deadline;
-/// the wait for the ABI is bounded by `handshake_timeout_ms` (none when 0).
+/// the wait for the ABI is bounded by `handshake_timeout_ms`, or by
+/// `connect_timeout_ms` when that is 0.
 /// The session aborts the task when the client leaves or the router shuts
 /// down. `guard` is released on every error.
 async fn dial(
@@ -710,7 +711,11 @@ async fn dial(
         Err(_) => return Err(DialError::Handshake("timed out".to_string())),
     };
 
-    let abi = match read_first_abi(&mut ws, limits.handshake_timeout_ms).await {
+    let abi_wait = match limits.handshake_timeout_ms {
+        0 => limits.connect_timeout_ms.max(1),
+        ms => ms,
+    };
+    let abi = match read_first_abi(&mut ws, Duration::from_millis(abi_wait)).await {
         Ok(abi) => abi,
         Err(e) => {
             let _ = ws.close(None).await;
@@ -733,10 +738,7 @@ async fn dial(
 /// Read the upstream's first meaningful frame, which must be the Text ABI.
 /// Leading Ping/Pong control frames are skipped. One deadline covers the
 /// whole read, so a peer that drips control frames cannot extend it.
-async fn read_first_abi(
-    ws: &mut UpstreamWs,
-    handshake_timeout_ms: u64,
-) -> Result<String, DialError> {
+async fn read_first_abi(ws: &mut UpstreamWs, wait: Duration) -> Result<String, DialError> {
     let read = async {
         loop {
             match ws.next().await {
@@ -755,13 +757,9 @@ async fn read_first_abi(
             }
         }
     };
-    if handshake_timeout_ms > 0 {
-        timeout(Duration::from_millis(handshake_timeout_ms), read)
-            .await
-            .unwrap_or(Err(DialError::AbiTimeout))
-    } else {
-        read.await
-    }
+    timeout(wait, read)
+        .await
+        .unwrap_or(Err(DialError::AbiTimeout))
 }
 
 /// A session's upstream socket and what the router knows about it.
@@ -1025,6 +1023,36 @@ mod tests {
             .err()
             .expect("dial should fail");
         assert!(matches!(err, DialError::Handshake(_)), "{err:?}");
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert_eq!(slots(&counter), 0);
+        holder.abort();
+    }
+
+    #[tokio::test]
+    async fn without_a_handshake_timeout_the_abi_wait_ends_at_the_connect_timeout() {
+        // Complete the WebSocket upgrade and never send the ABI.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let holder = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let counter = Arc::new(AtomicUsize::new(0));
+        let guard = ConnectionGuard::acquire(counter.clone());
+        let fast = ProxyLimits {
+            handshake_timeout_ms: 0,
+            connect_timeout_ms: 200,
+            ..limits()
+        };
+        let started = Instant::now();
+        let mut task = DialTask::spawn(target(&endpoint), fast, guard, Instant::now());
+        let err = timeout(Duration::from_secs(5), task.outcome())
+            .await
+            .expect("the dial must time out on its own")
+            .err()
+            .expect("dial should fail");
+        assert_eq!(err, DialError::AbiTimeout);
         assert!(started.elapsed() >= Duration::from_millis(150));
         assert_eq!(slots(&counter), 0);
         holder.abort();

@@ -720,7 +720,7 @@ pub(crate) async fn render_metrics(listeners: &[ListenerHealthState]) -> String 
     }
 
     out.push_str(
-        "# HELP fleet_router_active_connections Active client connections routed to an upstream.\n",
+        "# HELP fleet_router_active_connections Connections the router's sessions hold or are dialing to an upstream.\n",
     );
     out.push_str("# TYPE fleet_router_active_connections gauge\n");
     for s in &snapshots {

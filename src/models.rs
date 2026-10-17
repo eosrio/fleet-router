@@ -1950,7 +1950,8 @@ pub struct ServerState {
     /// Configured [`Server::name`], copied when the state map is built so
     /// `/metrics` can emit a `server` label.
     pub name: String,
-    /// Active client connections currently routed to this upstream.
+    /// Connections the router's sessions hold or are dialing to this upstream
+    /// (links, and in a stitched listener pre-dialed standbys).
     /// `Arc<AtomicUsize>` so [`crate::session::ConnectionGuard`] can
     /// decrement synchronously on drop without locking the whole map.
     pub connections: Arc<AtomicUsize>,

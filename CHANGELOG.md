@@ -153,8 +153,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A message larger than `max_message_bytes` closes the client with 1011 and
   the reason `block K exceeds max_message_bytes` instead of striking the
   upstream.
-- Session upstream dials now time out (`handshake_timeout_ms`, 10 s when
-  `0`).
+- Session upstream dials now time out: the TCP connect with the WebSocket
+  upgrade, and then the wait for the upstream's ABI, are each bounded by
+  `handshake_timeout_ms` (10 s when `0`). Before, a session waited for the
+  ABI with no bound when `handshake_timeout_ms` was `0`.
 
 ## [0.6.0] - 2026-10-17
 

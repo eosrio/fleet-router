@@ -1552,13 +1552,22 @@ async fn chain_api_series_name_their_listener_and_readiness_follows_the_live_cha
                 .to_string(),
             1.0,
         ),
-        (
-            r#"fleet_router_api_in_flight{listener="main"}"#.to_string(),
-            0.0,
-        ),
     ] {
         assert_eq!(metric(metrics, &series).await, want, "{series}");
     }
+    // The request's slot comes back once its answer is written.
+    common::wait_metric(
+        metrics,
+        &format!("fleet_router_upstream_api_in_flight{{{labels}}} 0\n"),
+        WAIT,
+    )
+    .await;
+    common::wait_metric(
+        metrics,
+        "fleet_router_api_in_flight{listener=\"main\"} 0\n",
+        WAIT,
+    )
+    .await;
     // Only the listener with a chain API has chain API series.
     let lines = api_lines(metrics).await;
     assert!(!lines.is_empty());

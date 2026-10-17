@@ -30,7 +30,7 @@ use tracing::Instrument;
 use crate::abi::accept_upstream_abi;
 use crate::fleet::view::UpstreamView;
 use crate::fleet::{DialFailure, FleetHub, LinkPurpose};
-use crate::models::{ProxyLimits, ResolvedTopology, Role};
+use crate::models::{ProxyLimits, ResolvedTopology, Role, UpstreamCounters};
 use crate::ship::wire::BlocksRequest;
 use crate::ship::BlockPos;
 
@@ -43,6 +43,10 @@ pub(super) type UpstreamWs = WebSocketStream<MaybeTlsStream<ActivityStream<TcpSt
 /// Upstream picks per connect or failover before the client is closed. A pick
 /// that finds no candidate ends the attempts.
 pub(super) const MAX_DIAL_ATTEMPTS: u32 = 3;
+
+/// Payload of the router's own pings to an upstream. Pongs carrying it are
+/// liveness replies, not upstream activity.
+pub(super) const LIVENESS_PING: &[u8] = b"fleet-router-liveness";
 
 /// Holds one unit of an upstream's active-connection counter. Decrements
 /// synchronously (and underflow-safely) when dropped — no spawn, no lock, no
@@ -85,6 +89,9 @@ pub(super) enum UpCursor {
 pub(super) enum Purpose {
     /// The client's own request, on the link it arrived for.
     Initial,
+    /// Stitched: the next leg of the client's request, after the previous
+    /// upstream served its range up to a clamped end.
+    Handoff,
     /// A resume after the previous link ended.
     Failover,
     /// The client's request, moved before it was forwarded to an upstream
@@ -96,6 +103,7 @@ impl Purpose {
     pub fn label(self) -> LinkPurpose {
         match self {
             Purpose::Initial => LinkPurpose::Initial,
+            Purpose::Handoff => LinkPurpose::Handoff,
             Purpose::Failover => LinkPurpose::Failover,
             Purpose::Reroute => LinkPurpose::Reroute,
         }
@@ -105,7 +113,7 @@ impl Purpose {
     /// router made). Its first result must follow the client's last block;
     /// a fresh client request may legitimately start anywhere.
     pub fn resumes(self) -> bool {
-        matches!(self, Purpose::Failover)
+        matches!(self, Purpose::Failover | Purpose::Handoff)
     }
 }
 
@@ -148,6 +156,23 @@ pub(super) struct LinkState {
     pub became_owed_at: Instant,
     pub was_owed: bool,
     pub frames: u64,
+    /// Stitched: a link kept open with nothing to send (its leg is done) is
+    /// closed at this instant unless a new request reuses it first.
+    pub linger_until: Option<Instant>,
+    /// When a liveness ping went out, while no frame has arrived since.
+    pub ping_at: Option<Instant>,
+    /// The monitor lost this upstream: the link fails over at this instant
+    /// unless a frame arrives first.
+    pub probe_until: Option<Instant>,
+    /// Transport activity (ms since the session epoch) when the last frame
+    /// that was not a liveness pong was read.
+    pub data_ms: u64,
+    /// Transport activity when the last liveness pong was read, while no
+    /// other frame has been read since.
+    pub pong_ms: Option<u64>,
+    /// The upstream was online in the last fleet view the session saw, so
+    /// the view that shows it offline starts a probe.
+    pub upstream_online: bool,
 }
 
 impl LinkState {
@@ -168,6 +193,49 @@ impl LinkState {
             became_owed_at: now,
             was_owed: false,
             frames: 0,
+            linger_until: None,
+            ping_at: None,
+            probe_until: None,
+            data_ms: 0,
+            pong_ms: None,
+            upstream_online: false,
+        }
+    }
+
+    /// A frame was read; `read_ms` is the transport activity now. Any frame
+    /// shows the upstream is alive. Only frames other than a reply to the
+    /// router's own liveness ping count as data for the idle, stall and
+    /// monitor-offline silence limits.
+    pub fn note_frame(&mut self, read_ms: u64, liveness_pong: bool) {
+        self.ping_at = None;
+        self.probe_until = None;
+        if liveness_pong {
+            self.pong_ms = Some(read_ms);
+        } else {
+            self.data_ms = read_ms;
+            self.pong_ms = None;
+        }
+    }
+
+    /// Transport activity (ms since the session epoch) that counts as data:
+    /// the last read, unless all it carried was a liveness pong. Bytes read
+    /// after that pong (part of a large message, say) count again.
+    pub fn data_activity_ms(&self, read_ms: u64) -> u64 {
+        if self.pong_ms == Some(read_ms) {
+            self.data_ms
+        } else {
+            read_ms
+        }
+    }
+
+    /// The link's request, if any, has nothing left to send: the upstream's
+    /// cursor reached its end. A frozen upstream then stays silent until a
+    /// new request.
+    pub fn leg_done(&self) -> bool {
+        match (&self.req, self.up_cursor) {
+            (None, _) => true,
+            (Some(req), UpCursor::Exact(u)) => u >= req.end,
+            (Some(_), UpCursor::Uncertain { .. }) => false,
         }
     }
 
@@ -190,12 +258,17 @@ impl LinkState {
 /// ended at or below LIB + 1, and a node that sends head keep-alives (or only
 /// speaks status v0, the legacy family that does) may send at any time.
 pub(super) fn quiescent(st: &LinkState, pre_credit: u32, legacy_status: bool) -> bool {
+    pre_credit == 0 || settled(st, legacy_status)
+}
+
+/// Whether nothing of the link's request can ever arrive, whatever credit
+/// the client adds: it has none, or its end was reached as [`quiescent`]
+/// describes. A link that is quiet only for lack of credit is not settled:
+/// the next ack would resume its old request.
+pub(super) fn settled(st: &LinkState, legacy_status: bool) -> bool {
     let Some(req) = &st.req else {
         return true;
     };
-    if pre_credit == 0 {
-        return true;
-    }
     match st.up_cursor {
         UpCursor::Exact(u) if u >= req.end => match st.role {
             Role::Frozen => true,
@@ -339,6 +412,7 @@ pub(super) fn build_request(
     };
     st.first_result_pending = true;
     st.became_owed_at = now;
+    st.linger_until = None;
     BlocksRequest {
         v1: creq.v1,
         start,
@@ -473,6 +547,7 @@ pub(super) struct DialTarget {
     pub name: Arc<str>,
     pub url: Arc<str>,
     pub role: Role,
+    pub counters: Arc<UpstreamCounters>,
 }
 
 impl DialTarget {
@@ -483,6 +558,7 @@ impl DialTarget {
             name: u.name.clone(),
             url: u.url.clone(),
             role: u.role,
+            counters: u.counters.clone(),
         }
     }
 }
@@ -652,20 +728,39 @@ pub(super) struct Link {
     pub rx: SplitStream<UpstreamWs>,
     /// Milliseconds since the session epoch of the last transport read.
     pub activity: Arc<AtomicU64>,
+    /// The upstream's cumulative counters.
+    pub counters: Arc<UpstreamCounters>,
     guard: ConnectionGuard,
 }
 
 impl Link {
     pub fn new(target: &DialTarget, est: Established, now: Instant) -> Self {
         let (tx, rx) = est.ws.split();
+        let mut st = LinkState::new(target.up, target.role, now);
+        st.data_ms = est.activity.load(Ordering::Relaxed);
         Link {
-            st: LinkState::new(target.up, target.role, now),
+            st,
             endpoint: target.endpoint.clone(),
             name: target.name.clone(),
             tx,
             rx,
             activity: est.activity,
+            counters: target.counters.clone(),
             guard: est.guard,
+        }
+    }
+
+    /// Milliseconds since the session epoch of the last transport read.
+    pub fn read_ms(&self) -> u64 {
+        self.activity.load(Ordering::Relaxed)
+    }
+
+    /// Send a liveness ping. Bounded, so a stuck socket cannot hold the
+    /// session loop.
+    pub async fn ping(&mut self) {
+        let ping = self.tx.send(Message::Ping(LIVENESS_PING.into()));
+        if !matches!(timeout(Duration::from_secs(1), ping).await, Ok(Ok(()))) {
+            tracing::debug!(upstream = %self.endpoint, "liveness ping to upstream not sent");
         }
     }
 
@@ -718,6 +813,7 @@ mod tests {
         ProxyLimits {
             handshake_timeout_ms: 2_000,
             idle_timeout_ms: 0,
+            upstream_liveness_timeout_ms: 0,
             max_message_bytes: 1 << 20,
             max_client_message_bytes: 64 * 1024,
             stall_timeout_ms: 0,
@@ -732,6 +828,7 @@ mod tests {
             name: Arc::from("test-upstream"),
             url: Arc::from(format!("ws://{endpoint}")),
             role: Role::Live,
+            counters: Arc::default(),
         }
     }
 
@@ -1005,15 +1102,21 @@ mod tests {
     fn quiescence_rules() {
         let mut idle = LinkState::new(0, Role::Live, Instant::now());
         assert!(quiescent(&idle, 10, false), "no request");
+        assert!(settled(&idle, false), "no request");
         idle.req = live_state(100, 200).req;
         idle.up_cursor = UpCursor::Exact(150);
         assert!(quiescent(&idle, 0, false), "C == 0: nothing in flight");
         assert!(!quiescent(&idle, 10, false), "mid-stream");
+        assert!(
+            !settled(&idle, false),
+            "quiet only for lack of credit: an ack resumes the old request"
+        );
 
         let mut frozen = live_state(100, 200);
         frozen.role = Role::Frozen;
         frozen.last_lib = None;
         assert!(quiescent(&frozen, 10, false), "frozen at its end");
+        assert!(settled(&frozen, false), "frozen at its end");
 
         let at_end = live_state(100, 200);
         assert!(quiescent(&at_end, 10, false), "live, end <= LIB + 1");
@@ -1028,6 +1131,30 @@ mod tests {
         let mut uncertain = live_state(100, 200);
         uncertain.up_cursor = UpCursor::Uncertain { lo: 150, hi: 200 };
         assert!(!quiescent(&uncertain, 10, false));
+    }
+
+    /// A leg is done when the upstream's known cursor reached its end; a
+    /// link without a request has nothing to send either.
+    #[test]
+    fn a_leg_is_done_at_its_end_and_only_with_a_known_cursor() {
+        assert!(LinkState::new(0, Role::Frozen, Instant::now()).leg_done());
+        let mut st = live_state(100, 200);
+        assert!(st.leg_done(), "at its end");
+        st.up_cursor = UpCursor::Exact(199);
+        assert!(!st.leg_done(), "one block owed");
+        st.up_cursor = UpCursor::Uncertain { lo: 150, hi: 200 };
+        assert!(!st.leg_done(), "a rewind may still come");
+    }
+
+    /// Router-made seams (handoffs and failovers) must continue the client's
+    /// stream; a client's own request need not.
+    #[test]
+    fn handoffs_and_failovers_are_seams() {
+        assert!(Purpose::Handoff.resumes());
+        assert!(Purpose::Failover.resumes());
+        assert!(!Purpose::Initial.resumes());
+        assert!(!Purpose::Reroute.resumes());
+        assert_eq!(Purpose::Handoff.label(), LinkPurpose::Handoff);
     }
 
     #[test]
@@ -1263,5 +1390,23 @@ mod tests {
             frozen.resume_floor, None,
             "no positions, not a failover: no window"
         );
+
+        // A stitched handoff to a frozen upstream: the next leg from the
+        // cursor, no positions, no window, and a kept link stops lingering.
+        frozen.linger_until = Some(Instant::now());
+        let req = build_request(
+            &c,
+            &creq,
+            &mut frozen,
+            200,
+            Purpose::Handoff,
+            STITCHED,
+            Instant::now(),
+        );
+        assert_eq!((req.start, req.end, req.max_in_flight), (103, 200, 7));
+        assert!(req.have_positions.is_empty());
+        assert_eq!(frozen.resume_floor, None);
+        assert_eq!(frozen.linger_until, None, "the link is in use again");
+        assert_eq!(frozen.req.as_ref().unwrap().purpose, Purpose::Handoff);
     }
 }

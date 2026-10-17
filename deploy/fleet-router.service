@@ -1,0 +1,38 @@
+# systemd unit for running one fleet-router process from a single config file
+# (single-port or multi-listener). For one process per network, use
+# fleet-router@.service instead.
+#
+# Install to /etc/systemd/system/fleet-router.service, place the config at
+# /etc/fleet-router/config.json, then enable and start:
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fleet-router
+#
+# See docs/operations.md#run-as-a-service for the full walkthrough.
+
+[Unit]
+Description=Fleet SHiP Router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=fleet
+Group=fleet
+ExecStart=/usr/local/bin/fleet-router run --config /etc/fleet-router/config.json
+Restart=on-failure
+RestartSec=2
+# SIGTERM triggers a graceful, bounded drain. Allow more than shutdown_grace_ms
+# so systemd does not SIGKILL the process mid-drain.
+TimeoutStopSec=10
+Environment=RUST_LOG=info
+# Each client session holds two sockets (client and upstream). systemd's
+# default soft limit of 1024 open files caps the router at ~500 clients.
+LimitNOFILE=65536
+# The router only reads its config and writes to stdout/stderr (journald).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

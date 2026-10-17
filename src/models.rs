@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 
 use crate::abi::{accept_upstream_abi, AbiEntry};
 use crate::ship::{BlockPos, Range};
@@ -26,6 +27,9 @@ fn default_handshake_timeout_ms() -> u64 {
 }
 fn default_idle_timeout_ms() -> u64 {
     0 // 0 = disabled
+}
+fn default_upstream_liveness_timeout_ms() -> u64 {
+    4_000
 }
 fn default_max_message_bytes() -> usize {
     256 * 1024 * 1024 // 256 MiB
@@ -148,7 +152,8 @@ pub enum HistoryPreference {
     /// Prefer frozen upstreams, keeping history reads off the live nodes.
     #[default]
     Frozen,
-    /// No role preference; the longest run wins.
+    /// No role preference; among upstreams of equal `priority`, the longest
+    /// run wins, and load per `weight` only splits equal runs.
     Any,
 }
 
@@ -205,6 +210,15 @@ impl Default for StitchingPolicy {
 
 fn has_enabled_frozen(servers: &[Server]) -> bool {
     servers.iter().any(|s| s.enabled && s.role == Role::Frozen)
+}
+fn default_server_weight() -> u32 {
+    1
+}
+fn is_default_server_weight(value: &u32) -> bool {
+    *value == default_server_weight()
+}
+fn is_default_priority(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Opt-in shared exclusion of one upstream for a short block range.
@@ -265,7 +279,6 @@ const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS: u64 = 10_000;
 
 /// A single upstream SHiP node, as declared in `config.json`.
 #[derive(Debug, Deserialize, Serialize, Hash, Eq, PartialEq, Clone)]
-#[cfg_attr(test, derive(Default))]
 pub struct Server {
     /// Human-readable name used in logs and as the `server` label on `/metrics`.
     pub name: String,
@@ -288,6 +301,24 @@ pub struct Server {
     /// connection is not counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_sessions: Option<u32>,
+    /// Preference tier. Lower is preferred; `0` (the default) is the highest.
+    ///
+    /// Among upstreams that are equally able to serve a request, the router
+    /// picks from the lowest tier first. Coverage of the requested block and
+    /// freshness still rank above priority, so a preferred upstream that lacks
+    /// the block never wins over one that has it.
+    #[serde(default, skip_serializing_if = "is_default_priority")]
+    pub priority: u32,
+    /// Relative share of client sessions within the same priority tier.
+    /// Must be at least `1` (the default).
+    ///
+    /// Selection compares active connections divided by weight, so an
+    /// upstream with weight `2` takes about twice the sessions of one with `1`.
+    #[serde(
+        default = "default_server_weight",
+        skip_serializing_if = "is_default_server_weight"
+    )]
+    pub weight: u32,
     /// The server's nodeos-compatible HTTP chain API: `http://host[:port]`
     /// or `host:port`. For a live server, its nodeos `http-server-address`;
     /// for a frozen range server, its chain API address. Used only by a
@@ -304,6 +335,25 @@ impl Server {
     /// or `wss`.
     pub fn ws_url(&self) -> String {
         dial_url(&self.endpoint)
+    }
+}
+
+/// Test fixtures build servers with `..Default::default()`. Not derived, so
+/// the default `weight` is the configured default (1), not an invalid 0.
+#[cfg(test)]
+impl Default for Server {
+    fn default() -> Self {
+        Server {
+            name: String::new(),
+            endpoint: String::new(),
+            enabled: false,
+            role: Role::default(),
+            range: None,
+            max_sessions: None,
+            priority: 0,
+            weight: default_server_weight(),
+            api_endpoint: None,
+        }
     }
 }
 
@@ -520,6 +570,15 @@ pub struct ServerConfig {
     /// Idle timeout (ms): close a connection that exchanges no data for this long. 0 = disabled.
     #[serde(default = "default_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
+    /// Fail a session over when its upstream socket goes silent (ms).
+    ///
+    /// After half this time with no frame from the upstream, the session
+    /// sends a WebSocket ping. If no frame at all arrives within the full
+    /// time, the upstream is treated as dead: it is marked offline and the
+    /// session fails over. Catches a node that stops answering without
+    /// closing the connection. 0 = disabled.
+    #[serde(default = "default_upstream_liveness_timeout_ms")]
+    pub upstream_liveness_timeout_ms: u64,
     /// Maximum WebSocket message size (bytes) accepted on upstream links.
     #[serde(default = "default_max_message_bytes")]
     pub max_message_bytes: usize,
@@ -555,6 +614,60 @@ pub struct ServerConfig {
     /// Optional port for the HTTP health/metrics endpoint. When unset, the endpoint is disabled.
     #[serde(default)]
     pub metrics_port: Option<u16>,
+    /// Opt-in dashboard, status page, JSON API and control API on the
+    /// health/metrics endpoint. Off when omitted.
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
+}
+
+/// Minimum length of a control API token.
+pub const MIN_CONTROL_TOKEN_LEN: usize = 16;
+
+/// Environment variable that supplies the control API token.
+pub const CONTROL_TOKEN_ENV: &str = "FLEET_ROUTER_CONTROL_TOKEN";
+
+/// `dashboard` settings. Everything here is served on `metrics_port`.
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct DashboardConfig {
+    /// Serve `/ui/`, `/status` and `/api/v1`. Requires `metrics_port`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bearer token for the control API, inline. Prefer
+    /// [`Self::control_token_file`] or [`CONTROL_TOKEN_ENV`].
+    #[serde(default)]
+    pub control_token: Option<String>,
+    /// File holding the control API token. Surrounding whitespace is ignored.
+    #[serde(default)]
+    pub control_token_file: Option<String>,
+    /// Host names the dashboard answers to besides IP literals and
+    /// `localhost`, for access through a reverse proxy that keeps the name.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+impl DashboardConfig {
+    /// Resolve the control API token: the environment variable first, then
+    /// `control_token_file`, then `control_token`. `Ok(None)` disables control.
+    pub fn resolve_control_token(&self) -> Result<Option<String>> {
+        let env = std::env::var(CONTROL_TOKEN_ENV).ok();
+        let token = if let Some(token) = env.filter(|token| !token.trim().is_empty()) {
+            Some(token)
+        } else if let Some(path) = &self.control_token_file {
+            Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| anyhow!("dashboard.control_token_file '{path}': {e}"))?,
+            )
+        } else {
+            self.control_token.clone()
+        };
+        let Some(token) = token.map(|token| token.trim().to_string()) else {
+            return Ok(None);
+        };
+        if token.len() < MIN_CONTROL_TOKEN_LEN {
+            bail!("the control API token must be at least {MIN_CONTROL_TOKEN_LEN} characters");
+        }
+        Ok(Some(token))
+    }
 }
 
 /// Format a `host` and `port` for `TcpListener::bind`, bracketing bare IPv6
@@ -632,6 +745,12 @@ fn validate_servers(servers: &[Server], listener_ctx: Option<&str>) -> Result<()
         }
         let identity = upstream_identity(&s.endpoint)
             .map_err(|err| anyhow!("{prefix}server '{}': {err}", s.name))?;
+        if s.weight == 0 {
+            bail!(
+                "{prefix}server '{}': weight must be at least 1 (set enabled: false to stop using it)",
+                s.name
+            );
+        }
         if !s.enabled {
             continue;
         }
@@ -1086,10 +1205,8 @@ fn resolve_chain_api(
                 endpoint: s.endpoint.clone(),
                 role: s.role,
                 api,
-                // Servers carry no routing priority or weight yet: every
-                // API shares one tier with an equal share.
-                priority: 0,
-                weight: 1,
+                priority: s.priority,
+                weight: s.weight.max(1),
             })
         })
         .collect();
@@ -1328,6 +1445,19 @@ impl ServerConfig {
         }
         if self.upstream_stall_timeout_ms != 0 && self.upstream_stall_timeout_ms < 1_000 {
             bail!("upstream_stall_timeout_ms must be 0 or at least 1000");
+        }
+        if self.dashboard.enabled && self.metrics_port.is_none() {
+            bail!("dashboard.enabled requires metrics_port");
+        }
+        if self.dashboard.control_token.is_some() && self.dashboard.control_token_file.is_some() {
+            bail!("set only one of dashboard.control_token and dashboard.control_token_file");
+        }
+        if let Some(token) = &self.dashboard.control_token {
+            if token.trim().len() < MIN_CONTROL_TOKEN_LEN {
+                bail!(
+                    "dashboard.control_token must be at least {MIN_CONTROL_TOKEN_LEN} characters"
+                );
+            }
         }
 
         if !self.servers.is_empty() && !self.listeners.is_empty() {
@@ -1716,6 +1846,7 @@ impl ServerConfig {
         ProxyLimits {
             handshake_timeout_ms: self.handshake_timeout_ms,
             idle_timeout_ms: self.idle_timeout_ms,
+            upstream_liveness_timeout_ms: self.upstream_liveness_timeout_ms,
             max_message_bytes: self.max_message_bytes,
             max_client_message_bytes: self.max_client_message_bytes,
             stall_timeout_ms: self.upstream_stall_timeout_ms,
@@ -1746,6 +1877,24 @@ fn resolve_stitching(
     (resolved, policy, abi_pin)
 }
 
+/// Cumulative per-upstream counters, updated by sessions without taking the
+/// state lock.
+#[derive(Debug, Default)]
+pub struct UpstreamCounters {
+    /// Sessions assigned to this upstream, including failovers to it.
+    pub sessions_total: AtomicU64,
+    /// Sessions that left this upstream through failover or an operator move.
+    pub failovers_total: AtomicU64,
+    /// Block frames forwarded from this upstream to clients.
+    pub blocks_total: AtomicU64,
+    /// Bytes forwarded from this upstream to clients.
+    pub bytes_total: AtomicU64,
+    /// Woken when the upstream goes from online to offline, so sessions on
+    /// it can check their socket right away instead of waiting for their own
+    /// liveness timeout.
+    pub went_offline: Notify,
+}
+
 /// Live state tracked per upstream by the monitoring loop and the proxy.
 #[derive(Debug)]
 pub struct ServerState {
@@ -1756,11 +1905,19 @@ pub struct ServerState {
     /// `Arc<AtomicUsize>` so [`crate::session::ConnectionGuard`] can
     /// decrement synchronously on drop without locking the whole map.
     pub connections: Arc<AtomicUsize>,
+    pub counters: Arc<UpstreamCounters>,
     pub enabled: bool,
+    /// Set through the control API. Unlike [`Self::enabled`], the monitor never
+    /// clears it. New sessions and failovers skip the upstream while it is set.
+    pub operator_disabled: bool,
     pub online: bool,
     /// Set by the monitoring loop when an upstream stops advancing its chain
     /// state. Stale upstreams are deprioritized (but not excluded) when routing.
     pub stale: bool,
+    /// Configured [`Server::priority`]. Lower is preferred.
+    pub priority: u32,
+    /// Configured [`Server::weight`]. Always at least 1.
+    pub weight: u32,
     /// Optional configured `chain_id` that every upstream in this pool must match.
     pub expected_chain_id: Option<[u8; 32]>,
     /// When `true` and [`Self::expected_chain_id`] is set, a status that omits
@@ -1851,9 +2008,13 @@ impl ServerState {
         ServerState {
             name: String::new(),
             connections: Arc::new(AtomicUsize::new(0)),
+            counters: Arc::new(UpstreamCounters::default()),
             enabled: true,
+            operator_disabled: false,
             online: false,
             stale: false,
+            priority: 0,
+            weight: 1,
             expected_chain_id,
             require_chain_id,
             chain_id_unverified_warned: false,
@@ -1882,13 +2043,17 @@ impl ServerState {
         }
     }
 
-    /// Record that the monitor lost this upstream.
+    /// Record that the monitor (or a session) lost this upstream.
     ///
     /// Clears `online` and the reported `chain_id`. Ranges, head, LIB and the
     /// ABI are kept, so coverage stays sticky. `offline_since` keeps the first
-    /// instant of an outage.
+    /// instant of an outage. Going from online to offline wakes the sessions
+    /// on this upstream (see [`UpstreamCounters::went_offline`]).
     pub fn mark_offline(&mut self, now: Instant) {
-        self.online = false;
+        if self.online {
+            self.online = false;
+            self.counters.went_offline.notify_waiters();
+        }
         self.chain_id = None;
         if self.offline_since.is_none() {
             self.offline_since = Some(now);
@@ -1972,6 +2137,17 @@ impl ServerState {
         true
     }
 
+    /// Whether selection may use this upstream (online or not).
+    pub fn routable(&self) -> bool {
+        self.enabled && !self.operator_disabled
+    }
+
+    /// Remove every block-range exclusion and pending strike.
+    pub fn clear_quarantines(&mut self) {
+        self.quarantines.clear();
+        self.block_strikes.clear();
+    }
+
     /// Drop exclusions whose TTL has passed so the list cannot grow without bound.
     pub fn prune_expired_quarantines(&mut self, now: Instant) {
         self.quarantines.retain(|quarantine| quarantine.active(now));
@@ -2036,6 +2212,8 @@ pub struct StaticConfig {
 pub struct ProxyLimits {
     pub handshake_timeout_ms: u64,
     pub idle_timeout_ms: u64,
+    /// See [`ServerConfig::upstream_liveness_timeout_ms`]. 0 = disabled.
+    pub upstream_liveness_timeout_ms: u64,
     /// Upstream WebSocket message/frame cap.
     pub max_message_bytes: usize,
     /// Client WebSocket message/frame cap.
@@ -2069,6 +2247,8 @@ pub fn build_state_db_with_chain_id(
                 state.role = s.role;
                 state.declared = s.range;
                 state.max_sessions = s.max_sessions;
+                state.priority = s.priority;
+                state.weight = s.weight.max(1);
                 (s.endpoint.clone(), state)
             })
             .collect::<HashMap<String, ServerState>>(),
@@ -2176,6 +2356,111 @@ mod tests {
         ]));
         cfg.validate().unwrap();
         assert_eq!(cfg.servers[0].ws_url(), "wss://[::1]:8443");
+    }
+
+    #[test]
+    fn priority_and_weight_default_and_reach_the_state_map() {
+        let cfg = config_with_servers(serde_json::json!([
+            { "name": "plain", "endpoint": "127.0.0.1:18080", "enabled": true },
+            { "name": "backup", "endpoint": "127.0.0.1:18081", "enabled": true,
+              "priority": 10, "weight": 3 }
+        ]));
+        cfg.validate().unwrap();
+        assert_eq!((cfg.servers[0].priority, cfg.servers[0].weight), (0, 1));
+        assert_eq!((cfg.servers[1].priority, cfg.servers[1].weight), (10, 3));
+
+        let db = build_state_db(cfg.servers.clone());
+        let states = db.try_lock().unwrap();
+        let backup = &states["127.0.0.1:18081"];
+        assert_eq!((backup.priority, backup.weight), (10, 3));
+        let plain = &states["127.0.0.1:18080"];
+        assert_eq!((plain.priority, plain.weight), (0, 1));
+    }
+
+    #[test]
+    fn priority_and_weight_serialize_only_when_set() {
+        let cfg = config_with_servers(serde_json::json!([
+            { "name": "plain", "endpoint": "127.0.0.1:18080", "enabled": true },
+            { "name": "backup", "endpoint": "127.0.0.1:18081", "enabled": true,
+              "priority": 10, "weight": 3 }
+        ]));
+        let servers = serde_json::to_value(&cfg).unwrap()["servers"].clone();
+        assert!(servers[0].get("priority").is_none());
+        assert!(servers[0].get("weight").is_none());
+        assert_eq!(servers[1]["priority"], 10);
+        assert_eq!(servers[1]["weight"], 3);
+    }
+
+    #[test]
+    fn dashboard_is_off_by_default_and_needs_metrics_port() {
+        let cfg: ServerConfig = serde_json::from_value(minimal_config()).unwrap();
+        assert_eq!(cfg.dashboard, DashboardConfig::default());
+        assert!(!cfg.dashboard.enabled);
+
+        let mut value = minimal_config();
+        value["dashboard"] = serde_json::json!({ "enabled": true });
+        let cfg: ServerConfig = serde_json::from_value(value.clone()).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("requires metrics_port"),
+            "unexpected error: {err}"
+        );
+
+        value["metrics_port"] = serde_json::json!(9090);
+        let cfg: ServerConfig = serde_json::from_value(value).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn control_token_must_be_long_and_from_one_config_source() {
+        let mut value = minimal_config();
+        value["metrics_port"] = serde_json::json!(9090);
+        value["dashboard"] = serde_json::json!({ "enabled": true, "control_token": "short" });
+        let cfg: ServerConfig = serde_json::from_value(value.clone()).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("at least 16"), "unexpected error: {err}");
+
+        value["dashboard"] = serde_json::json!({
+            "enabled": true,
+            "control_token": "0123456789abcdef",
+            "control_token_file": "/tmp/token"
+        });
+        let cfg: ServerConfig = serde_json::from_value(value).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("only one of"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn control_token_file_is_trimmed() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, b"  0123456789abcdef\n").unwrap();
+        let dashboard = DashboardConfig {
+            enabled: true,
+            control_token: None,
+            control_token_file: Some(file.path().display().to_string()),
+            allowed_hosts: Vec::new(),
+        };
+        // The environment variable takes precedence; only check the file
+        // when it is not set in this test environment.
+        if std::env::var(CONTROL_TOKEN_ENV).is_err() {
+            assert_eq!(
+                dashboard.resolve_control_token().unwrap().as_deref(),
+                Some("0123456789abcdef")
+            );
+        }
+    }
+
+    #[test]
+    fn zero_weight_is_rejected() {
+        let cfg = config_with_servers(serde_json::json!([
+            { "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true },
+            { "name": "b", "endpoint": "127.0.0.1:18081", "enabled": false, "weight": 0 }
+        ]));
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("server 'b': weight must be at least 1"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -3638,6 +3923,9 @@ mod tests {
 
     #[test]
     fn chain_api_resolution_uses_state_indices_push_order_and_bind_address() {
+        let mut weighted = with_api(live("live-2", 18082), "http://[::1]:8888/");
+        weighted["priority"] = serde_json::json!(5);
+        weighted["weight"] = serde_json::json!(3);
         let cfg = single(
             serde_json::json!([
                 with_api(live("off", 18079), "10.0.1.9:8888")
@@ -3650,7 +3938,7 @@ mod tests {
                     .unwrap(),
                 live("no-api", 18080),
                 with_api(live("live-1", 18081), "10.0.1.10:8888"),
-                with_api(live("live-2", 18082), "http://[::1]:8888/")
+                weighted
             ]),
             serde_json::json!({
                 "chain_api": {
@@ -3677,7 +3965,16 @@ mod tests {
         for u in &resolved.upstreams {
             assert_eq!(db[&u.endpoint].index, u.index);
             assert_eq!(db[&u.endpoint].name, u.name);
+            assert_eq!(db[&u.endpoint].priority, u.priority);
+            assert_eq!(db[&u.endpoint].weight, u.weight);
         }
+        // Each server's priority and weight carry over to its API.
+        let tiers: Vec<(u32, u32)> = resolved
+            .upstreams
+            .iter()
+            .map(|u| (u.priority, u.weight))
+            .collect();
+        assert_eq!(tiers, vec![(0, 1), (5, 3)]);
         assert_eq!(resolved.push, vec![2, 1]);
         assert_eq!(resolved.upstreams[1].api.authority(), "[::1]:8888");
 

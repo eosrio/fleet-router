@@ -155,15 +155,16 @@ enum Inbound {
     /// A status result was decoded (the in-flight request is done).
     /// The payload is the result variant: 0 = v0, 3 = v1.
     Status(u8),
-    /// Upstream sent a close frame. Stop monitoring this server, unless this
-    /// session's unanswered v1 probe should reconnect and fall back.
+    /// Upstream sent a close frame (nodeos does this when it shuts down
+    /// cleanly). Mark it offline and reconnect, so it comes back online after
+    /// a restart.
     Close,
     Ignore,
 }
 
 /// How [`run_monitor_session`] ended.
 enum SessionEnd {
-    /// Shutdown, or the upstream closed after this was not an unanswered v1 probe.
+    /// Shutdown.
     Stop,
     /// Reconnect. `unanswered_v1` means a v1 request was sent and no status
     /// result arrived. `saw_status` resets the miss counter.
@@ -404,9 +405,8 @@ pub async fn monitoring_connection(
 
 /// Drive one connected monitor session.
 ///
-/// [`SessionEnd::Stop`] means shutdown, or the upstream closed after this was
-/// not an unanswered v1 probe. [`SessionEnd::Reconnect`] asks the outer loop
-/// to connect again. `status_request` is the variant byte to send; a v0 result
+/// [`SessionEnd::Stop`] means shutdown. [`SessionEnd::Reconnect`] asks the
+/// outer loop to connect again, including after the upstream closed. `status_request` is the variant byte to send; a v0 result
 /// switches it to [`STATUS_REQUEST_V0`] for the rest of this upstream.
 async fn run_monitor_session(
     websocket: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -482,13 +482,12 @@ async fn run_monitor_session(
                         }
                         Inbound::Close => {
                             mark_offline_published(hub, &server.endpoint).await;
-                            // A node that does not understand v1 often closes the
-                            // socket. Reconnect so the miss counter can fall back
-                            // to v0. A close after a real status result still stops.
-                            if sent_v1 && !saw_status {
-                                return session_reconnect(true, false);
-                            }
-                            return SessionEnd::Stop;
+                            // Always reconnect. A node that does not understand
+                            // v1 often closes the socket, and the miss counter
+                            // then falls back to v0. A node that is restarting
+                            // closes it too; stopping here would keep it offline
+                            // until the router restarts.
+                            return session_reconnect(sent_v1, saw_status);
                         }
                         Inbound::Ignore => {}
                     }
@@ -611,7 +610,7 @@ async fn handle_monitoring_msg(
 /// upstream stays online and a warning is logged once until a later status
 /// reports a `chain_id`. `require_chain_id` restores the reject-when-missing
 /// behaviour for a pinned pool.
-async fn apply_status_update(
+pub(crate) async fn apply_status_update(
     bin_msg: &[u8],
     server_state_db: &ServerStateDb,
     server: &Server,
@@ -813,7 +812,7 @@ fn warn_unverified_chain_id(server: &Server, expected: Option<[u8; 32]>) {
     }
 }
 
-fn hex_32(bytes: &[u8; 32]) -> String {
+pub(crate) fn hex_32(bytes: &[u8; 32]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(64);
     for b in bytes {

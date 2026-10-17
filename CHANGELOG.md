@@ -7,9 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-17
+
+### Upgrade notes
+
+- The new upstream liveness check is on by default. A session pings an
+  upstream that has sent nothing for 2 s and fails over if nothing comes
+  back within 4 s. Clients keep their connection either way, but if single
+  blocks from your upstreams take seconds to transfer (very large blocks over
+  a slow link), raise `upstream_liveness_timeout_ms`.
+- The dashboard and control API are off unless `dashboard.enabled` is set.
+  An existing `metrics_port` serves the same health, readiness and metrics
+  as before.
+- `/ready` no longer counts an upstream that an operator disabled through
+  the control API.
+- The health/metrics endpoint now runs on hyper. Paths and bodies are
+  unchanged; a non-GET request to an unknown path returns `404` instead of
+  `405`.
+
+### Fixed
+
+- A session on an upstream that went silent without closing the connection
+  (cable pulled, VM frozen, firewall dropping packets) waited until the
+  operating system gave up on the TCP connection, often around 15 minutes,
+  and the client saw a stalled stream. Sessions now ping a quiet upstream and
+  fail over when nothing comes back within `upstream_liveness_timeout_ms`
+  (default 4 s), or within 1 s once the monitor has marked that upstream
+  offline. The client keeps its connection and resumes at the next block.
+  Reported by @Rossco99.
+- The upstream monitor stopped for good when an upstream closed its WebSocket
+  cleanly, as nodeos does on a normal shutdown or restart. That upstream then
+  stayed offline until fleet-router restarted. The monitor now reconnects.
+
 ### Added
 
+- `upstream_liveness_timeout_ms` (default `4000`, `0` disables). See Fixed.
+- Opt-in live dashboard at `/ui/`, a plain `/status` page, and a JSON API
+  under `/api/v1` (status, sessions, 15-minute history, events, and a
+  server-sent events stream), served on `metrics_port` when
+  `dashboard.enabled` is `true`. Off by default, so upgrading does not expose
+  anything new on an existing metrics port. Requested by @Rossco99.
+- Token-protected control API (`dashboard.control_token_file`,
+  `dashboard.control_token`, or `FLEET_ROUTER_CONTROL_TOKEN`): disable,
+  enable, or drain an upstream, change its priority and weight at runtime,
+  clear its quarantines, and move or close a single session. A drain moves
+  live sessions to other upstreams with the normal failover, so clients stay
+  connected. A session moves only when another online upstream's range
+  starts at or before its next block, so draining the only archive node
+  leaves its history readers in place. Runtime changes are not written back
+  to the config.
+- `dashboard.allowed_hosts`: dashboard routes answer only requests addressed
+  by IP, `localhost`, or a listed name, which blocks DNS rebinding. At most 32
+  live streams are open at once.
+- New gauge `fleet_router_upstream_operator_disabled`.
+
+- Optional per-server `priority` (default `0`, lower is preferred) and
+  `weight` (default `1`). Among upstreams that are equally able to serve a
+  request (same block coverage and freshness), the router uses the lowest
+  priority tier, then the fewest connections per unit of weight. A high
+  priority makes an upstream a last resort. Failover still moves off a failed
+  preferred upstream to a backup that covers the block. New gauges
+  `fleet_router_upstream_priority` and `fleet_router_upstream_weight`.
+  Requested by @Rossco99.
 - Static landing page under `site/` for GitHub Pages.
+- `deploy/fleet-router.service`, a systemd unit for one process and one config
+  file, next to the per-network `fleet-router@.service` template.
+- "Run as a service" section in `docs/operations.md`: step-by-step systemd
+  install, Docker restart policy, a launchd plist for macOS, and running the
+  Windows build under a service wrapper.
+
+### Changed
+
+- The health/metrics endpoint now runs on hyper (via axum) instead of a
+  hand-written HTTP loop. Paths and response bodies are unchanged. Request
+  headers must arrive within 5 s, at most 256 connections are served at
+  once, and each connection serves one request (as before). A request to an unknown path with a method other than `GET` now
+  returns `404` instead of `405`.
+- `fleet_router_upstream_priority` and `fleet_router_upstream_weight` report
+  the values in effect, which can differ from the config after a control API
+  change.
+- Shorten `README.md` to an overview, install, and quick start. The full
+  configuration reference, production notes, and metrics moved to
+  `docs/configuration.md`, `docs/operations.md`, and `docs/observability.md`.
+- Both systemd units set `LimitNOFILE=65536` (the systemd default of 1024
+  open files capped the router at about 500 clients), `RestartSec=2`, and
+  basic sandboxing (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
+  `PrivateTmp`).
 
 ## [0.5.0] - 2026-10-15
 
@@ -235,7 +318,8 @@ First public release on crates.io and GitHub.
 - Upstream handshake now skips leading control frames and retries against
   another upstream instead of dropping the client on an unexpected first frame.
 
-[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/eosrio/fleet-router/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/eosrio/fleet-router/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/eosrio/fleet-router/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/eosrio/fleet-router/compare/v0.3.0...v0.3.1

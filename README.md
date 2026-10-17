@@ -1,36 +1,16 @@
 # fleet-router
 
-[Homepage](https://eosrio.github.io/fleet-router/)
-
 A reverse proxy and load balancer for the Antelope **SHiP** (State History Plugin) WebSocket protocol.
 
 [![CI](https://github.com/eosrio/fleet-router/actions/workflows/ci.yml/badge.svg)](https://github.com/eosrio/fleet-router/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/fleet-router.svg)](https://crates.io/crates/fleet-router)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`fleet-router` sits in front of a fleet of Antelope SHiP nodes. Clients open a single WebSocket connection to the router; the router picks a healthy upstream SHiP node, forwards its ABI, and proxies the WebSocket bidirectionally. If an upstream drops, the router transparently fails over to another suitable node, replays the in-flight `get_blocks` request from the next block, and de-duplicates already-delivered blocks — so the client connection persists without any manual reconnect.
+[Homepage](https://eosrio.github.io/fleet-router/) · [Configuration](docs/configuration.md) · [Operations](docs/operations.md) · [Observability](docs/observability.md) · [Dashboard & API](docs/api.md) · [Changelog](CHANGELOG.md)
 
-Use it when you run more than one SHiP node and want clients (Hyperion, dfuse-style indexers, custom consumers) to see a single, resilient endpoint with load balancing and automatic failover, instead of pinning each consumer to one node.
+Run more than one SHiP node? Put fleet-router in front of them and give your clients (Hyperion, other indexers, custom consumers) **one resilient endpoint** instead of pinning each consumer to one node.
 
-It is written in Rust on [tokio](https://tokio.rs/) and [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite), and uses [rs_abieos](https://github.com/eosrio/rs-abieos) (pure-Rust backend) to check that an upstream SHiP ABI parses. Each handshake, failover, and monitor builds a short-lived `AbiHandle` and drops it; connections do not share an abieos context.
-
-## Features
-
-- **Range-aware, least-connections load balancing** — prefers an upstream whose trace range covers the requested block; otherwise routes to the least-loaded healthy upstream. A `get_blocks_request_v1` with `fetch_finality_data` is sent only to an upstream whose finality-data range covers that block (learned from `get_status_result_v1`). If no upstream reports a covering range, routing stays on the trace-range rules.
-- **Automatic failover with de-duplication** — on upstream loss, reconnects to another suitable node, resumes `get_blocks` at the next block, de-duplicates replayed blocks, and buffers/replays client frames sent during the swap. A session that keeps dying on an unclean drop at the same next block backs off and is closed with WebSocket code 1011 after five such drops. An idle timeout or a clean close still fails over and does not count.
-- **Opt-in block quarantine** — `block_failure_quarantine` can skip an upstream for a short block range after repeated unclean drops at that block, without marking the node offline.
-- **Stale-upstream deprioritization** — upstreams that stop advancing their chain state are flagged stale and deprioritized (not hard-excluded) when routing.
-- **Multiple networks in one process** — `listeners` mode serves several chains, each on its own port with its own upstream pool, `chain_id`, connection cap, and `/ready/<name>` check.
-- **`chain_id` verification** — upstreams reporting a different `chain_id` from the pinned value or the rest of their pool are kept offline. Older nodes that omit `chain_id` (FIO and other EOSIO 2.0-based builds) stay usable unless `require_chain_id` is set.
-- **Graceful shutdown** — handles `SIGINT`/`SIGTERM` with a bounded drain and WebSocket close frames to connected clients.
-- **Structured logging** — `tracing`-based, controlled with `RUST_LOG`.
-- **Optional health/metrics endpoint** — liveness, readiness, and Prometheus metrics over HTTP, enabled on demand. Per-upstream series carry `server` and `endpoint` labels and include each SHiP range's start and end blocks.
-- **Upstream `wss://`** — optional TLS to SHiP nodes. A bare `host:port` stays `ws://`. Certificates are verified with rustls against the OS trust store. The client listener remains plaintext.
-- **Resource safety** — connection cap, handshake/idle timeouts, and a bounded maximum WebSocket message size.
-
-## How it works
-
-A client connects over WebSocket. The router selects an upstream (range-aware, then least-connections), forwards that upstream's ABI to the client, and then proxies frames in both directions. Background loops poll each upstream's status and block progress; an upstream that stops advancing is marked stale and deprioritized. If the active upstream drops, the router selects another suitable upstream, resends the in-flight `get_blocks` request resumed at the next block, de-duplicates blocks the client has already received, and replays any client frames buffered during the swap. The client connection stays open throughout.
+Clients open a single WebSocket connection to the router. The router picks a healthy upstream, forwards its ABI, and proxies the stream. If that upstream drops, the router fails over to another suitable node, resumes `get_blocks` at the next block, and de-duplicates blocks the client already has. The client connection stays open.
 
 ```
                                     +-----------------------+
@@ -46,30 +26,25 @@ A client connects over WebSocket. The router selects an upstream (range-aware, t
        transparent swap to B  ----> +-----------------------+  de-duplicate blocks)
 ```
 
-## Requirements and supported platforms
+## Features
 
-fleet-router builds on **Linux, macOS, and Windows** (x86_64 and arm64). ABI handling uses the pure-Rust `rs_abieos` backend, so `libclang` is not required. Upstream TLS links [aws-lc-rs](https://github.com/aws/aws-lc-rs) through rustls. Building that provider needs a C compiler and CMake on `PATH`.
-
-| Requirement | Notes |
-|---|---|
-| Rust ≥ 1.99 (MSRV) | Toolchain used to build, test, and publish fleet-router |
-| C compiler and CMake | Used to build `aws-lc-rs` for `wss://`. Not required at runtime. |
-
-If you do not already have Rust, install it via [rustup](https://rustup.rs/):
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
+- **Failover without reconnecting.** On upstream loss the session moves to another node, resumes at the next block, drops replayed blocks, and replays client frames sent during the swap.
+- **Range-aware, least-connections routing.** Requests go to an upstream whose trace range covers the requested block, otherwise to the least-loaded healthy one. Optional per-node `priority` and `weight` mark preferred and last-resort nodes and split load. `fetch_finality_data` requests go only to nodes whose finality range covers the block.
+- **Stale nodes are deprioritized, not excluded.** Upstreams that stop advancing drop down the list.
+- **Bounded failure on corrupted SHiP logs.** A block that breaks every upstream ends the session with close code 1011 and a clear reason instead of a silent stall. Opt-in quarantine skips one node for just the bad block range.
+- **Several networks in one process.** Each listener has its own port, upstream pool, `chain_id`, connection cap, and `/ready/<name>` check.
+- **`chain_id` verification.** Upstreams that report the wrong chain stay offline. Older nodes that omit `chain_id` (FIO and other EOSIO 2.0-based builds) stay usable unless you require it.
+- **Operable.** Prometheus metrics, health and readiness endpoints, `tracing` logs, graceful shutdown, upstream `wss://`, and connection, timeout and message-size limits.
+- **Live dashboard and control API (opt-in).** See every upstream's block range, load and health in real time, and drain a node for maintenance: its sessions move to other nodes without the clients reconnecting.
 
 ## Installation
 
-### From crates.io
-
 ```bash
-cargo install fleet-router
+cargo install fleet-router              # from crates.io
+docker pull ghcr.io/eosrio/fleet-router  # container image
 ```
 
-### From source
+Prebuilt archives for Linux x86_64, macOS (arm64 and x86_64) and Windows x86_64 are attached to each [GitHub Release](https://github.com/eosrio/fleet-router/releases). To build from source:
 
 ```bash
 git clone https://github.com/eosrio/fleet-router.git
@@ -77,84 +52,27 @@ cd fleet-router
 cargo install --path .
 ```
 
-### Docker
+### Requirements and supported platforms
 
-A prebuilt image is published to the GitHub Container Registry on tagged releases:
+fleet-router builds on **Linux, macOS, and Windows** (x86_64 and arm64).
 
-```bash
-docker pull ghcr.io/eosrio/fleet-router
-```
+- **Rust ≥ 1.99** (MSRV). Install it with [rustup](https://rustup.rs/) if needed.
+- **A C compiler and CMake** on `PATH`, to build `aws-lc-rs` for upstream `wss://`. Not needed at runtime.
 
-The image runs as a non-root user and defines a `HEALTHCHECK` that runs `fleet-router check` against the proxy port (`17000`). See [Running in production](#running-in-production) for a full `docker run` example.
+ABI handling uses the pure-Rust [rs_abieos](https://github.com/eosrio/rs-abieos) backend, so `libclang` is not required.
 
 ## Quick start
 
-1. Write a sample config file:
-
-   ```bash
-   fleet-router config init ./config.json
-   ```
-
-2. Edit `config.json` to list your SHiP nodes. A bare `host:port` is dialed as `ws://`; use `wss://host:port` when the node serves TLS. Adjust the bind address/port and intervals.
-
-3. Validate the config and test upstream connectivity:
-
-   ```bash
-   fleet-router config test ./config.json
-   ```
-
-4. Run the proxy:
-
-   ```bash
-   fleet-router run --config ./config.json
-   ```
-
-On startup, `run` validates the configuration before binding. Invalid configs fail fast with an actionable error; on success the router begins listening and logs its upstream monitors:
-
-```
-configuration is valid.
-INFO starting upstream monitor name="SHiP Node 1" upstream=127.0.0.1:18080
-INFO listening for clients address=0.0.0.0 port=17000
+```bash
+fleet-router config init ./config.json   # 1. write a sample config
+#                                          2. list your SHiP nodes in config.json
+fleet-router config test ./config.json   # 3. validate and test upstream connectivity
+fleet-router run --config ./config.json  # 4. start the proxy
 ```
 
-## Configuration
+To start fleet-router at boot and restart it after a crash, run it as a service: [systemd, Docker, launchd or Windows](docs/operations.md#run-as-a-service).
 
-Configuration is a single JSON file (`config.json` by default). The three `*_ms` fields are in **milliseconds**. An upstream `endpoint` is `host:port`, `ws://…`, or `wss://…`. A bare `host:port` is dialed as `ws://`, which is what existing configs already do.
-
-- **`listen_address`** *(string, required in single-port mode; default `"0.0.0.0"` with `listeners`)* — Bind address for client connections (e.g. `0.0.0.0`). Acts as the default bind address for `listeners` and `metrics_address`.
-- **`listen_port`** *(u16, required in single-port mode, non-zero; sample `17000`)* — Port for client connections in single-listener mode. Cannot be combined with `listeners`.
-- **`upstream_reconnect_ms`** *(u64, required, `> 0`)* — Milliseconds between upstream reconnection attempts.
-- **`upstream_monitoring_ms`** *(u64, required, `> 0`)* — Milliseconds between block-progress logging and staleness checks.
-- **`upstream_status_ms`** *(u64, required, `> 0`)* — Milliseconds between status requests sent to each upstream. Only one request is in flight; a reply that misses this deadline marks the upstream offline.
-- **`servers`** *(array, required in single-port mode, `≥ 1` enabled)* — List of upstream SHiP nodes (see below). Mutually exclusive with `listeners`.
-- **`chain_id`** *(string, optional)* — 64-character hex `chain_id` in single-port mode; upstreams reporting a different `chain_id` are rejected and kept offline. A status that omits `chain_id` stays online unless `require_chain_id` is set: on `get_status_result_v0` that field is an optional extension, and older nodeos builds (FIO mainnet/testnet and other EOSIO 2.0-based nodes) never send it. Even when unset, any upstream whose reported `chain_id` mismatches the rest of its pool is automatically rejected.
-- **`require_chain_id`** *(bool, optional, default `false`)* — Reject and keep offline any upstream whose status omits `chain_id`. Requires `chain_id`. The default accepts that status and logs one warning per upstream that `chain_id` cannot be verified (the warning is cleared if a later status reports a `chain_id`, then logged again on the next omission). Cannot be combined with `listeners`; set it on each listener instead.
-- **`block_failure_quarantine`** *(object, optional, off when omitted)* — After repeated unclean mid-`get_blocks` drops at the same block, skip that upstream for a short range. It stays online for every other block. Cannot be combined with `listeners`; set it on each listener instead. See [Corrupted SHiP logs](#corrupted-ship-logs).
-  - **`strikes`** *(u32, default `2`, `> 0`)* — Unclean drops at one block, from any session, before the exclusion.
-  - **`window_secs`** *(u64, default `300`, `> 0`)* — How long a strike counts toward `strikes`.
-  - **`ttl_secs`** *(u64, default `600`, `> 0`)* — How long the exclusion lasts.
-  - **`range`** *(u32, default `1`, `> 0`)* — Blocks skipped starting at the failed block K (`K..K+range`). `1` skips only K.
-- **`listeners`** *(array, required in multi-listener mode, `≥ 1` entry)* — Named ingress listeners mapping distinct ports to isolated SHiP pools (see [Multi-network / multi-port routing](#multi-network--multi-port-routing)).
-- **`max_connections`** *(usize, optional, default `10000`)* — Max concurrent client connections; excess are rejected (backpressure). Acts as the default per-listener cap when `listeners` is used.
-- **`handshake_timeout_ms`** *(u64, optional, default `10000`)* — Client WebSocket handshake timeout; `0` disables it. The upstream monitor and `config test` use this same bound for connect and the first read, falling back to 10s when it is `0`.
-- **`idle_timeout_ms`** *(u64, optional, default `0` / disabled)* — Close a connection idle (no data in either direction) for this long.
-- **`max_message_bytes`** *(usize, optional, default `268435456` / 256 MiB)* — Max WebSocket message size on proxied upstreams and monitor connections.
-- **`max_client_message_bytes`** *(usize, optional, default `65536` / 64 KiB)* — Max WebSocket message and frame size accepted from a client. Omitting the field keeps existing configs valid and applies this default.
-- **`shutdown_grace_ms`** *(u64, optional, default `5000`)* — How long to wait for in-flight connections to drain on shutdown.
-- **`metrics_address`** *(string, optional, defaults to `listen_address`)* — Bind address for the health/metrics HTTP endpoint.
-- **`metrics_port`** *(u16, optional, disabled when unset)* — Port for the health/metrics HTTP endpoint. Setting it enables the endpoint.
-
-Each entry in `servers` is an object:
-
-- **`name`** *(string, required)* — Human-readable name used in logs and as the `server` label on each `/metrics` series for this upstream.
-- **`endpoint`** *(string, required)* — Upstream as `host:port`, `ws://host:port`, or `wss://host:port`. A bare `host:port` is dialed as `ws://`. Endpoints must be unique within a listener's pool (see below).
-- **`enabled`** *(bool, required)* — Whether the router may use this upstream. At least one enabled server is required.
-
-`wss://` is dialed with rustls (not OpenSSL). The router verifies the upstream certificate against the operating-system trust store. The published container image installs CA certificates, so public CAs work there. For a private CA, install it into that store, or set `SSL_CERT_FILE` / `SSL_CERT_DIR` to PEM certificates — when either variable is set, those paths replace the OS store. Unknown schemes (`https://`, `http://`, …) are rejected. Uniqueness is the dial target: `127.0.0.1:8080` and `ws://127.0.0.1:8080` are the same upstream, and so are `ws://host` and `ws://host:80`. `ws://` and `wss://` to the same host are different. The client-facing listener stays plaintext `ws://`.
-
-Client requests are capped by `max_client_message_bytes` (default 64 KiB) on both the WebSocket message size and the frame size. Upstream block payloads still use `max_message_bytes`. While an upstream failover is in progress, client frames that cannot be forwarded are buffered up to **64 KiB** per session. Each buffered frame counts as at least one byte, so empty frames cannot grow the queue without a bound. Exceeding that cap closes the session with WebSocket close code 1008 (policy violation).
-
-### Sample `config.json`
+A minimal config with two SHiP nodes:
 
 ```json
 {
@@ -164,84 +82,23 @@ Client requests are capped by `max_client_message_bytes` (default 64 KiB) on bot
   "upstream_monitoring_ms": 5000,
   "upstream_status_ms": 5000,
   "servers": [
-    {
-      "name": "SHiP Node 1",
-      "endpoint": "127.0.0.1:18080",
-      "enabled": true
-    },
-    {
-      "name": "SHiP Node 2",
-      "endpoint": "127.0.0.1:28080",
-      "enabled": true
-    }
+    { "name": "SHiP Node 1", "endpoint": "127.0.0.1:18080", "enabled": true },
+    { "name": "SHiP Node 2", "endpoint": "127.0.0.1:28080", "enabled": true }
   ]
 }
 ```
 
-### Multi-network / multi-port routing
+A bare `host:port` is dialed as `ws://`; use `wss://host:port` for nodes that serve TLS. Then point your client's SHiP URL at the router (`ws://<router-host>:17000`) instead of a single node.
 
-To expose multiple ingress ports for different chains (each backed by its own redundant SHiP pool), you can either:
+On startup the router validates the config and logs its upstream monitors:
 
-1. **Use `listeners` in a single `fleet-router` process** — each entry in `listeners` binds its own port and maintains an isolated upstream pool, monitor loop, and connection semaphore:
+```
+configuration is valid.
+INFO starting upstream monitor name="SHiP Node 1" upstream=127.0.0.1:18080
+INFO listening for clients address=0.0.0.0 port=17000
+```
 
-   - **`name`** *(string, required)* — Unique listener/network identifier (no `/` or whitespace). Used in logs, `/metrics` (`listener="<name>"`), and `/ready/<name>`.
-   - **`listen_port`** *(u16, required, non-zero)* — Ingress TCP port for this listener. Must not collide with other listeners or `metrics_port`.
-   - **`listen_address`** *(string, optional)* — Bind address override; defaults to top-level `listen_address` (or `"0.0.0.0"`).
-   - **`max_connections`** *(usize, optional)* — Per-listener concurrent client cap; defaults to top-level `max_connections`.
-   - **`chain_id`** *(string, optional, recommended)* — 64-character hex `chain_id` for this network; upstreams reporting a different `chain_id` are rejected and kept offline. A status that omits `chain_id` stays online unless `require_chain_id` is true, because older nodeos builds never send that optional `get_status_result_v0` extension. When `chain_id` is omitted from the config, `fleet-router` logs a startup warning and trusts the first currently-online upstream in the pool as the reference `chain_id` (if a misconfigured wrong-chain node answers first, the remaining nodes will be rejected until it goes offline). Always pin `chain_id` in multi-network setups.
-   - **`require_chain_id`** *(bool, optional, default `false`)* — When `true`, a status that omits `chain_id` is rejected and the upstream stays offline. Requires this listener's `chain_id`. The default keeps older SHiP nodes (FIO and other EOSIO 2.0-based builds) online and logs a one-time warning that `chain_id` cannot be verified for that upstream.
-   - **`block_failure_quarantine`** *(object, optional)* — Same fields as the top-level object (`strikes`, `window_secs`, `ttl_secs`, `range`). Applies only to this listener's pool.
-   - **`servers`** *(array, required, `≥ 1` enabled)* — Redundant SHiP nodes belonging to this network. Referencing the same `endpoint` across two different listeners is allowed (e.g. a dedicated VIP vs. a public port) and spawns an independent upstream monitor per listener.
-
-   ```json
-   {
-     "listen_address": "0.0.0.0",
-     "upstream_reconnect_ms": 3000,
-     "upstream_monitoring_ms": 5000,
-     "upstream_status_ms": 5000,
-     "metrics_port": 9090,
-     "listeners": [
-       {
-         "name": "eos",
-         "listen_port": 17000,
-         "chain_id": "aca376f206b8fc25a6ed44dbdc66547c36c6c33e3a119ffbeaef943642f0e906",
-         "servers": [
-           {
-             "name": "EOS SHiP 1",
-             "endpoint": "10.0.1.10:8080",
-             "enabled": true
-           },
-           {
-             "name": "EOS SHiP 2",
-             "endpoint": "10.0.1.11:8080",
-             "enabled": true
-           }
-         ]
-       },
-       {
-         "name": "wax",
-         "listen_port": 17001,
-         "chain_id": "1064487b3cd1a897ce03ae5b6a865651747e2e152090f99c1d19d44e01aea5a4",
-         "servers": [
-           {
-             "name": "WAX SHiP 1",
-             "endpoint": "10.0.2.10:8080",
-             "enabled": true
-           },
-           {
-             "name": "WAX SHiP 2",
-             "endpoint": "10.0.2.11:8080",
-             "enabled": true
-           }
-         ]
-       }
-     ]
-   }
-   ```
-
-2. **Run one `fleet-router` instance per network** for process/container-level isolation — see [`deploy/docker-compose.multi-network.yml`](deploy/docker-compose.multi-network.yml) and [`deploy/fleet-router@.service`](deploy/fleet-router@.service).
-
-## Usage
+## Commands
 
 ```text
 fleet-router config init <path>     Write a sample config file to <path>.
@@ -252,137 +109,27 @@ fleet-router --version              Print the version.
 fleet-router --help                 Print help.
 ```
 
-The `--config` flag is global and defaults to `./config.json`, so `fleet-router run` with a `config.json` in the working directory is equivalent to passing `--config ./config.json`.
+`--config` is global and defaults to `./config.json`.
 
-## Observability
+## Documentation
 
-### Logging
+- **[Configuration reference](docs/configuration.md)**: every field and default, upstream TLS, and multi-network `listeners`.
+- **[Running in production](docs/operations.md)**: security, running as a service (systemd, Docker, launchd, Windows), graceful shutdown, corrupted SHiP logs, and tuning.
+- **[Observability](docs/observability.md)**: logging, health and readiness endpoints, and the Prometheus metrics.
+- **[Dashboard and control API](docs/api.md)**: the opt-in live dashboard, status page, JSON API, and token-protected control actions.
+- **Deployment samples**: [`deploy/fleet-router.service`](deploy/fleet-router.service), [`deploy/fleet-router@.service`](deploy/fleet-router@.service), and [`deploy/docker-compose.multi-network.yml`](deploy/docker-compose.multi-network.yml).
 
-Logging uses `tracing`. Control verbosity with the `RUST_LOG` environment variable (default `info`):
+## Security
 
-```bash
-# Everything at debug
-RUST_LOG=debug fleet-router run --config config.json
+The client listener is **plaintext `ws://` and unauthenticated**. Run fleet-router on a trusted network or behind a TLS-terminating reverse proxy that adds access control. **Do not expose it directly to the public internet.** See [Security](docs/operations.md#security) for details.
 
-# Debug for fleet-router, info for everything else
-RUST_LOG=fleet_router=debug,info \
-  fleet-router run --config config.json
-```
-
-### Health and metrics endpoint
-
-Set `metrics_port` (and optionally `metrics_address`) to enable an HTTP endpoint. It serves `GET` requests on:
-
-- **`/health`**, **`/healthz`** — `200` while the process is running.
-- **`/ready`**, **`/readyz`** — `200` if at least one upstream is online (or, in `listeners` mode, if **every** listener has at least one upstream online), otherwise `503`.
-- **`/ready/<listener>`**, **`/readyz/<listener>`** — `200` if the named listener has at least one online upstream, `503` if none are online, or `404` if the listener name is unknown.
-- **`/metrics`** — Prometheus text exposition of router and upstream state.
-
-Exposed metrics include (each per-upstream series carries `server="<name>"` from the configured server name; in multi-listener mode, each upstream series also carries `listener="<name>"`):
-
-```text
-fleet_router_up
-fleet_router_upstream_up{endpoint,server}
-fleet_router_upstream_stale{endpoint,server}
-fleet_router_active_connections{endpoint,server}
-fleet_router_upstream_trace_begin_block{endpoint,server}
-fleet_router_upstream_chain_state_begin_block{endpoint,server}
-fleet_router_upstream_chain_state_end_block{endpoint,server}
-fleet_router_upstream_finality_data_begin_block{endpoint,server}
-fleet_router_upstream_finality_data_end_block{endpoint,server}
-fleet_router_upstream_block_failures_total{endpoint,server}
-fleet_router_upstream_quarantined{endpoint,server}
-fleet_router_upstream_quarantine_block{endpoint,server}
-```
-
-`fleet_router_up` is a process gauge and has no labels. Label values escape `\`, `"`, and newlines per the Prometheus text format.
-
-`trace_begin_block`, `chain_state_begin_block`, and `finality_data_begin_block` are the first block of each SHiP range on that upstream. The gauges are always emitted. `0` is the value before a status result arrives. `finality_data_begin_block` (and `finality_data_end_block`) stay `0` on pre-Savanna nodes that only answer `get_status_result_v0` and never report a finality range.
-
-`fleet_router_upstream_block_failures_total` counts unclean mid-`get_blocks` drops (the socket died with no WebSocket close frame) while a blocks request was in flight. `fleet_router_upstream_quarantined` is `1` while that upstream is excluded for any block range. `fleet_router_upstream_quarantine_block` is the start block of that exclusion, or `0` when none is active; if several ranges are active it is the lowest start block. The block number is the gauge value, not a label.
-
-## Running in production
-
-> **Do not expose `fleet-router` directly to the public internet.** See [Security and limitations](#security-and-limitations).
-
-### systemd
-
-For a single config file (either single-port or multi-listener):
-
-```ini
-[Unit]
-Description=Fleet SHiP Router
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=fleet
-ExecStart=/usr/local/bin/fleet-router run --config /etc/fleet-router/config.json
-Restart=on-failure
-# SIGTERM triggers a graceful, bounded drain. Allow more than shutdown_grace_ms
-# so systemd does not SIGKILL the process mid-drain.
-TimeoutStopSec=10
-Environment=RUST_LOG=info
-
-[Install]
-WantedBy=multi-user.target
-```
-
-To run **one isolated process per network** with systemd template units, copy [`deploy/fleet-router@.service`](deploy/fleet-router@.service) to `/etc/systemd/system/fleet-router@.service`, place each chain's config at `/etc/fleet-router/<chain>.json`, and start each unit (`systemctl enable --now fleet-router@eos fleet-router@wax`).
-
-`SIGTERM` (sent by `systemctl stop`) triggers graceful shutdown: the router stops accepting new connections, drains in-flight ones for up to `shutdown_grace_ms`, and sends WebSocket close frames to clients. Keep `TimeoutStopSec` comfortably larger than `shutdown_grace_ms`.
-
-### Docker
-
-```bash
-docker run -p 17000:17000 \
-  -v "$PWD/config.json:/etc/fleet-router.json:ro" \
-  ghcr.io/eosrio/fleet-router run --config /etc/fleet-router.json
-```
-
-The image runs as a non-root user. Its `HEALTHCHECK` runs `fleet-router check`, which dials `127.0.0.1:17000`. For multi-container deployments (one container per network), see [`deploy/docker-compose.multi-network.yml`](deploy/docker-compose.multi-network.yml).
-
-### Corrupted SHiP logs
-
-A damaged `trace_history.log` or `chain_state_history.log` makes nodeos drop the SHiP socket with no WebSocket close frame when a client reaches that block (`zlib error: iostream error`). Indexers then reconnect and request the same block forever. fleet-router treats that drop as a mid-stream failure:
-
-- The session tries another suitable upstream first. Retries after an unclean drop at the same next block wait 100 ms, then double, up to 3.2 s, and stop after five such drops. The client is closed with WebSocket code 1011 and reason `block <K> unavailable on all upstreams`. One error line names the upstream and the block. An idle timeout or a clean close still fails over after 100 ms and does not count, so a client waiting at the chain tip is not closed.
-- Each unclean drop increments `fleet_router_upstream_block_failures_total` for that upstream. The node stays online, so other block ranges are unaffected.
-- Optional `block_failure_quarantine` remembers the block. After `strikes` drops at the same K inside `window_secs`, from any session, that upstream is skipped for requests starting in `K..K+range` for `ttl_secs`. Later sessions are routed to a healthy node and do not pay a failover on that range. When the TTL ends the upstream is eligible again. Repair or resync the log; the gauge `fleet_router_upstream_quarantine_block` shows which block to look at.
-
-This bound is always on. Quarantine is off until `block_failure_quarantine` is set, at the top level or on a listener.
-
-### Tuning notes
-
-- **Intervals** (`upstream_reconnect_ms`, `upstream_monitoring_ms`, `upstream_status_ms`): lower values detect failures and staleness faster at the cost of more polling traffic to upstreams; raise them to reduce chatter.
-- **Limits** (`max_connections`, `handshake_timeout_ms`, `idle_timeout_ms`, `max_message_bytes`, `max_client_message_bytes`): size `max_connections` for your expected concurrency (excess connections are rejected, not queued); set `idle_timeout_ms` to reap dead clients; lower `max_message_bytes` only if you are sure upstream blocks fit. `max_client_message_bytes` caps client frames (default 64 KiB). The per-session failover buffer is capped at 64 KiB, and the session is closed if a client exceeds it.
-
-## Security and limitations
-
-- The client listener is **plaintext `ws://`** and **unauthenticated** — anyone who can reach the port can stream data. Put TLS and access control for clients on a reverse proxy in front of fleet-router.
-- Upstream connections default to plaintext `ws://`. Set `endpoint` to `wss://host:port` to dial that node with TLS; the certificate is verified with rustls against the OS trust store.
-- `rs_abieos` (pure Rust) parses untrusted upstream data; treat your upstreams as part of the trust boundary.
-
-Because of the above:
-
-- Deploy on a trusted or internal network, and/or behind a TLS-terminating reverse proxy (nginx, Caddy, Envoy) that adds access control.
-- **Do not expose `fleet-router` directly to the public internet.**
+To report a vulnerability, follow [SECURITY.md](SECURITY.md). Please do not open public issues for security reports.
 
 ## Contributing
 
-Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, the CI checks, and the pre-PR checklist (`cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace`, and a `CHANGELOG.md` entry). Tests run against an in-repo mock SHiP double and need no external services.
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers the development setup, the CI checks, and the pre-PR checklist. Tests run against an in-repo mock SHiP double and need no external services. This project follows the [Code of Conduct](CODE_OF_CONDUCT.md).
 
-## Security policy
-
-To report a vulnerability, see [SECURITY.md](SECURITY.md). Please do not open public issues for security reports.
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for release notes ([Keep a Changelog](https://keepachangelog.com/) format).
-
-## Code of conduct
-
-This project follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+Release notes are in [CHANGELOG.md](CHANGELOG.md) ([Keep a Changelog](https://keepachangelog.com/) format).
 
 ## License
 

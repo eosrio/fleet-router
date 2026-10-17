@@ -7,8 +7,9 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::abi::fnv1a64;
-use crate::fleet::{ContractViolation, FailoverReason, FleetHub};
+use crate::fleet::{ContractViolation, FailoverReason, FleetHub, HoldWhy};
 use crate::models::{BlockFailureQuarantine, Role};
+use crate::telemetry::{self, Event, EventKind, Level};
 
 /// Per session, how many times the upstream stream may die with the same next
 /// block before the client is closed. The drop that starts the loop counts, so
@@ -29,6 +30,10 @@ pub(super) const DIAL_EXCLUSION: Duration = Duration::from_secs(2);
 /// How long an upstream that jumped past the cursor on a resume is avoided.
 const UNCOVERED_EXCLUSION: Duration = Duration::from_secs(30);
 
+/// Stitched: how long a session avoids an upstream whose ABI differs from the
+/// one its client was sent, under `abi_mismatch: "exclude"`.
+pub(super) const ABI_EXCLUSION: Duration = Duration::from_secs(300);
+
 /// First retry waits 100 ms (the historical failover pause). Each further retry
 /// at that same block doubles the wait, up to 3.2 s.
 fn same_block_backoff(failures: u32) -> Duration {
@@ -37,8 +42,24 @@ fn same_block_backoff(failures: u32) -> Duration {
     Duration::from_millis((100u64 << shift).min(3_200))
 }
 
-fn block_unavailable_reason(block: u32) -> String {
+pub(super) fn block_unavailable_reason(block: u32) -> String {
     format!("block {block} unavailable on all upstreams")
+}
+
+/// The pause before retry `attempt` (from 0) of a held session: 100 ms,
+/// doubling to 3.2 s, before jitter.
+pub(super) fn hold_backoff(attempt: u32) -> Duration {
+    same_block_backoff(attempt.saturating_add(1))
+}
+
+/// The close reason when a bounded hold at `block` runs out of `gap_wait_ms`.
+pub(super) fn hold_close_reason(why: HoldWhy, block: u32) -> String {
+    match why {
+        HoldWhy::Offline | HoldWhy::Quarantined => block_unavailable_reason(block),
+        HoldWhy::AtCapacity | HoldWhy::Busy => {
+            format!("upstream capacity exhausted for block {block}")
+        }
+    }
 }
 
 pub(super) struct SameBlockPlan {
@@ -153,6 +174,12 @@ pub(super) enum UpEnd {
     TooLarge,
     /// The request write failed on a link that never produced a frame.
     SendFailed,
+    /// No frame at all, not even a reply to a liveness ping, within
+    /// `upstream_liveness_timeout_ms` (1 s once the monitor lost the
+    /// upstream). The socket may still look open.
+    Silent,
+    /// An operator moved the session off this upstream.
+    Moved,
 }
 
 /// Which upstream a session avoids after a link end.
@@ -196,8 +223,8 @@ pub(super) struct EndFacts {
 
 /// The link-end table. Only unclean drops, frozen stalls and frozen contract
 /// violations strike the upstream; a clean close, an idle or live stall, a
-/// busy or uncovered upstream, an oversized message or a client-induced drop
-/// never do. `cursor` is the client's next block.
+/// busy, uncovered or silent upstream, an operator move, an oversized message
+/// or a client-induced drop never do. `cursor` is the client's next block.
 pub(super) fn classify(end: UpEnd, facts: &EndFacts, cursor: u32, now: Instant) -> EndAction {
     let failover = |strike: bool, budget: bool, delay: Duration, exclusion: Exclusion, reason| {
         EndAction::Failover {
@@ -292,6 +319,22 @@ pub(super) fn classify(end: UpEnd, facts: &EndFacts, cursor: u32, now: Instant) 
             Exclusion::Hard(DIAL_EXCLUSION),
             FailoverReason::Send,
         ),
+        // A dead node, not a bad block: prefer another upstream, but no
+        // strike against the block.
+        UpEnd::Silent => failover(
+            false,
+            false,
+            CLEAN_DELAY,
+            Exclusion::Soft,
+            FailoverReason::Silent,
+        ),
+        UpEnd::Moved => failover(
+            false,
+            false,
+            CLEAN_DELAY,
+            Exclusion::Soft,
+            FailoverReason::Operator,
+        ),
     }
 }
 
@@ -328,6 +371,16 @@ pub(super) async fn note_block_failure(
             range,
             "upstream quarantined after repeated mid-stream block failures"
         );
+        let last = block.saturating_add(range.saturating_sub(1));
+        telemetry::global().emit(
+            Event::new(
+                Level::Warn,
+                EventKind::UpstreamQuarantined,
+                format!("{} quarantined for blocks {block}..={last}", state.name),
+            )
+            .listener(hub.name.as_deref().unwrap_or("default"))
+            .upstream(endpoint),
+        );
     }
     hub.rebuild(&db);
 }
@@ -354,6 +407,26 @@ mod tests {
             block_unavailable_reason(115),
             "block 115 unavailable on all upstreams"
         );
+    }
+
+    #[test]
+    fn holds_back_off_from_100ms_and_close_with_the_reason_of_their_cause() {
+        let waits: Vec<u64> = (0..8)
+            .map(|attempt| hold_backoff(attempt).as_millis() as u64)
+            .collect();
+        assert_eq!(waits, [100, 200, 400, 800, 1600, 3200, 3200, 3200]);
+        for why in [HoldWhy::Offline, HoldWhy::Quarantined] {
+            assert_eq!(
+                hold_close_reason(why, 1001),
+                "block 1001 unavailable on all upstreams"
+            );
+        }
+        for why in [HoldWhy::AtCapacity, HoldWhy::Busy] {
+            assert_eq!(
+                hold_close_reason(why, 1001),
+                "upstream capacity exhausted for block 1001"
+            );
+        }
     }
 
     #[test]
@@ -564,6 +637,42 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A silent upstream and an operator move fail over to another upstream
+    /// without a strike or the same-block budget.
+    #[test]
+    fn silent_upstreams_and_operator_moves_are_avoided_without_a_block_strike() {
+        let now = Instant::now();
+        for role in [Role::Live, Role::Frozen] {
+            for (end, reason) in [
+                (UpEnd::Silent, FailoverReason::Silent),
+                (UpEnd::Moved, FailoverReason::Operator),
+            ] {
+                assert_eq!(
+                    classify(end, &facts(role, None), 115, now),
+                    EndAction::Failover {
+                        strike: false,
+                        budget: false,
+                        delay: Duration::from_millis(100),
+                        exclusion: Exclusion::Soft,
+                        reason,
+                    },
+                    "{end:?} on {role:?}"
+                );
+            }
+        }
+        let mut stuck_at = None;
+        for _ in 0..8 {
+            let plan = plan_same_block_failover(&mut stuck_at, false, Some(115), CLEAN_DELAY);
+            assert!(
+                plan.close_reason.is_none(),
+                "a dead node must not close with 1011"
+            );
+            assert_eq!(plan.failures, 0);
+            assert_eq!(plan.delay, Duration::from_millis(100));
+        }
+        assert!(stuck_at.is_none(), "a dead node is not a bad block");
     }
 
     /// F2: jitter is within ±20 % and deterministic.

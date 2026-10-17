@@ -104,7 +104,8 @@ scope, including (non-exhaustively):
 
 ## See Also
 
-- [README.md](README.md) for deployment and configuration guidance.
+- [docs/operations.md](docs/operations.md) for deployment and security guidance, and
+  [docs/configuration.md](docs/configuration.md) for the configuration reference.
 - [CONTRIBUTING.md](CONTRIBUTING.md) for development and pull-request workflow.
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
 - [CHANGELOG.md](CHANGELOG.md) for release history.

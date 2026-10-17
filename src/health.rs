@@ -1,28 +1,25 @@
-//! Minimal, dependency-free HTTP endpoint exposing liveness, readiness, and
-//! Prometheus metrics. Opt-in via the `metrics_port` config field.
+//! Readiness, fleet coverage and Prometheus metrics for the HTTP endpoint in
+//! [`crate::http`]. Opt-in via the `metrics_port` config field.
 //!
-//! Routes (GET only):
-//!   - `/health`, `/healthz`           -> 200 while the process is running
-//!   - `/ready`,  `/readyz`            -> 200 if every configured listener can serve the tip, else 503
-//!   - `/ready/<name>`, `/readyz/<name>` -> the same for one listener, 404 if unknown
-//!   - `?scope=history` on either      -> also requires complete, online archive coverage (stitched)
-//!   - `/coverage`, `/coverage/<name>` -> JSON fleet coverage of every listener, or of one
-//!   - `/metrics`                      -> Prometheus text exposition of upstream and listener state
+//! - `/ready`, `/ready/<name>`: whether every listener (or one) can serve
+//!   the tip; `?scope=history` also requires complete, online archive
+//!   coverage (stitched).
+//! - `/coverage`, `/coverage/<name>`: JSON fleet coverage of every listener,
+//!   or of one.
+//! - `/metrics`: Prometheus text exposition of upstream and listener state.
 //!
-//! A pool listener can serve the tip when at least one upstream is online. A
-//! stitched listener needs an online live upstream (any online upstream when
-//! it has no live servers). History readiness is never part of plain `/ready`,
-//! so one archive outage cannot pull the router out of a load balancer.
+//! A pool listener can serve the tip when at least one usable upstream is
+//! online. A stitched listener needs an online live upstream (any online
+//! upstream when it has no live servers). An upstream an operator disabled
+//! through the control API does not count. History readiness is never part
+//! of plain `/ready`, so one archive outage cannot pull the router out of a
+//! load balancer.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
-use tokio::time::timeout;
 
 use crate::fleet::view::AbiSource;
 use crate::fleet::{FleetHub, FleetView, ListenerStats, Log, MetricLabel, SessionGauge};
@@ -65,152 +62,33 @@ fn parse_scope(query: Option<&str>) -> Result<Scope, String> {
     Ok(Scope::Tip)
 }
 
-/// Run the health/metrics HTTP server until a shutdown signal is received.
-pub async fn run_metrics_server(
-    addr: String,
-    listeners: Vec<ListenerHealthState>,
-    mut shutdown: broadcast::Receiver<()>,
-) {
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(%addr, error = %e, "failed to bind health/metrics endpoint");
-            return;
-        }
-    };
-    tracing::info!(%addr, "health/metrics endpoint listening");
-
-    let listeners = Arc::new(listeners);
-
-    loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((stream, _peer)) => {
-                        let pools = listeners.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_request(stream, &pools).await {
-                                tracing::debug!(error = %e, "health/metrics request error");
-                            }
-                        });
-                    }
-                    Err(e) => tracing::warn!(error = %e, "health/metrics accept error"),
-                }
-            }
-            _ = shutdown.recv() => {
-                tracing::info!("health/metrics endpoint shutting down");
-                break;
-            }
-        }
-    }
-}
-
-async fn handle_request(
-    mut stream: TcpStream,
-    listeners: &[ListenerHealthState],
-) -> std::io::Result<()> {
-    // Read just enough to parse the request line, bounded by a single overall
-    // timeout (so a slow client can't hold the connection open by dripping
-    // bytes) and a fixed buffer size.
-    let mut buf = [0u8; 1024];
-    let len = match timeout(Duration::from_secs(5), async {
-        let mut len = 0;
-        while len < buf.len() {
-            match stream.read(&mut buf[len..]).await {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    len += n;
-                    if buf[..len].windows(4).any(|w| w == b"\r\n\r\n")
-                        || buf[..len].contains(&b'\n')
-                    {
-                        break; // we have the request line (and possibly headers)
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(len)
-    })
-    .await
-    {
-        Ok(Ok(len)) => len,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Ok(()), // overall read timeout: drop the connection
-    };
-
-    let head = String::from_utf8_lossy(&buf[..len]);
-    let request_line = head.lines().next().unwrap_or("");
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let raw_path = parts.next().unwrap_or("");
-    let (path, query) = match raw_path.split_once('?') {
-        Some((path, query)) => (path, Some(query)),
-        None => (raw_path, None),
-    };
-
-    let (status, content_type, body) = if method != "GET" {
-        (
-            "405 Method Not Allowed",
-            "text/plain",
-            "method not allowed\n".to_string(),
-        )
-    } else {
-        route(listeners, path, query).await
-    };
-
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-type Response = (&'static str, &'static str, String);
+/// Status line, content type and body of a response.
+pub(crate) type Response = (&'static str, &'static str, String);
 
 fn not_found() -> Response {
     ("404 Not Found", "text/plain", "not found\n".to_string())
 }
 
-async fn route(listeners: &[ListenerHealthState], path: &str, query: Option<&str>) -> Response {
-    match path {
-        "/health" | "/healthz" => ("200 OK", "text/plain", "ok\n".to_string()),
-        "/metrics" => (
-            "200 OK",
-            "text/plain; version=0.0.4",
-            render_metrics(listeners).await,
-        ),
-        "/coverage" => coverage_response(listeners, None),
-        _ => {
-            if let Some(target) = path.strip_prefix("/coverage/") {
-                return coverage_response(listeners, Some(target));
-            }
-            let target = match path {
-                "/ready" | "/readyz" => None,
-                _ => match path
-                    .strip_prefix("/ready/")
-                    .or_else(|| path.strip_prefix("/readyz/"))
-                {
-                    Some(target) => Some(target),
-                    None => return not_found(),
-                },
-            };
-            let scope = match parse_scope(query) {
-                Ok(scope) => scope,
-                Err(other) => {
-                    return (
-                        "400 Bad Request",
-                        "text/plain",
-                        format!("unknown scope '{other}'; use tip or history\n"),
-                    )
-                }
-            };
-            match target {
-                None => evaluate_overall(listeners, scope).await,
-                Some(target) => evaluate_listener(listeners, target, scope).await,
-            }
+/// `GET /ready` (`target` is `None`) or `/ready/<target>`, with the request's
+/// query string. Only `scope` is read from it.
+pub(crate) async fn readiness(
+    listeners: &[ListenerHealthState],
+    target: Option<&str>,
+    query: Option<&str>,
+) -> Response {
+    let scope = match parse_scope(query) {
+        Ok(scope) => scope,
+        Err(other) => {
+            return (
+                "400 Bad Request",
+                "text/plain",
+                format!("unknown scope '{other}'; use tip or history\n"),
+            )
         }
+    };
+    match target {
+        None => evaluate_overall(listeners, scope).await,
+        Some(target) => evaluate_listener(listeners, target, scope).await,
     }
 }
 
@@ -405,12 +283,20 @@ async fn evaluate_listener(
 }
 
 async fn count_online(state_db: &ServerStateDb) -> usize {
-    state_db.lock().await.values().filter(|s| s.online).count()
+    state_db
+        .lock()
+        .await
+        .values()
+        .filter(|s| s.online && s.routable())
+        .count()
 }
 
 /// `GET /coverage` (every listener) or `/coverage/<name>` (one; 404 if
 /// unknown).
-fn coverage_response(listeners: &[ListenerHealthState], target: Option<&str>) -> Response {
+pub(crate) fn coverage_response(
+    listeners: &[ListenerHealthState],
+    target: Option<&str>,
+) -> Response {
     let selected: Vec<&ListenerHealthState> = match target {
         None => listeners.iter().collect(),
         Some(name) => {
@@ -552,6 +438,9 @@ struct MetricSnapshot {
     labels: String,
     online: bool,
     stale: bool,
+    operator_disabled: bool,
+    priority: u32,
+    weight: u32,
     connections: usize,
     trace_begin_block: u32,
     trace_end_block: u32,
@@ -586,7 +475,7 @@ struct ListenerSnapshot {
     head_age: Duration,
 }
 
-async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
+pub(crate) async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
     let now = Instant::now();
     let mut snapshots = Vec::new();
     let mut fleets = Vec::new();
@@ -617,6 +506,9 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
                 labels: format_labels(l.name.as_deref(), endpoint, &state.name),
                 online: state.online,
                 stale: state.stale,
+                operator_disabled: state.operator_disabled,
+                priority: state.priority,
+                weight: state.weight,
                 connections: state.connections.load(Ordering::Relaxed),
                 trace_begin_block: state.trace_begin_block,
                 trace_end_block: state.trace_end_block,
@@ -662,6 +554,34 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
             "fleet_router_upstream_stale{{{}}} {}\n",
             s.labels,
             u8::from(s.stale)
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_operator_disabled Whether an operator disabled or drained an upstream through the control API (1) or not (0).\n");
+    out.push_str("# TYPE fleet_router_upstream_operator_disabled gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_operator_disabled{{{}}} {}\n",
+            s.labels,
+            u8::from(s.operator_disabled)
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_priority Priority tier in effect for an upstream (lower is preferred).\n");
+    out.push_str("# TYPE fleet_router_upstream_priority gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_priority{{{}}} {}\n",
+            s.labels, s.priority
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_weight Weight in effect for an upstream within its priority tier.\n");
+    out.push_str("# TYPE fleet_router_upstream_weight gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_weight{{{}}} {}\n",
+            s.labels, s.weight
         ));
     }
 
@@ -1414,6 +1334,8 @@ mod tests {
             name: nasty.to_string(),
             endpoint: "127.0.0.1:18080".to_string(),
             enabled: true,
+            priority: 2,
+            weight: 3,
             ..Default::default()
         }]);
         let named = build_state_db(vec![Server {
@@ -1458,6 +1380,9 @@ mod tests {
         let series = [
             ("fleet_router_upstream_up", "1", "0"),
             ("fleet_router_upstream_stale", "1", "0"),
+            ("fleet_router_upstream_operator_disabled", "0", "0"),
+            ("fleet_router_upstream_priority", "2", "0"),
+            ("fleet_router_upstream_weight", "3", "1"),
             ("fleet_router_active_connections", "3", "0"),
             ("fleet_router_upstream_chain_state_end_block", "42", "5"),
             ("fleet_router_upstream_finality_data_begin_block", "7", "0"),
@@ -1475,48 +1400,6 @@ mod tests {
                 "missing listener series {named_line} in:\n{metrics}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn handle_request_strips_query_string_on_routes() {
-        let db_eos = build_state_db(vec![Server {
-            name: "eos-1".to_string(),
-            endpoint: "127.0.0.1:18080".to_string(),
-            enabled: true,
-            ..Default::default()
-        }]);
-        db_eos
-            .lock()
-            .await
-            .get_mut("127.0.0.1:18080")
-            .unwrap()
-            .online = true;
-        let listeners = vec![ListenerHealthState {
-            name: Some("eos".to_string()),
-            state_db: db_eos,
-            hub: None,
-        }];
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server_listeners = listeners.clone();
-        let server_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            handle_request(stream, &server_listeners).await.unwrap();
-        });
-
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        client
-            .write_all(b"GET /ready/eos?probe=k8s&v=1 HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .await
-            .unwrap();
-        let mut resp = String::new();
-        client.read_to_string(&mut resp).await.unwrap();
-        server_task.await.unwrap();
-
-        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {resp}");
-        assert!(resp.contains("ready (eos): 1 upstream(s) online\n"));
     }
 
     fn assert_gauge(metrics: &str, name: &str, endpoint: &str, value: u32, listener: Option<&str>) {
@@ -1983,22 +1866,14 @@ mod tests {
             .await;
         }
 
+        /// The status line and body of `GET path` from the HTTP endpoint.
         async fn get(listeners: &[ListenerHealthState], path: &str) -> (String, String) {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let pools = listeners.to_vec();
-            let server = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                handle_request(stream, &pools).await.unwrap();
-            });
-            let mut client = TcpStream::connect(addr).await.unwrap();
-            client
-                .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
-                .await
-                .unwrap();
-            let mut resp = String::new();
-            client.read_to_string(&mut resp).await.unwrap();
-            server.await.unwrap();
+            let app = crate::api::AppState::health_only(listeners.to_vec());
+            let resp = crate::http::request(
+                app,
+                &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+            )
+            .await;
             let (head, body) = resp.split_once("\r\n\r\n").unwrap();
             (head.lines().next().unwrap().to_string(), body.to_string())
         }

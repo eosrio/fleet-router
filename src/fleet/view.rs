@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::abi::AbiEntry;
-use crate::models::{AbiMismatch, BlockQuarantine, ResolvedTopology, Role, Server, ServerState};
+use crate::models::{
+    AbiMismatch, BlockQuarantine, ResolvedTopology, Role, Server, ServerState, UpstreamCounters,
+};
 use crate::ship::{BlockPos, Range};
 
 use super::ObservedTip;
@@ -152,6 +154,10 @@ pub struct UpstreamView {
     pub url: Arc<str>,
     pub role: Role,
     pub enabled: bool,
+    /// Disabled or drained through the control API: never picked for a
+    /// session, and not counted as online for readiness. Its coverage stays,
+    /// like an offline upstream's.
+    pub operator_disabled: bool,
     pub online: bool,
     pub stale: bool,
     /// Ranges are usable: frozen, reported or declared; live, reported.
@@ -165,7 +171,13 @@ pub struct UpstreamView {
     pub lib: Option<BlockPos>,
     /// The upstream's live link count (the same counter sessions update).
     pub connections: Arc<AtomicUsize>,
+    /// The upstream's cumulative counters, shared with its state.
+    pub counters: Arc<UpstreamCounters>,
     pub max_sessions: Option<u32>,
+    /// Configured preference tier. Lower is preferred.
+    pub priority: u32,
+    /// Configured share within the tier. Always at least 1.
+    pub weight: u32,
     pub quarantines: Vec<BlockQuarantine>,
     pub abi_fp: Option<u64>,
     /// False when `abi_mismatch: "exclude"` drops this upstream for an ABI
@@ -177,6 +189,11 @@ pub struct UpstreamView {
 }
 
 impl UpstreamView {
+    /// Whether a session may be routed here (online or not).
+    pub fn routable(&self) -> bool {
+        self.enabled && !self.operator_disabled
+    }
+
     pub fn range(&self, log: Log) -> Range {
         match log {
             Log::Trace => self.trace,
@@ -229,8 +246,16 @@ impl UpstreamView {
     }
 
     pub fn at_capacity(&self) -> bool {
+        self.at_capacity_besides(0)
+    }
+
+    /// At `max_sessions` without the `own` slots the asking session holds
+    /// here itself (its link, dial or standby). Serving from this upstream
+    /// reuses or replaces such a slot, so it opens no extra connection.
+    pub fn at_capacity_besides(&self, own: usize) -> bool {
         self.max_sessions.is_some_and(|max| {
-            self.connections.load(Ordering::Relaxed) >= usize::try_from(max).unwrap_or(usize::MAX)
+            self.connections.load(Ordering::Relaxed).saturating_sub(own)
+                >= usize::try_from(max).unwrap_or(usize::MAX)
         })
     }
 
@@ -250,6 +275,7 @@ impl PartialEq for UpstreamView {
             && self.url == other.url
             && self.role == other.role
             && self.enabled == other.enabled
+            && self.operator_disabled == other.operator_disabled
             && self.online == other.online
             && self.stale == other.stale
             && self.known == other.known
@@ -259,7 +285,10 @@ impl PartialEq for UpstreamView {
             && self.head == other.head
             && self.lib == other.lib
             && Arc::ptr_eq(&self.connections, &other.connections)
+            && Arc::ptr_eq(&self.counters, &other.counters)
             && self.max_sessions == other.max_sessions
+            && self.priority == other.priority
+            && self.weight == other.weight
             && self.quarantines == other.quarantines
             && self.abi_fp == other.abi_fp
             && self.abi_ok == other.abi_ok
@@ -555,7 +584,7 @@ pub(crate) fn build_view(
                     continue;
                 };
                 segs.push(seg);
-                if u.online {
+                if u.online && !u.operator_disabled {
                     online.push(seg);
                 }
                 if u.role == Role::Live {
@@ -579,10 +608,13 @@ pub(crate) fn build_view(
         .iter()
         .filter(|u| u.enabled && u.role == Role::Frozen && !u.known)
         .count();
-    let online = upstreams.iter().filter(|u| u.enabled && u.online).count();
+    let online = upstreams
+        .iter()
+        .filter(|u| u.routable() && u.online)
+        .count();
     let live_online = upstreams
         .iter()
-        .filter(|u| u.enabled && u.online && u.role == Role::Live)
+        .filter(|u| u.routable() && u.online && u.role == Role::Live)
         .count();
 
     let canonical = match ctx.topology {
@@ -641,6 +673,8 @@ fn upstream_view(ctx: &BuildCtx<'_>, endpoint: &str, s: &ServerState) -> Upstrea
                 role: s.role,
                 range: s.declared,
                 max_sessions: s.max_sessions,
+                priority: s.priority,
+                weight: s.weight,
                 api_endpoint: None,
             };
             (
@@ -670,6 +704,7 @@ fn upstream_view(ctx: &BuildCtx<'_>, endpoint: &str, s: &ServerState) -> Upstrea
         url,
         role: s.role,
         enabled: s.enabled,
+        operator_disabled: s.operator_disabled,
         online: s.online,
         stale: s.stale,
         known: s.ranges_usable(),
@@ -679,7 +714,10 @@ fn upstream_view(ctx: &BuildCtx<'_>, endpoint: &str, s: &ServerState) -> Upstrea
         head: s.head,
         lib: s.lib,
         connections: s.connections.clone(),
+        counters: s.counters.clone(),
         max_sessions: s.max_sessions,
+        priority: s.priority,
+        weight: s.weight.max(1),
         quarantines: s.quarantines.clone(),
         abi_fp: s.abi.as_ref().map(|abi| abi.fp),
         abi_ok: true,
@@ -1027,7 +1065,10 @@ pub(crate) mod fixtures {
             c.role = self.role;
             c.declared = self.declared;
             c.max_sessions = self.max_sessions;
+            c.priority = self.priority;
+            c.weight = self.weight;
             c.enabled = self.enabled;
+            c.operator_disabled = self.operator_disabled;
             c.online = self.online;
             c.stale = self.stale;
             c.ranges_known = self.ranges_known;
@@ -1045,6 +1086,7 @@ pub(crate) mod fixtures {
             c.quarantines = self.quarantines.clone();
             c.abi = self.abi.clone();
             c.connections = self.connections.clone();
+            c.counters = self.counters.clone();
             c
         }
     }
@@ -1488,6 +1530,11 @@ mod tests {
         capped.connections.store(1, Ordering::Relaxed);
         let v = view(vec![capped]);
         assert!(v.upstreams[0].at_capacity());
+        assert!(
+            !v.upstreams[0].at_capacity_besides(1),
+            "the asking session's own slot is not counted"
+        );
+        assert!(v.upstreams[0].at_capacity_besides(0));
         assert_eq!(v.up(0).map(|u| u.index), Some(0));
         assert!(v.up(5).is_none());
 

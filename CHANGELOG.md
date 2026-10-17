@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Static landing page under `site/` for GitHub Pages.
 
+### Changed
+
+- Shorten `README.md` to an overview, install, and quick start. The full
+  configuration reference, production notes, and metrics moved to
+  `docs/configuration.md`, `docs/operations.md`, and `docs/observability.md`.
+
 ## [0.5.0] - 2026-10-15
 
 ### Fixed

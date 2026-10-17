@@ -34,7 +34,7 @@ A range-split fleet serves old history and the chain tip from different upstream
 - **Live nodes** (`"role": "live"`, the default) run nodeos with state history at the chain head. They serve the tip and the recent history they still hold.
 - **Frozen range servers** (`"role": "frozen"`) are archive upstreams. Each serves one fixed block range from archived state-history logs (and block logs, where it has them), with no nodeos behind it. It speaks the SHiP WebSocket protocol, never advances, and reports the same ranges for as long as it runs.
 
-A listener with an enabled frozen server is **stitched** ([`topology`](configuration.md#topology-and-stitching)). The router presents its upstreams to clients as one SHiP node whose history is the union of their ranges, so a client reads from the first archived block to the head through one connection. With the default [`history_preference`](configuration.md#topology-and-stitching), blocks that an archive covers are read from the archive, not from a live node. Tip readiness (`/ready`) does not depend on the archives.
+A listener with an enabled frozen server is **stitched** ([`topology`](configuration.md#topology-and-stitching)). The router presents its upstreams to clients as one SHiP node whose history is the union of their ranges, so a client reads from the first archived block to the head through one connection. With the default [`history_preference`](configuration.md#topology-and-stitching), blocks that an archive covers are read from the archive, not from a live node. With live servers configured, tip readiness (`/ready`) does not depend on the archives.
 
 [`example.stitched.config.json`](../example.stitched.config.json) is a complete config with two archived ranges, two replicas each, and two live nodes.
 
@@ -130,7 +130,7 @@ The flag covers the whole archive and is kept per listener: an archive with a pa
 
 ### Readiness and coverage
 
-`/ready` means the listener can serve the chain tip: a stitched listener needs an online live upstream (any online upstream when it has no live server). An archive outage never makes it fail, so one dead archive cannot pull the router out of a load balancer. `/ready?scope=history` also requires the archived history to be complete and online. `GET /coverage` returns, per listener, the fleet tip, the canonical ABI and each log's coverage with the upstreams that serve each segment. See [Observability](observability.md#readiness-and-coverage) for both, and for [alerts](observability.md#alerts) on the fleet gauges.
+`/ready` means the listener can serve the chain tip: a stitched listener needs an online live upstream (any online upstream when it has no live server). With live servers configured, an archive outage never makes it fail, so one dead archive cannot pull the router out of a load balancer. `/ready?scope=history` also requires the archived history to be complete and online. `GET /coverage` returns, per listener, the fleet tip, the canonical ABI and each log's coverage with the upstreams that serve each segment. See [Observability](observability.md#readiness-and-coverage) for both, and for [alerts](observability.md#alerts) on the fleet gauges.
 
 ## Security
 

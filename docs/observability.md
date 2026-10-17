@@ -43,7 +43,7 @@ A listener can serve the chain tip when:
 - **pool**: at least one upstream is online and not disabled by an operator;
 - **stitched**: at least one live upstream is online and not disabled by an operator. A listener with no live server needs any online upstream instead.
 
-An archive outage never makes `/ready` fail, so one dead frozen range server cannot pull the router out of a load balancer. Two scopes ask for more, on `/ready`, `/readyz` and the per-listener forms:
+In a listener with live servers, an archive outage never makes `/ready` fail, so one dead frozen range server cannot pull the router out of a load balancer. Two scopes ask for more, on `/ready`, `/readyz` and the per-listener forms:
 
 - **`?scope=history`** — Tip readiness, and for a stitched listener also: no hole in the trace or chain-state coverage, no part of it without an online upstream, and no enabled frozen server that has neither reported nor declared its range. For a pool listener it is the same as tip readiness.
 - **`?scope=api`** — Whether the [chain API](chain-api.md) can answer: it accepts connections, and a live upstream API on the listener's chain is up and not disabled by an operator. When no live server has an `api_endpoint`, a verified frozen range server API that is up stands in. On `/ready`, only the listeners with a chain API count. `/ready/<listener>?scope=api` for a listener without one, and `/ready?scope=api` when no listener has one, answer `503` with `no chain API configured`.

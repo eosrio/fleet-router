@@ -93,9 +93,9 @@ Full router state. This is the same object the [live stream](#live-stream) sends
 | `quarantined` | Online, with at least one active block-range quarantine. Routable outside those ranges. |
 | `up` | Online and advancing. |
 
-`priority` and `weight` are the values in effect. `config` holds the values from the config file, so a client can show when an operator changed them at runtime. An upstream's `sessions` is the number of connections sessions hold to it now; in a stitched listener a session can also hold a pre-dialed standby link to the next range's upstream. A listener's `sessions` and `totals.sessions` count client sessions. `sessions_total` counts every session it has been assigned since start, including failovers to it. `failovers_total` counts sessions that left it through failover: the stream ended, a request was rerouted to an upstream that serves it better, or an operator moved or drained it.
+`priority` and `weight` are the values in effect. `config` holds the values from the config file, so a client can show when an operator changed them at runtime. An upstream's `sessions` is the number of connections sessions hold to it now; in a stitched listener a session can also hold a pre-dialed standby link to the next range's upstream. A listener's `sessions` and `totals.sessions` count client sessions. `sessions_total` counts every session it has been assigned since start, including failovers to it. `failovers_total` counts sessions that left it through failover: the stream ended, a request was rerouted to an upstream that serves it better, or an operator moved or drained it. `blocks_total` and `bytes_total` count block frames and bytes forwarded from it to clients.
 
-A listener's `ready` is what [`/ready/<listener>`](observability.md#readiness-and-coverage) answers: a stitched listener needs an online live upstream. `blocks_total` and `bytes_total` count block frames and bytes forwarded from it to clients.
+A listener's `ready` is what [`/ready/<listener>`](observability.md#readiness-and-coverage) answers: a stitched listener needs an online live upstream.
 
 `head_block` is the last block in its trace or chain-state range (`max(end) - 1`), or `null` before the first status reply.
 

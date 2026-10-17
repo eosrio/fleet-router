@@ -58,7 +58,7 @@ As on nodeos, the target is matched exactly, query string included, and any meth
 
 ### The block number
 
-The router reads the block number from the body: `block_num_or_id`, or `block_num` for `get_block_info`. nodeos parses bodies with its own JSON reader, which reads some bodies differently from standard JSON (escapes, repeated keys, numbers with exponents). So the router reads a block number only from a body that both read the same way: a JSON object with no backslash and no repeated top-level key, whose value is a non-negative integer, a string of digits, or a block id in hex (the block number is its first four bytes). For `get_block_header_state` an id must be exactly 64 hex digits.
+The router reads the block number from the body: `block_num_or_id`, or `block_num` for `get_block_info`. nodeos parses bodies with its own JSON reader, which reads some bodies differently from standard JSON (escapes, repeated keys, numbers with exponents). So the router reads a block number only from a body that both read the same way: a standard JSON object with no backslash, no repeated top-level key and no number other than an integer, whose value is a non-negative integer, a string of digits, or a block id as an even number of hex digits, at most 64 (the block number is its first four bytes). For `get_block_header_state` an id must be exactly 64 hex digits. As in nodeos, a number above `u32` is cut to its low 32 bits.
 
 Any other body (empty, malformed, or with an unusual value) is sent unchanged to one live node, chosen as for a [state call](#state-calls), which writes its own answer or error. Such a body never goes to a frozen range server.
 

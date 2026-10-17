@@ -105,8 +105,9 @@ INFO listening for clients address=0.0.0.0 port=17000
 ```text
 fleet-router config init <path>     Write a sample config file to <path>.
 fleet-router config test <path>     Parse and validate a config, then test upstream connectivity.
-             [--strict]             Also exit 1 on an invalid config, a coverage hole or an
-                                    unreported archive, or an archive without api_endpoint.
+             [--strict]             Also exit 1 on an invalid config, a coverage hole, an
+                                    unreported archive, or an archive without api_endpoint
+                                    on a chain API listener.
 fleet-router run [--config <path>]  Run the proxy.
 fleet-router check [--port <port>]  Exit 0 if 127.0.0.1:<port> accepts TCP (default 17000).
 fleet-router --version              Print the version.

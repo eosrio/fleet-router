@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Pool listeners now answer `get_status_request_v0` and `_v1` themselves,
   with the fleet's head, LIB and block ranges, instead of relaying one
-  upstream's reply. Until the fleet head is known, the request is still
-  relayed to the session's upstream.
+  upstream's reply. Until the fleet head and LIB are known, the request is
+  still relayed to the session's upstream.
 - Two new checks are on by default: `upstream_stall_timeout_ms` (60 s) fails
   over an upstream that stops sending blocks it owes, and `live_lag_blocks`
   (1200) ranks a live node that far behind the fleet head like a stale one
@@ -104,7 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rank like stale ones, `max_sessions` is honoured, and ties are broken by a
   per-session hash.
 - An upstream WebSocket close frame is no longer forwarded to the client;
-  the session fails over without the client noticing.
+  the session fails over and the client connection stays open.
 - `idle_timeout_ms` fails over a silent upstream only while it owes blocks,
   so a client waiting at the chain tip no longer causes reconnects. On the
   client side it still closes a connection that sends nothing.

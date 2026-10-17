@@ -2146,7 +2146,11 @@ impl Session {
                 "upstream ABI differs from the one this client was sent"
             );
         }
-        tracing::debug!(upstream = %target.name, "connected to upstream");
+        tracing::debug!(
+            upstream = %target.endpoint,
+            name = %target.name,
+            "connected to upstream"
+        );
         if let Some(u) = self.ctx.hub.stats.upstream(target.up) {
             u.links.inc(label);
         }
@@ -2262,7 +2266,11 @@ impl Session {
                 }
                 self.adopt_link(&target, est, purpose.label());
                 if purpose == Purpose::Failover {
-                    tracing::info!(upstream = %target.name, "reconnected to upstream after failover");
+                    tracing::info!(
+                        upstream = %target.endpoint,
+                        name = %target.name,
+                        "reconnected to upstream after failover"
+                    );
                 }
                 // Every request Spring could still answer goes to the new
                 // link, even with the cursor at its end: positions below the
@@ -2873,7 +2881,11 @@ impl Session {
                 };
                 self.adopt_link(&target, est, label);
                 if purpose == Purpose::Failover {
-                    tracing::info!(upstream = %target.name, "reconnected to upstream after failover");
+                    tracing::info!(
+                        upstream = %target.endpoint,
+                        name = %target.name,
+                        "reconnected to upstream after failover"
+                    );
                 }
                 match step {
                     Some(st) if self.c.in_progress() => {
@@ -5215,6 +5227,64 @@ mod tests {
         assert_eq!(legs(&a_mock), [(1, 301)]);
         assert_eq!(legs(&b_mock), [(301, 1001)]);
         assert_eq!(harness.hub.stats.handoffs.load(Ordering::Relaxed), 1);
+    }
+
+    /// The info line of a reconnect after a failover keys the upstream by
+    /// its endpoint and names it, like the line of the failover itself, in
+    /// pool and stitched listeners alike.
+    #[tokio::test]
+    async fn the_reconnect_after_a_failover_logs_the_endpoint_and_the_name() {
+        let (logs, _guard) = crate::test_log::capture();
+        let reconnects = || logs.lines_with("reconnected to upstream after failover");
+        let names = |line: &str, endpoint: &str, name: &str| {
+            line.contains(&format!("upstream={endpoint} "))
+                && line.contains(&format!("name={name}"))
+        };
+
+        let (failing, _failing_mock) = start_mock(MockShipConfig {
+            blocks_to_stream: 0,
+            disconnect_after: Some(3),
+            ..Default::default()
+        })
+        .await;
+        let (healthy, _healthy_mock) = start_mock(MockShipConfig {
+            blocks_to_stream: 0,
+            ..Default::default()
+        })
+        .await;
+        let harness = start_session(&[&failing, &healthy], &[&failing], 0).await;
+        let mut client = connect(&harness.url).await;
+        set_online(&harness.hub, &healthy).await;
+        client.send(blocks_request(100, 110, 100)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 10).await,
+            (100..110).collect::<Vec<_>>()
+        );
+        let lines = reconnects();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(names(&lines[0], &healthy, "upstream-1"), "{}", lines[0]);
+
+        let (dropping, _dropping_mock) = start_mock(MockShipConfig {
+            disconnect_after: Some(3),
+            ..MockShipConfig::frozen(1, 1001)
+        })
+        .await;
+        let (replica, _replica_mock) = start_mock(MockShipConfig::frozen(1, 1001)).await;
+        let harness = start_stitched(&[(&dropping, 1, 1001), (&replica, 1, 1001)]).await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&replica).unwrap().priority = 5;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(10, 20, 100)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 10).await,
+            (10..20).collect::<Vec<_>>()
+        );
+        let lines = reconnects();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(names(&lines[1], &replica, "archive-1"), "{}", lines[1]);
     }
 
     /// Stitched: the archive that holds blocks breaks the contract at 15 and

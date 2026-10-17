@@ -6,7 +6,7 @@ A reverse proxy and load balancer for the Antelope **SHiP** (State History Plugi
 [![Crates.io](https://img.shields.io/crates/v/fleet-router.svg)](https://crates.io/crates/fleet-router)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[Homepage](https://eosrio.github.io/fleet-router/) · [Configuration](docs/configuration.md) · [Operations](docs/operations.md) · [Observability](docs/observability.md) · [Changelog](CHANGELOG.md)
+[Homepage](https://eosrio.github.io/fleet-router/) · [Configuration](docs/configuration.md) · [Operations](docs/operations.md) · [Observability](docs/observability.md) · [Dashboard & API](docs/api.md) · [Changelog](CHANGELOG.md)
 
 Run more than one SHiP node? Put fleet-router in front of them and give your clients (Hyperion, other indexers, custom consumers) **one resilient endpoint** instead of pinning each consumer to one node.
 
@@ -35,6 +35,7 @@ Clients open a single WebSocket connection to the router. The router picks a hea
 - **Several networks in one process.** Each listener has its own port, upstream pool, `chain_id`, connection cap, and `/ready/<name>` check.
 - **`chain_id` verification.** Upstreams that report the wrong chain stay offline. Older nodes that omit `chain_id` (FIO and other EOSIO 2.0-based builds) stay usable unless you require it.
 - **Operable.** Prometheus metrics, health and readiness endpoints, `tracing` logs, graceful shutdown, upstream `wss://`, and connection, timeout and message-size limits.
+- **Live dashboard and control API (opt-in).** See every upstream's block range, load and health in real time, and drain a node for maintenance: its sessions move to other nodes without the clients reconnecting.
 
 ## Installation
 
@@ -115,6 +116,7 @@ fleet-router --help                 Print help.
 - **[Configuration reference](docs/configuration.md)**: every field and default, upstream TLS, and multi-network `listeners`.
 - **[Running in production](docs/operations.md)**: security, running as a service (systemd, Docker, launchd, Windows), graceful shutdown, corrupted SHiP logs, and tuning.
 - **[Observability](docs/observability.md)**: logging, health and readiness endpoints, and the Prometheus metrics.
+- **[Dashboard and control API](docs/api.md)**: the opt-in live dashboard, status page, JSON API, and token-protected control actions.
 - **Deployment samples**: [`deploy/fleet-router.service`](deploy/fleet-router.service), [`deploy/fleet-router@.service`](deploy/fleet-router@.service), and [`deploy/docker-compose.multi-network.yml`](deploy/docker-compose.multi-network.yml).
 
 ## Security

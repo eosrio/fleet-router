@@ -602,7 +602,7 @@ fn warn_unverified_chain_id(server: &Server, expected: Option<[u8; 32]>) {
     }
 }
 
-fn hex_32(bytes: &[u8; 32]) -> String {
+pub(crate) fn hex_32(bytes: &[u8; 32]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(64);
     for b in bytes {

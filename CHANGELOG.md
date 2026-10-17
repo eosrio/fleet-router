@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Opt-in live dashboard at `/ui/`, a plain `/status` page, and a JSON API
+  under `/api/v1` (status, sessions, 15-minute history, events, and a
+  server-sent events stream), served on `metrics_port` when
+  `dashboard.enabled` is `true`. Off by default, so upgrading does not expose
+  anything new on an existing metrics port. Requested by @Rossco99.
+- Token-protected control API (`dashboard.control_token_file`,
+  `dashboard.control_token`, or `FLEET_ROUTER_CONTROL_TOKEN`): disable,
+  enable, or drain an upstream, change its priority and weight at runtime,
+  clear its quarantines, and move or close a single session. A drain moves
+  live sessions to other upstreams with the normal failover, so clients stay
+  connected. Runtime changes are not written back to the config.
+- New gauge `fleet_router_upstream_operator_disabled`.
+
 - Optional per-server `priority` (default `0`, lower is preferred) and
   `weight` (default `1`). Among upstreams that are equally able to serve a
   request (same block coverage and freshness), the router uses the lowest
@@ -26,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The health/metrics endpoint now runs on hyper (via axum) instead of a
+  hand-written HTTP loop. Paths and response bodies are unchanged. Request
+  headers must arrive within 5 s, and at most 256 connections are served at
+  once. A request to an unknown path with a method other than `GET` now
+  returns `404` instead of `405`.
+- `fleet_router_upstream_priority` and `fleet_router_upstream_weight` report
+  the values in effect, which can differ from the config after a control API
+  change.
 - Shorten `README.md` to an overview, install, and quick start. The full
   configuration reference, production notes, and metrics moved to
   `docs/configuration.md`, `docs/operations.md`, and `docs/observability.md`.

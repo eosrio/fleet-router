@@ -109,7 +109,7 @@ pub fn should_reroute_for_finality(
         return false;
     }
     servers.iter().any(|(name, state)| {
-        name != endpoint && state.enabled && state.online && finality_covers(state, block)
+        name != endpoint && state.routable() && state.online && finality_covers(state, block)
     })
 }
 
@@ -214,7 +214,7 @@ fn select_ranked(
         && route.block.is_some_and(|block| {
             servers
                 .values()
-                .any(|state| state.enabled && state.online && finality_covers(state, block))
+                .any(|state| state.routable() && state.online && finality_covers(state, block))
         });
 
     let mut best: Option<(Candidate, String)> = None;
@@ -222,7 +222,7 @@ fn select_ranked(
 
     for (server, state) in servers.iter_mut() {
         state.prune_expired_quarantines(now);
-        if !state.enabled || (require_online && !state.online) {
+        if !state.routable() || (require_online && !state.online) {
             continue;
         }
         if let Some(block) = route.block {
@@ -683,6 +683,26 @@ mod tests {
             select_backend_server(&mut servers, route_at(100)).unwrap(),
             "big"
         );
+    }
+
+    #[test]
+    fn operator_disabled_upstream_is_skipped_by_new_sessions_and_failover() {
+        let mut servers = HashMap::new();
+        let mut drained = tiered(0, 0, 1);
+        drained.operator_disabled = true;
+        servers.insert("drained".to_string(), drained);
+        servers.insert("other".to_string(), tiered(5, 9, 1));
+        assert_eq!(
+            select_backend_server(&mut servers, route_at(100)).unwrap(),
+            "other"
+        );
+        assert_eq!(
+            select_failover_server(&mut servers, route_at(100), None).unwrap(),
+            "other"
+        );
+        servers.remove("other");
+        assert!(select_backend_server(&mut servers, route_at(100)).is_err());
+        assert!(select_failover_server(&mut servers, route_at(100), None).is_err());
     }
 
     #[test]

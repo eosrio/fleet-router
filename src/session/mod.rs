@@ -2342,15 +2342,19 @@ impl Session {
 
     /// Serve the leg `st`: on the current socket when it is quiescent and on
     /// the same upstream, on the standby link pre-dialed to it, on a dial
-    /// already running to it, or on a new dial.
+    /// already running to it, or on a new dial. A standby to any other
+    /// upstream belongs to a plan this one replaces, and is dropped; the new
+    /// leg's end gets its own pre-dial.
     async fn serve(&mut self, st: ServeStep, purpose: Purpose, pre: u32) -> Flow {
         let up = st.up;
+        self.predial_for = None;
         if self
             .link
             .as_ref()
             .is_some_and(|l| l.st.up == up && self.link_quiescent(l, pre))
         {
             self.dial = None;
+            self.discard_standby();
             return self.send_request(st.req_end, purpose).await;
         }
         // Drop what the old request may still send.
@@ -4179,6 +4183,88 @@ mod tests {
         assert_eq!(harness.hub.stats.predials.get(PredialResult::Used), 1);
         assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Silent), 0);
         assert_eq!(mock_b.sessions_accepted(), 1, "the standby link is kept");
+    }
+
+    /// Stitched: a new client request served on the current socket drops the
+    /// standby link pre-dialed for the old request's next leg, which would
+    /// otherwise hold a slot on that upstream until its linger runs out.
+    #[tokio::test]
+    async fn a_request_served_on_the_same_socket_drops_the_old_standby() {
+        let (a, _mock_a) = start_mock(MockShipConfig::frozen(1, 201)).await;
+        let (b, mock_b) = start_mock(MockShipConfig::frozen(201, 301)).await;
+        let harness = start_stitched(&[(&a, 1, 201), (&b, 201, 301)]).await;
+        let mut client = connect(&harness.url).await;
+        // Five blocks of credit: the link is quiet once they are sent.
+        client.send(blocks_request(10, 300, 5)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 5).await,
+            vec![10, 11, 12, 13, 14]
+        );
+        let b_slots = || {
+            harness
+                .hub
+                .view()
+                .upstreams
+                .iter()
+                .find(|u| *u.endpoint == *b)
+                .map(|u| u.connections.load(Ordering::Relaxed))
+        };
+        let standby = timeout(WAIT, async {
+            while mock_b.sessions_accepted() == 0 || b_slots() != Some(1) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(standby.is_ok(), "B is pre-dialed");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        client.send(blocks_request(100, 150, 100)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 50).await,
+            (100..150).collect::<Vec<_>>()
+        );
+        assert_eq!(harness.hub.stats.predials.get(PredialResult::Discarded), 1);
+        assert_eq!(b_slots(), Some(0), "the standby's slot on B is free");
+    }
+
+    /// Stitched: an operator move inside the pre-dial window drops the
+    /// standby to the next leg's upstream with the old link. The replica the
+    /// session moves to pre-dials it again, so the handoff stays warm.
+    #[tokio::test]
+    async fn a_move_inside_the_predial_window_predials_the_next_leg_again() {
+        let leg = |begin, end| MockShipConfig {
+            block_delay: Some(Duration::from_millis(5)),
+            ..MockShipConfig::frozen(begin, end)
+        };
+        let (a, _mock_a) = start_mock(leg(1, 101)).await;
+        let (twin, _mock_twin) = start_mock(leg(1, 101)).await;
+        let (b, mock_b) = start_mock(leg(101, 201)).await;
+        let harness = start_stitched(&[(&a, 1, 101), (&twin, 1, 101), (&b, 101, 201)]).await;
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        client.send(blocks_request(10, 150, 1000)).await.unwrap();
+        let mut blocks = read_block_nums(&mut client, 10).await;
+        let first = info.upstream();
+        let predialed = timeout(WAIT, async {
+            while mock_b.sessions_accepted() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(predialed.is_ok(), "B is pre-dialed");
+
+        info.request_move();
+        let rest = 150 - 10 - blocks.len();
+        blocks.extend(read_block_nums(&mut client, rest).await);
+        assert_eq!(blocks, (10..150).collect::<Vec<_>>());
+        assert_ne!(info.upstream(), first);
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Operator), 1);
+        assert_eq!(harness.hub.stats.predials.get(PredialResult::Used), 1);
+        assert_eq!(
+            mock_b.sessions_accepted(),
+            2,
+            "pre-dialed again after the move"
+        );
     }
 
     /// Whether the control API counts a session at `next_block` on `endpoint`

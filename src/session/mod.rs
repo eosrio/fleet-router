@@ -80,8 +80,8 @@ use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 
 use crate::abi::abi_fingerprint;
 use crate::fleet::planner::{
-    can_take_over, eligible, next_step, pool_pick, tip_region, Excludes, Need, ServeStep, Shape,
-    Step, Union,
+    can_take_over, eligible, next_step, pool_pick, run_end, tip_region, Excludes, Need, ServeStep,
+    Shape, Step, Union,
 };
 use crate::fleet::view::UpstreamView;
 use crate::fleet::{
@@ -107,8 +107,8 @@ use failover::{
 };
 pub use link::ConnectionGuard;
 use link::{
-    build_request, mark_no_block_log, mark_offline, owed, quiescent, settled, DialError,
-    DialTarget, DialTask, Established, Link, Purpose, Target, UpCursor, LIVENESS_PING,
+    build_request, mark_no_block_log, mark_offline, owed, quiescent, settled, BlocklessCheck,
+    DialError, DialTarget, DialTask, Established, Link, Purpose, Target, UpCursor, LIVENESS_PING,
     MAX_DIAL_ATTEMPTS,
 };
 use status::{router_status, status_ready, StatusFlow, StatusStep};
@@ -146,6 +146,12 @@ const STANDBY_LINGER: Duration = Duration::from_secs(60);
 /// Stitched: a waiting session re-plans at least this often, besides every
 /// fleet view change.
 const WAIT_RECHECK: Duration = Duration::from_secs(5);
+
+/// Stitched: a link that forwards results without the `block` its request
+/// asked for asks at least this often whether an upstream that holds blocks
+/// can take the stream, besides every fleet view change: a freed slot, or an
+/// exclusion or a quarantine that ran out, publishes no new view.
+const BLOCKLESS_RECHECK: Duration = Duration::from_secs(1);
 
 /// What every session of one listener shares.
 pub struct ListenerCtx {
@@ -1483,8 +1489,10 @@ impl Session {
     /// resumes at this block. Otherwise the result is forwarded without
     /// `block`, as one node with a pruned block log sends it, and counted.
     ///
-    /// That answer stands until the fleet view changes. A move that ended on
-    /// such an archive again delays the next one (see
+    /// That answer stands (see [`BlocklessCheck`]) until the fleet view
+    /// changes, the cursor reaches the archive's run end (where another
+    /// upstream may become eligible) or [`BLOCKLESS_RECHECK`] has passed. A
+    /// move that ended on such an archive again delays the next one (see
     /// [`blockless_move_backoff`]).
     async fn forward_without_block(&mut self, frame: Bytes, h: ResultHead, fw: Forward) -> Flow {
         let Some((up, endpoint, name)) = self
@@ -1508,10 +1516,10 @@ impl Session {
         }
         let now = Instant::now();
         let generation = self.view.generation;
-        let due = self
-            .link
-            .as_ref()
-            .is_some_and(|l| l.st.blockless_checked != Some(generation));
+        let due = self.link.as_ref().is_some_and(|l| {
+            l.st.blockless_checked
+                .is_none_or(|c| c.due(generation, block, now))
+        });
         let may_move = self
             .blockless_moved_at
             .is_none_or(|at| now >= at + blockless_move_backoff(self.blockless_moves));
@@ -1527,8 +1535,13 @@ impl Session {
                 self.blockless_moved_at = Some(now);
                 return self.on_link_end(UpEnd::NoBlockLog).await;
             }
+            let until = self.blockless_until(up, block);
             if let Some(link) = self.link.as_mut() {
-                link.st.blockless_checked = Some(generation);
+                link.st.blockless_checked = Some(BlocklessCheck {
+                    generation,
+                    until,
+                    next: now + BLOCKLESS_RECHECK,
+                });
             }
         }
         if let Some(u) = self.ctx.hub.stats.upstream(up) {
@@ -1570,6 +1583,17 @@ impl Session {
                 if *st.endpoint != *endpoint
                     && self.view.up(st.up).is_some_and(|u| !u.no_block_log)
         )
+    }
+
+    /// Stitched: where the run of archive `up` for the current request,
+    /// from block `k`, ends in the current view ([`run_end`]). For an archive
+    /// without a block log that is also where another upstream that holds
+    /// blocks becomes eligible.
+    fn blockless_until(&self, up: usize, k: u32) -> u32 {
+        match (self.c.req.as_ref(), self.view.up(up)) {
+            (Some(creq), Some(u)) => run_end(&self.view, u, Need::of(creq), k, std_now()),
+            _ => u32::MAX,
+        }
     }
 
     /// Whether another upstream than `endpoint` could serve block `k` of the
@@ -4902,6 +4926,199 @@ mod tests {
         assert_eq!(archive_mock.sessions_accepted(), 1);
         assert_eq!(syncing_mock.sessions_accepted(), 0);
         assert_eq!(tip_mock.sessions_accepted(), 0);
+    }
+
+    /// Stitched, archive-only: the archive that holds blocks is full when the
+    /// leg is planned, so its twin without a block log serves it. A freed
+    /// slot publishes no new view; the session still moves to the blocks
+    /// within about a second.
+    #[tokio::test]
+    async fn a_freed_slot_draws_a_block_request_off_an_archive_without_a_block_log() {
+        let (full, full_mock) = start_mock(MockShipConfig::frozen(1, 100_001)).await;
+        let (bare, _bare_mock) = start_mock(MockShipConfig {
+            no_block_log: true,
+            block_delay: Some(Duration::from_millis(2)),
+            ..MockShipConfig::frozen(1, 100_001)
+        })
+        .await;
+        let harness = start_stitched(&[(&full, 1, 100_001), (&bare, 1, 100_001)]).await;
+        assert!(link::mark_no_block_log(&harness.hub, &bare).await);
+        let slots = {
+            let mut db = harness.hub.state.lock().await;
+            let state = db.get_mut(&full).unwrap();
+            state.max_sessions = Some(1);
+            state.connections.store(1, Ordering::Relaxed);
+            let slots = state.connections.clone();
+            harness.hub.rebuild(&db);
+            slots
+        };
+        let generation = harness.hub.view().generation;
+        let mut client = connect(&harness.url).await;
+        client
+            .send(block_request(10, 90_000, 100_000))
+            .await
+            .unwrap();
+        let views = read_views(&mut client, 20).await;
+        assert!(
+            views.iter().all(|v| v.block.is_none()),
+            "the holder is full"
+        );
+        assert_eq!(full_mock.sessions_accepted(), 0);
+
+        slots.store(0, Ordering::Relaxed);
+        let freed = Instant::now();
+        let mut last = views.last().and_then(BlockView::num).unwrap();
+        loop {
+            assert!(
+                freed.elapsed() < Duration::from_secs(5),
+                "still without blocks at {last}"
+            );
+            let view = read_views(&mut client, 1).await.remove(0);
+            let n = view.num().unwrap();
+            assert_eq!(n, last + 1, "the stream goes on");
+            last = n;
+            if view.block.is_some() {
+                break;
+            }
+        }
+        let views = read_views(&mut client, 20).await;
+        assert!(views.iter().all(|v| v.block.is_some()));
+        assert_eq!(harness.hub.view().generation, generation, "no new view");
+        assert_eq!(
+            harness.hub.stats.failovers.get(FailoverReason::NoBlockLog),
+            1
+        );
+        assert_eq!(blocks_requests(&full_mock)[0].1, last, "resumed there");
+    }
+
+    /// Stitched: the archive that holds blocks breaks the contract at 15 and
+    /// is quarantined for 15..18, so its twin without a block log takes the
+    /// stream there. The session moves back to the blocks where the
+    /// quarantine ends, without waiting for a new view.
+    #[tokio::test]
+    async fn a_block_request_returns_to_the_blocks_where_a_quarantine_ends() {
+        let (full, full_mock) = start_mock(MockShipConfig {
+            omit_traces_at_block: Some(15),
+            ..MockShipConfig::frozen(1, 1001)
+        })
+        .await;
+        let (bare, _bare_mock) = start_mock(MockShipConfig {
+            no_block_log: true,
+            ..MockShipConfig::frozen(1, 1001)
+        })
+        .await;
+        let servers: Vec<Server> = [&full, &bare]
+            .iter()
+            .enumerate()
+            .map(|(i, endpoint)| Server {
+                name: format!("archive-{i}"),
+                endpoint: endpoint.to_string(),
+                enabled: true,
+                role: Role::Frozen,
+                range: Some(crate::ship::Range {
+                    begin: 1,
+                    end: 1001,
+                }),
+                ..Default::default()
+            })
+            .collect();
+        let resolved = ResolvedListener {
+            topology: ResolvedTopology::Stitched,
+            block_failure_quarantine: Some(BlockFailureQuarantine {
+                strikes: 1,
+                window_secs: 300,
+                ttl_secs: 600,
+                range: 3,
+            }),
+            ..listener(servers.clone())
+        };
+        let hub = FleetHub::new(
+            &resolved,
+            build_state_db(servers.clone()),
+            build_config_db(servers),
+        );
+        {
+            let mut db = hub.state.lock().await;
+            // The archive that holds blocks is tried first.
+            db.get_mut(&bare).unwrap().priority = 5;
+            let abi = Arc::new(crate::abi::AbiEntry::new(mock_ship::SHIP_ABI_JSON));
+            for endpoint in [&full, &bare] {
+                let state = db.get_mut(endpoint).unwrap();
+                let last = BlockPos {
+                    num: 1000,
+                    id: mock_ship::fake_block_id(1000),
+                };
+                state.online = true;
+                state.ranges_known = true;
+                state.trace_begin_block = 1;
+                state.trace_end_block = 1001;
+                state.chain_state_begin_block = 1;
+                state.chain_state_end_block = 1001;
+                state.head = Some(last);
+                state.lib = Some(last);
+                state.status_v1 = Some(true);
+                state.abi = Some(abi.clone());
+            }
+            hub.rebuild(&db);
+        }
+        let harness = serve_one(&resolved, hub, limits(0)).await;
+        let mut client = connect(&harness.url).await;
+        client.send(block_request(10, 40, 100)).await.unwrap();
+        let views = read_views(&mut client, 30).await;
+        assert_eq!(
+            views.iter().filter_map(BlockView::num).collect::<Vec<_>>(),
+            (10..40).collect::<Vec<_>>()
+        );
+        let without: Vec<u32> = views
+            .iter()
+            .filter(|v| v.block.is_none())
+            .filter_map(BlockView::num)
+            .collect();
+        assert_eq!(without, [15, 16, 17]);
+        assert_eq!(
+            blocks_requests(&full_mock)
+                .iter()
+                .map(|r| r.1)
+                .collect::<Vec<_>>(),
+            [10, 18]
+        );
+        let stats = &harness.hub.stats;
+        assert_eq!(stats.failovers.get(FailoverReason::Violation), 1);
+        assert_eq!(stats.failovers.get(FailoverReason::NoBlockLog), 1);
+    }
+
+    /// Stitched: a block request starts below the range of the archive that
+    /// holds blocks, on one without a block log, whose leg was planned before
+    /// it was known to lack them. The session moves to the blocks where that
+    /// range begins.
+    #[tokio::test]
+    async fn a_block_request_moves_to_the_blocks_where_their_range_begins() {
+        let (bare, bare_mock) = start_mock(MockShipConfig {
+            no_block_log: true,
+            ..MockShipConfig::frozen(1, 3001)
+        })
+        .await;
+        let (full, full_mock) = start_mock(MockShipConfig::frozen(1000, 3001)).await;
+        let harness = start_stitched(&[(&bare, 1, 3001), (&full, 1000, 3001)]).await;
+        let mut client = connect(&harness.url).await;
+        client.send(block_request(990, 1100, 200)).await.unwrap();
+        let views = read_views(&mut client, 110).await;
+        assert_eq!(
+            views.iter().filter_map(BlockView::num).collect::<Vec<_>>(),
+            (990..1100).collect::<Vec<_>>()
+        );
+        let without: Vec<u32> = views
+            .iter()
+            .filter(|v| v.block.is_none())
+            .filter_map(BlockView::num)
+            .collect();
+        assert_eq!(without, (990..1000).collect::<Vec<_>>());
+        assert_eq!(blocks_requests(&bare_mock)[0].1, 990);
+        assert_eq!(blocks_requests(&full_mock)[0].1, 1000);
+        assert_eq!(
+            harness.hub.stats.failovers.get(FailoverReason::NoBlockLog),
+            1
+        );
     }
 
     /// A move off an archive without a block log is routine, like an

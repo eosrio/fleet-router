@@ -173,11 +173,36 @@ pub(super) struct LinkState {
     /// The upstream was online in the last fleet view the session saw, so
     /// the view that shows it offline starts a probe.
     pub upstream_online: bool,
-    /// The fleet view generation in which no upstream that holds blocks
-    /// could serve this link's cursor. Until the view changes, a frozen
-    /// result without the requested `block` is forwarded without asking
-    /// again.
-    pub blockless_checked: Option<u64>,
+    /// The last time no upstream that holds blocks would have taken this
+    /// link's stream. Until it is due again, a frozen result without the
+    /// requested `block` is forwarded without asking again.
+    pub blockless_checked: Option<BlocklessCheck>,
+}
+
+/// A link's stream stays on an archive without a block log: no upstream that
+/// holds blocks would take it over at the cursor (see
+/// `Session::forward_without_block`). The answer holds while the fleet view
+/// stays the same, up to the block where another upstream may become
+/// eligible, and for a short while: a freed slot, or an exclusion or a
+/// quarantine that ran out, publishes no new view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BlocklessCheck {
+    /// The fleet view generation the answer was given in.
+    pub generation: u64,
+    /// The archive's run end from the cursor then: where a range begins, a
+    /// quarantine ends, or its own range ends.
+    pub until: u32,
+    /// Asked again from this instant, even in the same view and below
+    /// `until`.
+    pub next: Instant,
+}
+
+impl BlocklessCheck {
+    /// Whether to ask again for a result at `cursor`, in the view of
+    /// `generation`.
+    pub fn due(&self, generation: u64, cursor: u32, now: Instant) -> bool {
+        generation != self.generation || cursor >= self.until || now >= self.next
+    }
 }
 
 impl LinkState {
@@ -419,6 +444,8 @@ pub(super) fn build_request(
     st.first_result_pending = true;
     st.became_owed_at = now;
     st.linger_until = None;
+    // A new request asks afresh whether its results without `block` stay.
+    st.blockless_checked = None;
     BlocksRequest {
         v1: creq.v1,
         start,

@@ -38,6 +38,7 @@ use crate::session::{handle_client, ListenerCtx};
 use crate::tasks::{monitoring_connection, state_monitoring_loop, upstream_ws_config};
 
 mod abi;
+mod chain_api;
 mod config_sample;
 mod fleet;
 mod functions;

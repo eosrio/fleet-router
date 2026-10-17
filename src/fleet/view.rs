@@ -641,6 +641,7 @@ fn upstream_view(ctx: &BuildCtx<'_>, endpoint: &str, s: &ServerState) -> Upstrea
                 role: s.role,
                 range: s.declared,
                 max_sessions: s.max_sessions,
+                api_endpoint: None,
             };
             (
                 Arc::from(endpoint),

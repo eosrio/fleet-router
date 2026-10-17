@@ -288,6 +288,12 @@ pub struct Server {
     /// connection is not counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_sessions: Option<u32>,
+    /// The server's nodeos-compatible HTTP chain API: `http://host[:port]`
+    /// or `host:port`. For a live server, its nodeos `http-server-address`;
+    /// for a frozen range server, its chain API address. Used only by a
+    /// listener with [`ChainApiConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_endpoint: Option<String>,
 }
 
 impl Server {
@@ -416,6 +422,10 @@ pub struct ListenerConfig {
     /// Stitched-listener policy. Ignored (with a warning) by pool listeners.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stitching: Option<StitchingPolicy>,
+    /// Opt-in nodeos-compatible HTTP chain API in front of this listener's
+    /// servers. See [`ChainApiConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_api: Option<ChainApiConfig>,
 }
 
 /// A validated, normalized listener ready to be bound and monitored at runtime.
@@ -491,6 +501,10 @@ pub struct ServerConfig {
     /// set it on each listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stitching: Option<StitchingPolicy>,
+    /// See [`ChainApiConfig`]. Single-listener mode only. With `listeners`,
+    /// set it on each listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_api: Option<ChainApiConfig>,
     /// Named ingress listeners for multi-port / multi-network deployments.
     #[serde(default)]
     pub listeners: Vec<ListenerConfig>,
@@ -784,6 +798,510 @@ fn listener_warnings(
     out
 }
 
+// ---------------------------------------------------------------------------
+// Chain API: an opt-in nodeos-compatible HTTP port per listener
+// ---------------------------------------------------------------------------
+
+/// nodeos's default `max-body-size`.
+const DEFAULT_API_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+const API_MAX_BODY_BYTES: std::ops::RangeInclusive<usize> = 1024..=64 * 1024 * 1024;
+const API_MAX_ATTEMPTS: std::ops::RangeInclusive<u32> = 1..=8;
+const API_PROBE_MS: std::ops::RangeInclusive<u64> = 100..=60_000;
+const API_MIN_UPSTREAM_TIMEOUT_MS: u64 = 100;
+
+fn default_api_allow() -> Vec<ApiClass> {
+    vec![ApiClass::Block, ApiClass::Info, ApiClass::State]
+}
+fn default_api_max_body_bytes() -> usize {
+    DEFAULT_API_MAX_BODY_BYTES
+}
+fn default_api_max_connections() -> usize {
+    1_024
+}
+fn default_api_max_in_flight() -> usize {
+    256
+}
+fn default_api_max_in_flight_per_upstream() -> usize {
+    64
+}
+fn default_api_upstream_queue_ms() -> u64 {
+    1_000
+}
+fn default_api_upstream_timeout_ms() -> u64 {
+    10_000
+}
+fn default_api_request_deadline_ms() -> u64 {
+    30_000
+}
+fn default_api_max_attempts() -> u32 {
+    3
+}
+fn default_api_probe_ms() -> u64 {
+    1_000
+}
+
+/// A group of chain API endpoints a listener can serve. See
+/// [`ChainApiConfig::allow`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiClass {
+    /// Block endpoints, routed by block number: `get_block`,
+    /// `get_raw_block`, `get_block_header`, `get_block_header_state` and
+    /// `get_block_info`.
+    Block,
+    /// `get_info`, answered by one live node.
+    Info,
+    /// Every other read-only `/v1/chain/*` call, answered by live nodes.
+    State,
+    /// `compute_transaction` and `send_read_only_transaction`.
+    Exec,
+    /// `push_transaction`, `push_transactions`, `send_transaction` and
+    /// `send_transaction2`: the port relays transactions.
+    Push,
+}
+
+/// Who answers first for an irreversible block that both a frozen range
+/// server and a live node hold. `get_block` always goes to live nodes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockSource {
+    /// The frozen range server, keeping history reads off the live nodes.
+    #[default]
+    FrozenFirst,
+    /// The live node; the frozen range server serves what no live node holds.
+    LiveFirst,
+}
+
+/// CORS headers the router sets on every chain API response. Without it,
+/// the router answers like a nodeos with no CORS configured.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainApiCors {
+    /// `Access-Control-Allow-Origin`.
+    pub allow_origin: String,
+    /// `Access-Control-Allow-Headers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_headers: Option<String>,
+    /// `Access-Control-Max-Age`, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<u32>,
+    /// Also send `Access-Control-Allow-Credentials: true`.
+    #[serde(default)]
+    pub allow_credentials: bool,
+}
+
+/// An opt-in nodeos-compatible HTTP chain API port for one listener.
+///
+/// Block endpoints are routed by block number: an irreversible block goes to
+/// the frozen range server that holds it (falling back to live nodes), a
+/// reversible block to live nodes only. `get_info` and read-only state calls
+/// go to live nodes unchanged. Each server takes part through its
+/// [`Server::api_endpoint`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainApiConfig {
+    /// Port of the chain API. Required, non-zero.
+    pub listen_port: u16,
+    /// Bind address. Defaults to the listener's `listen_address`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_address: Option<String>,
+    /// Endpoint classes served; anything else answers nodeos's 404.
+    /// Default `["block", "info", "state"]`.
+    #[serde(default = "default_api_allow")]
+    pub allow: Vec<ApiClass>,
+    /// Default `frozen_first`.
+    #[serde(default)]
+    pub block_source: BlockSource,
+    /// Live servers (by name) that receive pushed transactions, in order.
+    /// Empty: the live node that answers `get_info`. Requires `push` in
+    /// [`Self::allow`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub push_servers: Vec<String>,
+    /// Largest request body accepted. Default 2097152 (nodeos's
+    /// `max-body-size`), `1024..=67108864`.
+    #[serde(default = "default_api_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Client connections open at once; excess sockets are closed at accept.
+    /// Default 1024.
+    #[serde(default = "default_api_max_connections")]
+    pub max_connections: usize,
+    /// Requests processed at once on this port. Default 256.
+    #[serde(default = "default_api_max_in_flight")]
+    pub max_in_flight: usize,
+    /// Requests in flight to one upstream API. Default 64. For a frozen
+    /// range server, the lower of this and the server's own limit.
+    #[serde(default = "default_api_max_in_flight_per_upstream")]
+    pub max_in_flight_per_upstream: usize,
+    /// How long (ms) a request waits for a free upstream slot. Default 1000.
+    #[serde(default = "default_api_upstream_queue_ms")]
+    pub upstream_queue_ms: u64,
+    /// Per attempt, until the upstream's response head (ms). Default 10000.
+    #[serde(default = "default_api_upstream_timeout_ms")]
+    pub upstream_timeout_ms: u64,
+    /// Whole request, every attempt included (ms). Default 30000.
+    #[serde(default = "default_api_request_deadline_ms")]
+    pub request_deadline_ms: u64,
+    /// Upstreams tried for one request. Default 3, `1..=8`.
+    #[serde(default = "default_api_max_attempts")]
+    pub max_attempts: u32,
+    /// Interval (ms) between probes of each upstream API. Default 1000,
+    /// `100..=60000`.
+    #[serde(default = "default_api_probe_ms")]
+    pub probe_ms: u64,
+    /// See [`ChainApiCors`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<ChainApiCors>,
+}
+
+/// A server's chain API address, parsed from [`Server::api_endpoint`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ApiEndpoint {
+    /// Lowercase. An IPv6 literal keeps its brackets.
+    pub host: String,
+    pub port: u16,
+}
+
+/// Why an `api_endpoint` was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiEndpointError {
+    /// `https://`: TLS to an upstream API is not supported yet.
+    Https,
+    /// Not `http://host[:port]` or `host:port`.
+    Invalid,
+}
+
+impl ApiEndpoint {
+    /// Parse `http://host[:port]` (port 80 by default) or `host:port`. A
+    /// path (other than a lone `/`), query, fragment or userinfo is
+    /// rejected.
+    pub fn parse(raw: &str) -> Result<ApiEndpoint, ApiEndpointError> {
+        let raw = raw.trim();
+        let (explicit_http, rest) = match raw.split_once("://") {
+            Some((scheme, rest)) => match scheme.to_ascii_lowercase().as_str() {
+                "http" => (true, rest),
+                "https" => return Err(ApiEndpointError::Https),
+                _ => return Err(ApiEndpointError::Invalid),
+            },
+            None => (false, raw),
+        };
+        let authority = if explicit_http {
+            rest.strip_suffix('/').unwrap_or(rest)
+        } else {
+            rest
+        };
+        if authority.is_empty()
+            || authority.ends_with(':')
+            || authority.contains(['/', '?', '#', '@'])
+        {
+            return Err(ApiEndpointError::Invalid);
+        }
+        let parsed: http::uri::Authority =
+            authority.parse().map_err(|_| ApiEndpointError::Invalid)?;
+        let host = parsed.host();
+        if host.is_empty() {
+            return Err(ApiEndpointError::Invalid);
+        }
+        let port = match parsed.port_u16() {
+            Some(port) => port,
+            None if explicit_http => 80,
+            None => return Err(ApiEndpointError::Invalid),
+        };
+        if port == 0 {
+            return Err(ApiEndpointError::Invalid);
+        }
+        Ok(ApiEndpoint {
+            host: host.to_ascii_lowercase(),
+            port,
+        })
+    }
+
+    /// `host:port`, with the port always written. Sent as the upstream
+    /// `Host` header, which nodeos validates by default.
+    #[allow(dead_code)] // Used by the chain API runtime.
+    pub fn authority(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// `http://host:port`, the base of every upstream request.
+    #[allow(dead_code)] // Used by the chain API runtime.
+    pub fn base_url(&self) -> String {
+        format!("http://{}:{}", self.host, self.port)
+    }
+}
+
+/// A listener's chain API after validation, ready to be bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Read by the chain API runtime.
+pub struct ResolvedChainApi {
+    /// `None` in single-listener mode.
+    pub listener: Option<String>,
+    /// [`ChainApiConfig::listen_address`], or the listener's address.
+    pub listen_address: String,
+    /// `host:port` for `TcpListener::bind`.
+    pub bind: String,
+    pub cfg: ChainApiConfig,
+    /// [`ApiUpstream::index`] of each `push_servers` entry, in order.
+    pub push: Vec<usize>,
+    /// Every enabled server with an `api_endpoint`, in config order.
+    pub upstreams: Vec<ApiUpstream>,
+}
+
+/// One server's chain API as the router routes to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Read by the chain API runtime.
+pub struct ApiUpstream {
+    /// `ServerState::index` of the server.
+    pub index: usize,
+    pub name: String,
+    /// The server's SHiP endpoint, the key of its `ServerState`.
+    pub endpoint: String,
+    pub role: Role,
+    pub api: ApiEndpoint,
+    /// Preference inside a candidate tier. Lower is preferred.
+    pub priority: u32,
+    /// Share of requests inside a priority tier. At least 1.
+    pub weight: u32,
+}
+
+fn resolve_chain_api(
+    api: Option<&ChainApiConfig>,
+    listener: Option<&str>,
+    listener_address: &str,
+    servers: &[Server],
+) -> Option<ResolvedChainApi> {
+    let cfg = api?.clone();
+    let listen_address = cfg
+        .listen_address
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or(listener_address)
+        .to_string();
+    let upstreams: Vec<ApiUpstream> = servers
+        .iter()
+        .filter(|s| s.enabled)
+        .enumerate()
+        .filter_map(|(index, s)| {
+            let api = ApiEndpoint::parse(s.api_endpoint.as_deref()?).ok()?;
+            Some(ApiUpstream {
+                index,
+                name: s.name.clone(),
+                endpoint: s.endpoint.clone(),
+                role: s.role,
+                api,
+                // Servers carry no routing priority or weight yet: every
+                // API shares one tier with an equal share.
+                priority: 0,
+                weight: 1,
+            })
+        })
+        .collect();
+    let push = cfg
+        .push_servers
+        .iter()
+        .filter_map(|name| {
+            upstreams
+                .iter()
+                .find(|u| u.name == *name && u.role.is_live())
+                .map(|u| u.index)
+        })
+        .collect();
+    Some(ResolvedChainApi {
+        listener: listener.map(str::to_string),
+        bind: format_bind_addr(&listen_address, cfg.listen_port),
+        listen_address,
+        cfg,
+        push,
+        upstreams,
+    })
+}
+
+/// Syntax of every server's `api_endpoint`, enabled or not, and uniqueness
+/// among the enabled ones.
+fn validate_api_endpoints(servers: &[Server], listener_ctx: Option<&str>) -> Result<()> {
+    let prefix = listener_prefix(listener_ctx);
+    let mut seen: HashMap<ApiEndpoint, &str> = HashMap::new();
+    for s in servers {
+        let Some(raw) = &s.api_endpoint else {
+            continue;
+        };
+        let api = ApiEndpoint::parse(raw).map_err(|err| match err {
+            ApiEndpointError::Https => anyhow!(
+                "{prefix}server '{}': https api_endpoint is not supported yet",
+                s.name
+            ),
+            ApiEndpointError::Invalid => anyhow!(
+                "{prefix}server '{}': api_endpoint must be http://host[:port] or host:port",
+                s.name
+            ),
+        })?;
+        if !s.enabled {
+            continue;
+        }
+        if let Some(previous) = seen.insert(api, &s.name) {
+            bail!(
+                "{prefix}server '{}': api_endpoint duplicates server '{previous}'",
+                s.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A CORS header value: non-empty and a valid HTTP header value (no CR, LF
+/// or other control bytes).
+fn valid_header_value(value: &str) -> bool {
+    !value.trim().is_empty() && http::HeaderValue::from_str(value).is_ok()
+}
+
+/// One listener's `chain_api`. Port conflicts are checked across the whole
+/// config by `ServerConfig::validate_chain_api_ports`.
+fn validate_chain_api(
+    api: &ChainApiConfig,
+    servers: &[Server],
+    listener_ctx: Option<&str>,
+) -> Result<()> {
+    let prefix = listener_prefix(listener_ctx);
+    if api.listen_port == 0 {
+        bail!("{prefix}chain_api.listen_port must be non-zero");
+    }
+    if api
+        .listen_address
+        .as_deref()
+        .is_some_and(|addr| addr.trim().is_empty())
+    {
+        bail!("{prefix}chain_api.listen_address must not be empty");
+    }
+    if !servers
+        .iter()
+        .any(|s| s.enabled && s.api_endpoint.is_some())
+    {
+        bail!("{prefix}chain_api requires at least one enabled server with api_endpoint");
+    }
+    if api.allow.is_empty() {
+        bail!("{prefix}chain_api.allow must not be empty");
+    }
+    if api
+        .allow
+        .iter()
+        .enumerate()
+        .any(|(i, class)| api.allow[..i].contains(class))
+    {
+        bail!("{prefix}chain_api.allow must list each class at most once");
+    }
+    if !API_MAX_BODY_BYTES.contains(&api.max_body_bytes) {
+        bail!(
+            "{prefix}chain_api.max_body_bytes must be between {} and {}",
+            API_MAX_BODY_BYTES.start(),
+            API_MAX_BODY_BYTES.end()
+        );
+    }
+    if !API_MAX_ATTEMPTS.contains(&api.max_attempts) {
+        bail!(
+            "{prefix}chain_api.max_attempts must be between {} and {}",
+            API_MAX_ATTEMPTS.start(),
+            API_MAX_ATTEMPTS.end()
+        );
+    }
+    if !API_PROBE_MS.contains(&api.probe_ms) {
+        bail!(
+            "{prefix}chain_api.probe_ms must be between {} and {}",
+            API_PROBE_MS.start(),
+            API_PROBE_MS.end()
+        );
+    }
+    if api.upstream_timeout_ms < API_MIN_UPSTREAM_TIMEOUT_MS {
+        bail!(
+            "{prefix}chain_api.upstream_timeout_ms must be at least {API_MIN_UPSTREAM_TIMEOUT_MS}"
+        );
+    }
+    if api.request_deadline_ms < api.upstream_timeout_ms {
+        bail!("{prefix}chain_api.request_deadline_ms must be at least upstream_timeout_ms");
+    }
+    if api.upstream_queue_ms > api.request_deadline_ms {
+        bail!("{prefix}chain_api.upstream_queue_ms must be at most request_deadline_ms");
+    }
+    for (field, value) in [
+        ("max_connections", api.max_connections),
+        ("max_in_flight", api.max_in_flight),
+        ("max_in_flight_per_upstream", api.max_in_flight_per_upstream),
+    ] {
+        if value == 0 {
+            bail!("{prefix}chain_api.{field} must be at least 1");
+        }
+    }
+    if !api.push_servers.is_empty() && !api.allow.contains(&ApiClass::Push) {
+        bail!("{prefix}chain_api.push_servers requires \"push\" in chain_api.allow");
+    }
+    for (i, name) in api.push_servers.iter().enumerate() {
+        if api.push_servers[..i].contains(name) {
+            bail!("{prefix}chain_api.push_servers lists '{name}' more than once");
+        }
+        if !servers
+            .iter()
+            .any(|s| s.name == *name && s.enabled && s.role.is_live() && s.api_endpoint.is_some())
+        {
+            bail!(
+                "{prefix}chain_api.push_servers: '{name}' is not an enabled live server with api_endpoint"
+            );
+        }
+    }
+    if let Some(cors) = &api.cors {
+        if !valid_header_value(&cors.allow_origin) {
+            bail!("{prefix}chain_api.cors.allow_origin is invalid");
+        }
+        if cors
+            .allow_headers
+            .as_deref()
+            .is_some_and(|value| !valid_header_value(value))
+        {
+            bail!("{prefix}chain_api.cors.allow_headers is invalid");
+        }
+    }
+    Ok(())
+}
+
+/// Non-fatal chain API hints for one listener.
+fn chain_api_warnings(
+    api: Option<&ResolvedChainApi>,
+    servers: &[Server],
+    listener_ctx: Option<&str>,
+) -> Vec<String> {
+    let prefix = listener_prefix(listener_ctx);
+    let mut out = Vec::new();
+    let Some(api) = api else {
+        if servers.iter().any(|s| s.api_endpoint.is_some()) {
+            out.push(format!("{prefix}api_endpoint is ignored without chain_api"));
+        }
+        return out;
+    };
+    for s in servers.iter().filter(|s| s.enabled) {
+        if s.role == Role::Frozen && s.api_endpoint.is_none() {
+            out.push(format!(
+                "{prefix}server '{}': no api_endpoint; chain API requests for its blocks are answered by live nodes only",
+                s.name
+            ));
+        }
+    }
+    if !servers
+        .iter()
+        .any(|s| s.enabled && s.role.is_live() && s.api_endpoint.is_some())
+    {
+        out.push(format!(
+            "{prefix}chain_api: no enabled live server has api_endpoint; get_info, state, push and reversible blocks answer 503"
+        ));
+    }
+    if api.cfg.allow.contains(&ApiClass::Push) {
+        out.push(format!(
+            "{prefix}chain_api allows push: the port relays transactions for anyone who can reach it"
+        ));
+    }
+    if is_unspecified_addr(&api.listen_address) {
+        out.push(format!(
+            "{prefix}chain_api listens on {} (every interface): the chain API has no authentication",
+            api.bind
+        ));
+    }
+    out
+}
+
 impl ServerConfig {
     /// Validate the configuration, returning a clear error for any invalid field.
     pub fn validate(&self) -> Result<()> {
@@ -843,6 +1361,10 @@ impl ServerConfig {
                 &self.servers,
                 None,
             )?;
+            validate_api_endpoints(&self.servers, None)?;
+            if let Some(api) = &self.chain_api {
+                validate_chain_api(api, &self.servers, None)?;
+            }
         } else {
             if self.listen_port != 0 {
                 bail!(
@@ -872,6 +1394,11 @@ impl ServerConfig {
             if self.stitching.is_some() {
                 bail!(
                     "top-level 'stitching' cannot be combined with 'listeners'; set 'stitching' on each listener"
+                );
+            }
+            if self.chain_api.is_some() {
+                bail!(
+                    "top-level 'chain_api' cannot be combined with 'listeners'; set 'chain_api' on each listener"
                 );
             }
             let mut seen_names = HashMap::<String, usize>::new();
@@ -942,6 +1469,10 @@ impl ServerConfig {
                     &listener.servers,
                     Some(name),
                 )?;
+                validate_api_endpoints(&listener.servers, Some(name))?;
+                if let Some(api) = &listener.chain_api {
+                    validate_chain_api(api, &listener.servers, Some(name))?;
+                }
             }
         }
 
@@ -957,8 +1488,97 @@ impl ServerConfig {
                 }
             }
         }
+        self.validate_chain_api_ports()?;
 
         Ok(())
+    }
+
+    /// Every `chain_api` port must differ from the SHiP listeners, the
+    /// metrics port and the other chain API ports on overlapping addresses.
+    fn validate_chain_api_ports(&self) -> Result<()> {
+        let mut taken: Vec<(String, u16, String)> = self
+            .listener_binds()
+            .into_iter()
+            .map(|(name, address, port)| {
+                let what = match name {
+                    Some(name) => {
+                        format!("listener '{name}' ({})", format_bind_addr(&address, port))
+                    }
+                    None => format!("listen_port {port}"),
+                };
+                (address, port, what)
+            })
+            .collect();
+        if let Some((host, port)) = self.resolved_metrics_host_port() {
+            taken.push((host, port, format!("metrics_port {port}")));
+        }
+        for api in self.resolved_chain_apis().into_iter().flatten() {
+            let prefix = listener_prefix(api.listener.as_deref());
+            let (host, port) = (api.listen_address, api.cfg.listen_port);
+            for (other_host, other_port, what) in &taken {
+                if *other_port == port && addresses_conflict(other_host, &host) {
+                    bail!("{prefix}chain_api port {port} on {host} conflicts with {what}");
+                }
+            }
+            let what = match &api.listener {
+                Some(name) => format!("the chain_api of listener '{name}'"),
+                None => "chain_api".to_string(),
+            };
+            taken.push((host, port, what));
+        }
+        Ok(())
+    }
+
+    /// The chain API of each listener, in the order of
+    /// [`Self::resolved_listeners`]; `None` for a listener without
+    /// `chain_api`.
+    pub fn resolved_chain_apis(&self) -> Vec<Option<ResolvedChainApi>> {
+        if self.listeners.is_empty() {
+            vec![resolve_chain_api(
+                self.chain_api.as_ref(),
+                None,
+                self.listen_address.trim(),
+                &self.servers,
+            )]
+        } else {
+            self.listeners
+                .iter()
+                .zip(self.listener_binds())
+                .map(|(l, (name, address, _))| {
+                    resolve_chain_api(l.chain_api.as_ref(), name.as_deref(), &address, &l.servers)
+                })
+                .collect()
+        }
+    }
+
+    /// `(name, listen_address, listen_port)` of each SHiP listener, as
+    /// [`Self::resolved_listeners`] resolves them, without loading any
+    /// `abi_file`.
+    fn listener_binds(&self) -> Vec<(Option<String>, String, u16)> {
+        if self.listeners.is_empty() {
+            return vec![(
+                None,
+                self.listen_address.trim().to_string(),
+                self.listen_port,
+            )];
+        }
+        let top = self.listen_address.trim();
+        let default_addr = if top.is_empty() { "0.0.0.0" } else { top };
+        self.listeners
+            .iter()
+            .map(|l| {
+                let address = l
+                    .listen_address
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or(default_addr);
+                (
+                    Some(l.name.trim().to_string()),
+                    address.to_string(),
+                    l.listen_port,
+                )
+            })
+            .collect()
     }
 
     /// Normalized list of ingress listeners to run.
@@ -1029,18 +1649,26 @@ impl ServerConfig {
     /// `listener '<name>': ` in multi-listener mode. Logged at startup and
     /// printed by `config test`.
     pub fn warnings(&self) -> Vec<String> {
+        let apis = self.resolved_chain_apis();
         if self.listeners.is_empty() {
-            listener_warnings(self.topology, self.stitching.as_ref(), &self.servers, None)
+            let mut out =
+                listener_warnings(self.topology, self.stitching.as_ref(), &self.servers, None);
+            out.extend(chain_api_warnings(
+                apis.first().and_then(Option::as_ref),
+                &self.servers,
+                None,
+            ));
+            out
         } else {
             self.listeners
                 .iter()
-                .flat_map(|l| {
-                    listener_warnings(
-                        l.topology,
-                        l.stitching.as_ref(),
-                        &l.servers,
-                        Some(l.name.trim()),
-                    )
+                .zip(&apis)
+                .flat_map(|(l, api)| {
+                    let name = Some(l.name.trim());
+                    let mut out =
+                        listener_warnings(l.topology, l.stitching.as_ref(), &l.servers, name);
+                    out.extend(chain_api_warnings(api.as_ref(), &l.servers, name));
+                    out
                 })
                 .collect()
         }
@@ -2907,5 +3535,747 @@ mod tests {
         assert_eq!(frozen.reported_end(), 1001);
         frozen.finality_data_end_block = 1100;
         assert_eq!(frozen.reported_end(), 1100);
+    }
+
+    // ---- chain API (CU5) ----
+
+    fn with_api(mut server: serde_json::Value, api: &str) -> serde_json::Value {
+        server["api_endpoint"] = serde_json::json!(api);
+        server
+    }
+
+    /// One frozen and one live server, both with an API.
+    fn api_servers() -> serde_json::Value {
+        serde_json::json!([
+            with_api(
+                frozen("archive-0a", 18080, Some((2, 1001))),
+                "http://10.0.3.10:8890"
+            ),
+            with_api(live("live-1", 18081), "10.0.1.10:8888")
+        ])
+    }
+
+    fn single_api(api: serde_json::Value) -> ServerConfig {
+        single(
+            api_servers(),
+            serde_json::json!({ "chain_id": CHAIN_ID, "chain_api": api }),
+        )
+    }
+
+    fn multi_api(api: serde_json::Value) -> ServerConfig {
+        multi(
+            serde_json::json!({ "chain_id": CHAIN_ID, "servers": api_servers(), "chain_api": api }),
+            serde_json::json!({}),
+        )
+    }
+
+    #[test]
+    fn chain_api_defaults_and_resolution() {
+        let cfg = multi_api(serde_json::json!({ "listen_port": 18888 }));
+        cfg.validate().unwrap();
+        let api = cfg.listeners[0].chain_api.as_ref().unwrap();
+        assert_eq!(api.listen_address, None);
+        assert_eq!(
+            api.allow,
+            vec![ApiClass::Block, ApiClass::Info, ApiClass::State]
+        );
+        assert_eq!(api.block_source, BlockSource::FrozenFirst);
+        assert!(api.push_servers.is_empty());
+        assert_eq!(api.max_body_bytes, 2_097_152);
+        assert_eq!(api.max_connections, 1024);
+        assert_eq!(api.max_in_flight, 256);
+        assert_eq!(api.max_in_flight_per_upstream, 64);
+        assert_eq!(api.upstream_queue_ms, 1000);
+        assert_eq!(api.upstream_timeout_ms, 10_000);
+        assert_eq!(api.request_deadline_ms, 30_000);
+        assert_eq!(api.max_attempts, 3);
+        assert_eq!(api.probe_ms, 1000);
+        assert_eq!(api.cors, None);
+
+        let resolved = cfg.resolved_chain_apis();
+        assert_eq!(resolved.len(), 1);
+        let resolved = resolved[0].as_ref().unwrap();
+        assert_eq!(resolved.listener.as_deref(), Some("eos"));
+        // The listener's address (here the top-level default).
+        assert_eq!(resolved.listen_address, "0.0.0.0");
+        assert_eq!(resolved.bind, "0.0.0.0:18888");
+        assert!(resolved.push.is_empty());
+        assert_eq!(
+            resolved.upstreams,
+            vec![
+                ApiUpstream {
+                    index: 0,
+                    name: "archive-0a".to_string(),
+                    endpoint: "127.0.0.1:18080".to_string(),
+                    role: Role::Frozen,
+                    api: ApiEndpoint {
+                        host: "10.0.3.10".to_string(),
+                        port: 8890
+                    },
+                    priority: 0,
+                    weight: 1,
+                },
+                ApiUpstream {
+                    index: 1,
+                    name: "live-1".to_string(),
+                    endpoint: "127.0.0.1:18081".to_string(),
+                    role: Role::Live,
+                    api: ApiEndpoint {
+                        host: "10.0.1.10".to_string(),
+                        port: 8888
+                    },
+                    priority: 0,
+                    weight: 1,
+                },
+            ]
+        );
+        assert_eq!(resolved.upstreams[0].api.authority(), "10.0.3.10:8890");
+        assert_eq!(
+            resolved.upstreams[1].api.base_url(),
+            "http://10.0.1.10:8888"
+        );
+    }
+
+    #[test]
+    fn chain_api_resolution_uses_state_indices_push_order_and_bind_address() {
+        let cfg = single(
+            serde_json::json!([
+                with_api(live("off", 18079), "10.0.1.9:8888")
+                    .as_object()
+                    .cloned()
+                    .map(|mut s| {
+                        s.insert("enabled".into(), serde_json::json!(false));
+                        serde_json::Value::Object(s)
+                    })
+                    .unwrap(),
+                live("no-api", 18080),
+                with_api(live("live-1", 18081), "10.0.1.10:8888"),
+                with_api(live("live-2", 18082), "http://[::1]:8888/")
+            ]),
+            serde_json::json!({
+                "chain_api": {
+                    "listen_port": 18888,
+                    "listen_address": "10.0.0.5",
+                    "allow": ["block", "push"],
+                    "push_servers": ["live-2", "live-1"]
+                }
+            }),
+        );
+        cfg.validate().unwrap();
+        let resolved = cfg.resolved_chain_apis()[0].clone().unwrap();
+        assert_eq!(resolved.listener, None);
+        assert_eq!(resolved.bind, "10.0.0.5:18888");
+        // ServerState indices count enabled servers only.
+        let indices: Vec<(usize, &str)> = resolved
+            .upstreams
+            .iter()
+            .map(|u| (u.index, u.name.as_str()))
+            .collect();
+        assert_eq!(indices, vec![(1, "live-1"), (2, "live-2")]);
+        let db = build_state_db(cfg.servers.clone());
+        let db = db.try_lock().unwrap();
+        for u in &resolved.upstreams {
+            assert_eq!(db[&u.endpoint].index, u.index);
+            assert_eq!(db[&u.endpoint].name, u.name);
+        }
+        assert_eq!(resolved.push, vec![2, 1]);
+        assert_eq!(resolved.upstreams[1].api.authority(), "[::1]:8888");
+
+        // No chain_api: `None`, aligned with the listeners.
+        let none = multi(
+            serde_json::json!({ "servers": [live("a", 18080)] }),
+            serde_json::json!({}),
+        );
+        assert_eq!(none.resolved_chain_apis(), vec![None]);
+    }
+
+    #[test]
+    fn listener_binds_match_the_resolved_listeners() {
+        let configs = [
+            serde_json::json!({
+                "listen_address": " 127.0.0.1 ",
+                "listen_port": 17000,
+                "upstream_reconnect_ms": 1000,
+                "upstream_monitoring_ms": 1000,
+                "upstream_status_ms": 1000,
+                "servers": [live("a", 18080)]
+            }),
+            serde_json::json!({
+                "listen_address": "10.0.0.5",
+                "upstream_reconnect_ms": 1000,
+                "upstream_monitoring_ms": 1000,
+                "upstream_status_ms": 1000,
+                "listeners": [
+                    { "name": " eos ", "listen_port": 17000, "servers": [live("a", 18080)] },
+                    { "name": "wax", "listen_address": " ::1 ", "listen_port": 17001, "servers": [live("b", 18081)] }
+                ]
+            }),
+            serde_json::json!({
+                "upstream_reconnect_ms": 1000,
+                "upstream_monitoring_ms": 1000,
+                "upstream_status_ms": 1000,
+                "listeners": [{ "name": "eos", "listen_port": 17000, "servers": [live("a", 18080)] }]
+            }),
+        ];
+        for value in configs {
+            let cfg: ServerConfig = serde_json::from_value(value).unwrap();
+            let resolved: Vec<(Option<String>, String, u16)> = cfg
+                .resolved_listeners()
+                .into_iter()
+                .map(|l| (l.name, l.listen_address, l.listen_port))
+                .collect();
+            assert_eq!(cfg.listener_binds(), resolved);
+        }
+    }
+
+    #[test]
+    fn chain_api_round_trips_and_absent_fields_stay_absent() {
+        let full = serde_json::json!({
+            "listen_port": 18888,
+            "listen_address": "10.0.0.5",
+            "allow": ["block", "info", "state", "exec", "push"],
+            "block_source": "live_first",
+            "push_servers": ["live-1"],
+            "max_body_bytes": 1024,
+            "max_connections": 10,
+            "max_in_flight": 20,
+            "max_in_flight_per_upstream": 5,
+            "upstream_queue_ms": 100,
+            "upstream_timeout_ms": 200,
+            "request_deadline_ms": 300,
+            "max_attempts": 8,
+            "probe_ms": 100,
+            "cors": {
+                "allow_origin": "*",
+                "allow_headers": "Content-Type",
+                "max_age": 600,
+                "allow_credentials": true
+            }
+        });
+        let cfg = single_api(full.clone());
+        cfg.validate().unwrap();
+        let api = cfg.chain_api.as_ref().unwrap();
+        assert_eq!(api.block_source, BlockSource::LiveFirst);
+        assert_eq!(
+            api.cors,
+            Some(ChainApiCors {
+                allow_origin: "*".to_string(),
+                allow_headers: Some("Content-Type".to_string()),
+                max_age: Some(600),
+                allow_credentials: true,
+            })
+        );
+        let reserialized = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(reserialized["chain_api"], full);
+        assert_eq!(reserialized["servers"], api_servers());
+
+        // Optional parts are omitted when unset.
+        let minimal = single_api(serde_json::json!({ "listen_port": 18888 }));
+        let value = serde_json::to_value(minimal.chain_api.as_ref().unwrap()).unwrap();
+        for key in ["listen_address", "push_servers", "cors"] {
+            assert!(value.get(key).is_none(), "{key} must be skipped");
+        }
+        assert_eq!(value["block_source"], "frozen_first");
+        let cors: ChainApiCors =
+            serde_json::from_value(serde_json::json!({ "allow_origin": "*" })).unwrap();
+        assert_eq!(
+            serde_json::to_value(&cors).unwrap(),
+            serde_json::json!({ "allow_origin": "*", "allow_credentials": false })
+        );
+
+        // Configs without the chain API serialize exactly as before: every
+        // server with the same keys, and no new key anywhere.
+        for (name, text) in FIXTURES {
+            let original: serde_json::Value = serde_json::from_str(text).unwrap();
+            let cfg: ServerConfig = serde_json::from_str(text).unwrap();
+            let reserialized = serde_json::to_value(&cfg).unwrap();
+            assert!(reserialized.get("chain_api").is_none(), "{name}");
+            assert_eq!(reserialized["servers"], original["servers"], "{name}");
+        }
+        let example: ServerConfig =
+            serde_json::from_str(include_str!("../example.config.json")).unwrap();
+        assert_eq!(
+            serde_json::to_string(&example.servers[0]).unwrap(),
+            r#"{"name":"SHiP Node 1","endpoint":"127.0.0.1:18080","enabled":true}"#
+        );
+        let listeners = multi(
+            serde_json::json!({ "servers": [live("a", 18080)] }),
+            serde_json::json!({}),
+        );
+        let reserialized = serde_json::to_value(&listeners).unwrap();
+        assert!(reserialized["listeners"][0].get("chain_api").is_none());
+        assert_eq!(reserialized["listeners"][0]["servers"][0], live("a", 18080));
+
+        // Unknown classes and block sources are rejected by the parser.
+        for bad in [
+            serde_json::json!({ "listen_port": 1, "allow": ["blocks"] }),
+            serde_json::json!({ "listen_port": 1, "block_source": "frozen" }),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                serde_json::from_value::<ChainApiConfig>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn api_endpoint_parsing() {
+        let ok = [
+            ("http://10.0.1.10:8888", "10.0.1.10", 8888),
+            ("HTTP://Node.Example:8888/", "node.example", 8888),
+            ("http://10.0.1.10", "10.0.1.10", 80),
+            (" 10.0.1.10:8888 ", "10.0.1.10", 8888),
+            ("node.example:1", "node.example", 1),
+            ("[::1]:8888", "[::1]", 8888),
+            ("http://[::1]", "[::1]", 80),
+        ];
+        for (raw, host, port) in ok {
+            assert_eq!(
+                ApiEndpoint::parse(raw),
+                Ok(ApiEndpoint {
+                    host: host.to_string(),
+                    port
+                }),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            ApiEndpoint::parse("https://10.0.1.10:443"),
+            Err(ApiEndpointError::Https)
+        );
+        assert_eq!(
+            ApiEndpoint::parse("HTTPS://10.0.1.10"),
+            Err(ApiEndpointError::Https)
+        );
+        for raw in [
+            "",
+            "10.0.1.10",
+            "10.0.1.10:",
+            "10.0.1.10:0",
+            "10.0.1.10:99999",
+            "10.0.1.10:port",
+            "ws://10.0.1.10:8888",
+            "http://",
+            "http://:8888",
+            "http://10.0.1.10:8888/v1",
+            "http://10.0.1.10:8888//",
+            "http://10.0.1.10:8888?x=1",
+            "http://10.0.1.10:8888#x",
+            "http://user@10.0.1.10:8888",
+            "10.0.1.10:8888/",
+            "://10.0.1.10:8888",
+            "::1:8888",
+            "http://10.0.1.10:8888 extra",
+        ] {
+            assert_eq!(
+                ApiEndpoint::parse(raw),
+                Err(ApiEndpointError::Invalid),
+                "{raw:?}"
+            );
+        }
+    }
+
+    // C1, C2
+    #[test]
+    fn api_endpoint_syntax_is_checked_on_every_server() {
+        let bad = single(
+            serde_json::json!([with_api(live("a", 18080), "http://10.0.1.10:8888/v1")]),
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            validation_error(&bad),
+            "server 'a': api_endpoint must be http://host[:port] or host:port"
+        );
+        let mut disabled = with_api(live("off", 18081), "10.0.1.10");
+        disabled["enabled"] = serde_json::json!(false);
+        let bad = multi(
+            serde_json::json!({ "servers": [live("a", 18080), disabled] }),
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            validation_error(&bad),
+            "listener 'eos': server 'off': api_endpoint must be http://host[:port] or host:port"
+        );
+        let https = single(
+            serde_json::json!([with_api(live("a", 18080), "https://10.0.1.10")]),
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            validation_error(&https),
+            "server 'a': https api_endpoint is not supported yet"
+        );
+    }
+
+    // C3
+    #[test]
+    fn api_endpoint_is_unique_within_a_listener() {
+        for (a, b) in [
+            ("10.0.1.10:8888", "http://10.0.1.10:8888"),
+            ("http://Node.Example", "node.example:80"),
+            ("[::1]:8888", "http://[::1]:8888/"),
+        ] {
+            let cfg = single(
+                serde_json::json!([with_api(live("a", 18080), a), with_api(live("b", 18081), b)]),
+                serde_json::json!({}),
+            );
+            assert_eq!(
+                validation_error(&cfg),
+                "server 'b': api_endpoint duplicates server 'a'",
+                "{a} {b}"
+            );
+        }
+        // A disabled duplicate is fine, and so are other ports.
+        let mut off = with_api(live("off", 18082), "10.0.1.10:8888");
+        off["enabled"] = serde_json::json!(false);
+        let cfg = single(
+            serde_json::json!([
+                with_api(live("a", 18080), "10.0.1.10:8888"),
+                with_api(live("b", 18081), "10.0.1.10:8889"),
+                off
+            ]),
+            serde_json::json!({}),
+        );
+        cfg.validate().unwrap();
+        // Unique per listener, not across listeners.
+        let cfg: ServerConfig = serde_json::from_value(serde_json::json!({
+            "upstream_reconnect_ms": 1000,
+            "upstream_monitoring_ms": 1000,
+            "upstream_status_ms": 1000,
+            "listeners": [
+                { "name": "eos", "listen_port": 17000,
+                  "servers": [with_api(live("a", 18080), "10.0.1.10:8888")] },
+                { "name": "wax", "listen_port": 17001,
+                  "servers": [with_api(live("b", 18081), "10.0.1.10:8888")] }
+            ]
+        }))
+        .unwrap();
+        cfg.validate().unwrap();
+    }
+
+    // C4
+    #[test]
+    fn chain_api_port_must_not_conflict() {
+        let zero = single_api(serde_json::json!({ "listen_port": 0 }));
+        assert_eq!(
+            validation_error(&zero),
+            "chain_api.listen_port must be non-zero"
+        );
+        let empty = multi_api(serde_json::json!({ "listen_port": 18888, "listen_address": " " }));
+        assert_eq!(
+            validation_error(&empty),
+            "listener 'eos': chain_api.listen_address must not be empty"
+        );
+
+        // The SHiP port of the same listener.
+        let own = single_api(serde_json::json!({ "listen_port": 17000 }));
+        assert_eq!(
+            validation_error(&own),
+            "chain_api port 17000 on 127.0.0.1 conflicts with listen_port 17000"
+        );
+        // Another address does not conflict.
+        let elsewhere =
+            single_api(serde_json::json!({ "listen_port": 17000, "listen_address": "127.0.0.2" }));
+        elsewhere.validate().unwrap();
+        // ...unless one side binds every interface.
+        let any =
+            single_api(serde_json::json!({ "listen_port": 17000, "listen_address": "0.0.0.0" }));
+        assert_eq!(
+            validation_error(&any),
+            "chain_api port 17000 on 0.0.0.0 conflicts with listen_port 17000"
+        );
+
+        // The metrics port.
+        let mut metrics = single_api(serde_json::json!({ "listen_port": 19090 }));
+        metrics.metrics_port = Some(19090);
+        assert_eq!(
+            validation_error(&metrics),
+            "chain_api port 19090 on 127.0.0.1 conflicts with metrics_port 19090"
+        );
+
+        // Another listener's SHiP port, and another chain_api.
+        let two = |eos_api: u16, wax_api: u16| -> ServerConfig {
+            serde_json::from_value(serde_json::json!({
+                "upstream_reconnect_ms": 1000,
+                "upstream_monitoring_ms": 1000,
+                "upstream_status_ms": 1000,
+                "listeners": [
+                    { "name": "eos", "listen_port": 17000,
+                      "servers": [with_api(live("a", 18080), "10.0.1.10:8888")],
+                      "chain_api": { "listen_port": eos_api } },
+                    { "name": "wax", "listen_port": 17001,
+                      "servers": [with_api(live("b", 18081), "10.0.1.11:8888")],
+                      "chain_api": { "listen_port": wax_api } }
+                ]
+            }))
+            .unwrap()
+        };
+        two(18888, 18889).validate().unwrap();
+        assert_eq!(
+            validation_error(&two(17001, 18889)),
+            "listener 'eos': chain_api port 17001 on 0.0.0.0 conflicts with listener 'wax' (0.0.0.0:17001)"
+        );
+        assert_eq!(
+            validation_error(&two(18888, 18888)),
+            "listener 'wax': chain_api port 18888 on 0.0.0.0 conflicts with the chain_api of listener 'eos'"
+        );
+    }
+
+    // C5
+    #[test]
+    fn chain_api_needs_an_enabled_server_with_api_endpoint() {
+        let mut off = with_api(live("off", 18081), "10.0.1.10:8888");
+        off["enabled"] = serde_json::json!(false);
+        for servers in [
+            serde_json::json!([live("a", 18080)]),
+            serde_json::json!([live("a", 18080), off]),
+        ] {
+            let cfg = multi(
+                serde_json::json!({ "servers": servers, "chain_api": { "listen_port": 18888 } }),
+                serde_json::json!({}),
+            );
+            assert_eq!(
+                validation_error(&cfg),
+                "listener 'eos': chain_api requires at least one enabled server with api_endpoint"
+            );
+        }
+        // An archive alone is enough.
+        let archive_only = single(
+            serde_json::json!([with_api(
+                frozen("arc", 18080, Some((2, 1001))),
+                "10.0.3.10:8890"
+            )]),
+            serde_json::json!({ "chain_id": CHAIN_ID, "chain_api": { "listen_port": 18888 } }),
+        );
+        archive_only.validate().unwrap();
+    }
+
+    // C6
+    #[test]
+    fn chain_api_allow_is_a_non_empty_set() {
+        let empty = single_api(serde_json::json!({ "listen_port": 18888, "allow": [] }));
+        assert_eq!(
+            validation_error(&empty),
+            "chain_api.allow must not be empty"
+        );
+        let twice = single_api(
+            serde_json::json!({ "listen_port": 18888, "allow": ["block", "info", "block"] }),
+        );
+        assert_eq!(
+            validation_error(&twice),
+            "chain_api.allow must list each class at most once"
+        );
+        let blocks = single_api(serde_json::json!({ "listen_port": 18888, "allow": ["block"] }));
+        blocks.validate().unwrap();
+    }
+
+    // C7
+    #[test]
+    fn chain_api_limits_are_bounded() {
+        let api = |extra: serde_json::Value| {
+            let mut value = serde_json::json!({ "listen_port": 18888 });
+            for (key, item) in extra.as_object().unwrap() {
+                value[key] = item.clone();
+            }
+            single_api(value)
+        };
+        let cases = [
+            (
+                serde_json::json!({ "max_body_bytes": 1023 }),
+                "chain_api.max_body_bytes must be between 1024 and 67108864",
+            ),
+            (
+                serde_json::json!({ "max_body_bytes": 67_108_865 }),
+                "chain_api.max_body_bytes must be between 1024 and 67108864",
+            ),
+            (
+                serde_json::json!({ "max_attempts": 0 }),
+                "chain_api.max_attempts must be between 1 and 8",
+            ),
+            (
+                serde_json::json!({ "max_attempts": 9 }),
+                "chain_api.max_attempts must be between 1 and 8",
+            ),
+            (
+                serde_json::json!({ "probe_ms": 99 }),
+                "chain_api.probe_ms must be between 100 and 60000",
+            ),
+            (
+                serde_json::json!({ "probe_ms": 60_001 }),
+                "chain_api.probe_ms must be between 100 and 60000",
+            ),
+            (
+                serde_json::json!({ "upstream_timeout_ms": 99 }),
+                "chain_api.upstream_timeout_ms must be at least 100",
+            ),
+            (
+                serde_json::json!({ "upstream_timeout_ms": 5000, "request_deadline_ms": 4999 }),
+                "chain_api.request_deadline_ms must be at least upstream_timeout_ms",
+            ),
+            (
+                serde_json::json!({ "upstream_queue_ms": 30_001 }),
+                "chain_api.upstream_queue_ms must be at most request_deadline_ms",
+            ),
+            (
+                serde_json::json!({ "max_connections": 0 }),
+                "chain_api.max_connections must be at least 1",
+            ),
+            (
+                serde_json::json!({ "max_in_flight": 0 }),
+                "chain_api.max_in_flight must be at least 1",
+            ),
+            (
+                serde_json::json!({ "max_in_flight_per_upstream": 0 }),
+                "chain_api.max_in_flight_per_upstream must be at least 1",
+            ),
+        ];
+        for (extra, want) in cases {
+            assert_eq!(validation_error(&api(extra.clone())), want, "{extra}");
+        }
+        let edges = serde_json::json!({
+            "max_body_bytes": 1024, "max_attempts": 1, "probe_ms": 60_000,
+            "upstream_timeout_ms": 100, "request_deadline_ms": 100, "upstream_queue_ms": 100,
+            "max_connections": 1, "max_in_flight": 1, "max_in_flight_per_upstream": 1
+        });
+        api(edges).validate().unwrap();
+        api(serde_json::json!({ "max_body_bytes": 67_108_864, "max_attempts": 8, "probe_ms": 100, "upstream_queue_ms": 0 }))
+            .validate()
+            .unwrap();
+    }
+
+    // C8
+    #[test]
+    fn push_servers_name_enabled_live_servers_with_an_api() {
+        let push = |names: serde_json::Value, allow: serde_json::Value| {
+            let mut off = with_api(live("off", 18082), "10.0.1.12:8888");
+            off["enabled"] = serde_json::json!(false);
+            multi(
+                serde_json::json!({
+                    "chain_id": CHAIN_ID,
+                    "servers": [
+                        with_api(frozen("archive-0a", 18080, Some((2, 1001))), "10.0.3.10:8890"),
+                        with_api(live("live-1", 18081), "10.0.1.10:8888"),
+                        off,
+                        live("no-api", 18083)
+                    ],
+                    "chain_api": { "listen_port": 18888, "allow": allow, "push_servers": names }
+                }),
+                serde_json::json!({}),
+            )
+        };
+        let with_push = serde_json::json!(["block", "push"]);
+        push(serde_json::json!(["live-1"]), with_push.clone())
+            .validate()
+            .unwrap();
+        for name in ["archive-0a", "off", "no-api", "missing"] {
+            assert_eq!(
+                validation_error(&push(serde_json::json!([name]), with_push.clone())),
+                format!("listener 'eos': chain_api.push_servers: '{name}' is not an enabled live server with api_endpoint")
+            );
+        }
+        assert_eq!(
+            validation_error(&push(serde_json::json!(["live-1", "live-1"]), with_push)),
+            "listener 'eos': chain_api.push_servers lists 'live-1' more than once"
+        );
+        assert_eq!(
+            validation_error(&push(
+                serde_json::json!(["live-1"]),
+                serde_json::json!(["block"])
+            )),
+            "listener 'eos': chain_api.push_servers requires \"push\" in chain_api.allow"
+        );
+    }
+
+    // C9
+    #[test]
+    fn top_level_chain_api_cannot_be_combined_with_listeners() {
+        let cfg = multi(
+            serde_json::json!({ "servers": [with_api(live("a", 18080), "10.0.1.10:8888")] }),
+            serde_json::json!({ "chain_api": { "listen_port": 18888 } }),
+        );
+        assert_eq!(
+            validation_error(&cfg),
+            "top-level 'chain_api' cannot be combined with 'listeners'; set 'chain_api' on each listener"
+        );
+    }
+
+    // C10
+    #[test]
+    fn cors_values_must_be_valid_header_values() {
+        let cors = |cors: serde_json::Value| {
+            single_api(serde_json::json!({ "listen_port": 18888, "cors": cors }))
+        };
+        cors(serde_json::json!({ "allow_origin": "https://explorer.example" }))
+            .validate()
+            .unwrap();
+        for bad in ["", "  ", "a\r\nX-Injected: 1", "a\nb", "a\u{0}b"] {
+            assert_eq!(
+                validation_error(&cors(serde_json::json!({ "allow_origin": bad }))),
+                "chain_api.cors.allow_origin is invalid",
+                "{bad:?}"
+            );
+            assert_eq!(
+                validation_error(&cors(
+                    serde_json::json!({ "allow_origin": "*", "allow_headers": bad })
+                )),
+                "chain_api.cors.allow_headers is invalid",
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chain_api_warnings() {
+        // api_endpoint without chain_api.
+        let ignored = single(
+            serde_json::json!([with_api(live("a", 18080), "10.0.1.10:8888")]),
+            serde_json::json!({}),
+        );
+        ignored.validate().unwrap();
+        assert_eq!(
+            ignored.warnings(),
+            vec!["api_endpoint is ignored without chain_api".to_string()]
+        );
+
+        // A frozen server without an API, no live API, push allowed, and a
+        // wildcard bind.
+        let cfg = multi(
+            serde_json::json!({
+                "chain_id": CHAIN_ID,
+                "listen_address": "0.0.0.0",
+                "servers": [
+                    with_api(frozen("archive-0a", 18080, Some((2, 1001))), "10.0.3.10:8890"),
+                    frozen("archive-0b", 18081, Some((2, 1001))),
+                    live("live-1", 18082)
+                ],
+                "chain_api": { "listen_port": 18888, "allow": ["block", "push"] }
+            }),
+            serde_json::json!({}),
+        );
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.warnings(),
+            vec![
+                "listener 'eos': server 'archive-0b': no api_endpoint; chain API requests for its blocks are answered by live nodes only".to_string(),
+                "listener 'eos': chain_api: no enabled live server has api_endpoint; get_info, state, push and reversible blocks answer 503".to_string(),
+                "listener 'eos': chain_api allows push: the port relays transactions for anyone who can reach it".to_string(),
+                "listener 'eos': chain_api listens on 0.0.0.0:18888 (every interface): the chain API has no authentication".to_string(),
+            ]
+        );
+        let v6 = multi_api(serde_json::json!({ "listen_port": 18888, "listen_address": "::" }));
+        v6.validate().unwrap();
+        assert_eq!(
+            v6.warnings(),
+            vec!["listener 'eos': chain_api listens on [::]:18888 (every interface): the chain API has no authentication".to_string()]
+        );
+
+        // A private bind with live and frozen APIs: no warning.
+        let quiet = single_api(serde_json::json!({ "listen_port": 18888 }));
+        quiet.validate().unwrap();
+        assert!(quiet.warnings().is_empty(), "{:?}", quiet.warnings());
+        let quiet =
+            multi_api(serde_json::json!({ "listen_port": 18888, "listen_address": "10.0.0.5" }));
+        quiet.validate().unwrap();
+        assert!(quiet.warnings().is_empty(), "{:?}", quiet.warnings());
     }
 }

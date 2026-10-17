@@ -148,7 +148,8 @@ pub enum HistoryPreference {
     /// Prefer frozen upstreams, keeping history reads off the live nodes.
     #[default]
     Frozen,
-    /// No role preference; the longest run wins.
+    /// No role preference; among upstreams of equal `priority` and load per
+    /// `weight`, the longest run wins.
     Any,
 }
 
@@ -205,6 +206,15 @@ impl Default for StitchingPolicy {
 
 fn has_enabled_frozen(servers: &[Server]) -> bool {
     servers.iter().any(|s| s.enabled && s.role == Role::Frozen)
+}
+fn default_server_weight() -> u32 {
+    1
+}
+fn is_default_server_weight(value: &u32) -> bool {
+    *value == default_server_weight()
+}
+fn is_default_priority(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Opt-in shared exclusion of one upstream for a short block range.
@@ -265,7 +275,6 @@ const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS: u64 = 10_000;
 
 /// A single upstream SHiP node, as declared in `config.json`.
 #[derive(Debug, Deserialize, Serialize, Hash, Eq, PartialEq, Clone)]
-#[cfg_attr(test, derive(Default))]
 pub struct Server {
     /// Human-readable name used in logs and as the `server` label on `/metrics`.
     pub name: String,
@@ -288,6 +297,24 @@ pub struct Server {
     /// connection is not counted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_sessions: Option<u32>,
+    /// Preference tier. Lower is preferred; `0` (the default) is the highest.
+    ///
+    /// Among upstreams that are equally able to serve a request, the router
+    /// picks from the lowest tier first. Coverage of the requested block and
+    /// freshness still rank above priority, so a preferred upstream that lacks
+    /// the block never wins over one that has it.
+    #[serde(default, skip_serializing_if = "is_default_priority")]
+    pub priority: u32,
+    /// Relative share of client sessions within the same priority tier.
+    /// Must be at least `1` (the default).
+    ///
+    /// Selection compares active connections divided by weight, so an
+    /// upstream with weight `2` takes about twice the sessions of one with `1`.
+    #[serde(
+        default = "default_server_weight",
+        skip_serializing_if = "is_default_server_weight"
+    )]
+    pub weight: u32,
 }
 
 impl Server {
@@ -298,6 +325,24 @@ impl Server {
     /// or `wss`.
     pub fn ws_url(&self) -> String {
         dial_url(&self.endpoint)
+    }
+}
+
+/// Test fixtures build servers with `..Default::default()`. Not derived, so
+/// the default `weight` is the configured default (1), not an invalid 0.
+#[cfg(test)]
+impl Default for Server {
+    fn default() -> Self {
+        Server {
+            name: String::new(),
+            endpoint: String::new(),
+            enabled: false,
+            role: Role::default(),
+            range: None,
+            max_sessions: None,
+            priority: 0,
+            weight: default_server_weight(),
+        }
     }
 }
 
@@ -618,6 +663,12 @@ fn validate_servers(servers: &[Server], listener_ctx: Option<&str>) -> Result<()
         }
         let identity = upstream_identity(&s.endpoint)
             .map_err(|err| anyhow!("{prefix}server '{}': {err}", s.name))?;
+        if s.weight == 0 {
+            bail!(
+                "{prefix}server '{}': weight must be at least 1 (set enabled: false to stop using it)",
+                s.name
+            );
+        }
         if !s.enabled {
             continue;
         }
@@ -1133,6 +1184,10 @@ pub struct ServerState {
     /// Set by the monitoring loop when an upstream stops advancing its chain
     /// state. Stale upstreams are deprioritized (but not excluded) when routing.
     pub stale: bool,
+    /// Configured [`Server::priority`]. Lower is preferred.
+    pub priority: u32,
+    /// Configured [`Server::weight`]. Always at least 1.
+    pub weight: u32,
     /// Optional configured `chain_id` that every upstream in this pool must match.
     pub expected_chain_id: Option<[u8; 32]>,
     /// When `true` and [`Self::expected_chain_id`] is set, a status that omits
@@ -1226,6 +1281,8 @@ impl ServerState {
             enabled: true,
             online: false,
             stale: false,
+            priority: 0,
+            weight: 1,
             expected_chain_id,
             require_chain_id,
             chain_id_unverified_warned: false,
@@ -1441,6 +1498,8 @@ pub fn build_state_db_with_chain_id(
                 state.role = s.role;
                 state.declared = s.range;
                 state.max_sessions = s.max_sessions;
+                state.priority = s.priority;
+                state.weight = s.weight.max(1);
                 (s.endpoint.clone(), state)
             })
             .collect::<HashMap<String, ServerState>>(),
@@ -1548,6 +1607,52 @@ mod tests {
         ]));
         cfg.validate().unwrap();
         assert_eq!(cfg.servers[0].ws_url(), "wss://[::1]:8443");
+    }
+
+    #[test]
+    fn priority_and_weight_default_and_reach_the_state_map() {
+        let cfg = config_with_servers(serde_json::json!([
+            { "name": "plain", "endpoint": "127.0.0.1:18080", "enabled": true },
+            { "name": "backup", "endpoint": "127.0.0.1:18081", "enabled": true,
+              "priority": 10, "weight": 3 }
+        ]));
+        cfg.validate().unwrap();
+        assert_eq!((cfg.servers[0].priority, cfg.servers[0].weight), (0, 1));
+        assert_eq!((cfg.servers[1].priority, cfg.servers[1].weight), (10, 3));
+
+        let db = build_state_db(cfg.servers.clone());
+        let states = db.try_lock().unwrap();
+        let backup = &states["127.0.0.1:18081"];
+        assert_eq!((backup.priority, backup.weight), (10, 3));
+        let plain = &states["127.0.0.1:18080"];
+        assert_eq!((plain.priority, plain.weight), (0, 1));
+    }
+
+    #[test]
+    fn priority_and_weight_serialize_only_when_set() {
+        let cfg = config_with_servers(serde_json::json!([
+            { "name": "plain", "endpoint": "127.0.0.1:18080", "enabled": true },
+            { "name": "backup", "endpoint": "127.0.0.1:18081", "enabled": true,
+              "priority": 10, "weight": 3 }
+        ]));
+        let servers = serde_json::to_value(&cfg).unwrap()["servers"].clone();
+        assert!(servers[0].get("priority").is_none());
+        assert!(servers[0].get("weight").is_none());
+        assert_eq!(servers[1]["priority"], 10);
+        assert_eq!(servers[1]["weight"], 3);
+    }
+
+    #[test]
+    fn zero_weight_is_rejected() {
+        let cfg = config_with_servers(serde_json::json!([
+            { "name": "a", "endpoint": "127.0.0.1:18080", "enabled": true },
+            { "name": "b", "endpoint": "127.0.0.1:18081", "enabled": false, "weight": 0 }
+        ]));
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("server 'b': weight must be at least 1"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

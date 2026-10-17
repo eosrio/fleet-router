@@ -7,7 +7,7 @@
 //! serving upstream must have it too. Live upstreams are open-ended above
 //! their begin; frozen ones cover exactly their range.
 
-use std::cmp::Reverse;
+use std::cmp::Ordering as CmpOrdering;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -216,6 +216,23 @@ fn eligible_with(
     true
 }
 
+/// Operator preference between two upstreams that serve a request equally
+/// well: the lower `priority` tier first, then fewer connections per unit of
+/// `weight` (weighted least-connections), then the higher weight. `Less`
+/// means `a` is preferred. `a_conns` and `b_conns` are the connections that
+/// count for each.
+///
+/// The load is compared as `a_conns * b.weight` against `b_conns * a.weight`,
+/// without dividing, so it is exact.
+fn preference(a: &UpstreamView, a_conns: usize, b: &UpstreamView, b_conns: usize) -> CmpOrdering {
+    let (a_weight, b_weight) = (a.weight.max(1), b.weight.max(1));
+    let load = |conns: usize, weight: u32| (conns as u128) * u128::from(weight);
+    a.priority
+        .cmp(&b.priority)
+        .then_with(|| load(a_conns, b_weight).cmp(&load(b_conns, a_weight)))
+        .then_with(|| b_weight.cmp(&a_weight))
+}
+
 /// A live upstream more than `lag` blocks behind the fleet head, asked for a
 /// block above its own head.
 fn lagging_for(v: &FleetView, u: &UpstreamView, n: u32, lag: u32) -> bool {
@@ -317,6 +334,19 @@ pub fn tip_region(v: &FleetView, from: u32) -> bool {
 /// range, it may hold blocks below the known fleet begin or inside a hole:
 /// those hold (bounded, as offline) instead of being served id-less by
 /// another archive or closed as a gap.
+///
+/// Candidates are ranked by: online, fresh and not lagging, under capacity,
+/// role preference, not soft-excluded, then the operator preference (lower
+/// `priority` tier, fewer connections per unit of `weight`, higher weight),
+/// then the longest run, then the rendezvous hash. Priority and weight come
+/// after role preference and capacity, so neither pulls history reads onto
+/// a live node or a session onto a full upstream, and after the soft
+/// exclusion, so a failover leaves a failed upstream for a peer in any tier.
+/// They come before the longest run so that an operator's tiers and weights
+/// hold across upstreams whose ranges differ, not only among replicas; with
+/// equal preference the longest run still keeps handoffs few. The session's
+/// own slots do not count as load on their upstream, so a session is not
+/// pushed off the upstream it already holds by its own connection.
 #[allow(clippy::too_many_arguments)]
 pub fn next_step(
     v: &FleetView,
@@ -359,10 +389,8 @@ pub fn next_step(
         // deliver them id-less from the owner of the known fleet begin.
         return unknown_hold;
     }
-    let full = |u: &UpstreamView| {
-        let mine = own.iter().filter(|&&i| i == u.index).count();
-        u.at_capacity_besides(mine)
-    };
+    let mine = |u: &UpstreamView| own.iter().filter(|&&i| i == u.index).count();
+    let full = |u: &UpstreamView| u.at_capacity_besides(mine(u));
     let cands: Vec<&UpstreamView> = v
         .upstreams
         .iter()
@@ -389,24 +417,41 @@ pub fn next_step(
             bounded: !tip_region(v, from),
         };
     }
-    let best = *cands
+    // Each candidate's keys are read once, so one ranking sees one
+    // connection count per upstream.
+    let ranked: Vec<Ranked<'_>> = cands
         .iter()
-        .min_by_key(|u| {
-            (
+        .map(|&u| Ranked {
+            up: u,
+            head: [
                 u8::from(!u.online),
                 u8::from(u.stale || lagging_for(v, u, from, lag)),
                 u8::from(full(u)),
                 match (pol.history_preference, u.role) {
-                    (HistoryPreference::Frozen, Role::Live) => 1u8,
+                    (HistoryPreference::Frozen, Role::Live) => 1,
                     _ => 0,
                 },
                 u8::from(ex.soft.as_deref() == Some(&*u.endpoint)),
-                Reverse(run_end(v, u, sh.need, from, now).min(sh.end)),
-                u.connections.load(Ordering::Relaxed),
-                rendezvous(sid, &u.endpoint),
-            )
+            ],
+            conns: u
+                .connections
+                .load(Ordering::Relaxed)
+                .saturating_sub(mine(u)),
+            run: run_end(v, u, sh.need, from, now).min(sh.end),
+            hash: rendezvous(sid, &u.endpoint),
+        })
+        .collect();
+    let chosen = ranked
+        .iter()
+        .min_by(|a, b| {
+            a.head
+                .cmp(&b.head)
+                .then_with(|| preference(a.up, a.conns, b.up, b.conns))
+                .then_with(|| b.run.cmp(&a.run))
+                .then_with(|| a.hash.cmp(&b.hash))
         })
         .expect("cands is not empty");
+    let best = chosen.up;
     if !best.online && !allow_offline {
         return Step::Hold {
             block: from,
@@ -414,7 +459,7 @@ pub fn next_step(
             bounded: !tip_region(v, from),
         };
     }
-    let mut req_end = run_end(v, best, sh.need, from, now).min(sh.end);
+    let mut req_end = chosen.run;
     if best.role == Role::Frozen {
         let (head, lib) = tip;
         let gate = if sh.irreversible_only { lib } else { head };
@@ -440,15 +485,43 @@ pub fn next_step(
     })
 }
 
+/// A [`next_step`] candidate with its ranking keys.
+struct Ranked<'a> {
+    up: &'a UpstreamView,
+    /// Online, fresh, under capacity, role preference, not soft-excluded:
+    /// `0` is better for each.
+    head: [u8; 5],
+    /// Connections that count as load (the session's own slots do not).
+    conns: usize,
+    /// The run's end, clamped to the request's end. Longer is better.
+    run: u32,
+    hash: u64,
+}
+
+/// A [`pool_pick`] candidate with its ranking keys.
+struct PoolRanked<'a> {
+    up: &'a UpstreamView,
+    offline: bool,
+    /// Coverage and freshness, `0` best (see `pool_pick`).
+    rank: u8,
+    conns: usize,
+    hash: u64,
+}
+
 /// Pick an upstream for a pool session. Replaces `select_backend_server`
 /// (`failover = false`: online only) and `select_failover_server`
 /// (`failover = true`: an offline upstream is a last resort).
 ///
 /// `route` is the request's need and start block, `None` before the first
 /// request. Candidates are ranked by: online, covers the block (online
-/// union), fresh and not lagging, least connections, rendezvous hash. The
-/// soft exclusion picks another upstream of the same or better rank when
-/// there is one.
+/// union), fresh and not lagging, then the lower `priority` tier, then fewer
+/// connections per unit of `weight` (weighted least-connections), then the
+/// higher weight, then the rendezvous hash. Coverage and freshness rank
+/// above priority, so a preferred upstream that lacks the block or is stale
+/// never wins over one that has it. The soft exclusion picks another
+/// upstream that covers the block as well and is as fresh, when there is
+/// one, in any priority tier: failover leaves a failed upstream even for a
+/// backup tier.
 pub fn pool_pick(
     v: &FleetView,
     route: Option<(Need, u32)>,
@@ -476,34 +549,44 @@ pub fn pool_pick(
             }
         }
     };
-    let key = |u: &&UpstreamView| {
-        (
-            u8::from(!u.online),
-            rank(u),
-            u.connections.load(Ordering::Relaxed),
-            rendezvous(sid, &u.endpoint),
-        )
+    // Each candidate's keys are read once, so one ranking sees one
+    // connection count per upstream.
+    let ranked: Vec<PoolRanked<'_>> = cands()
+        .map(|u| PoolRanked {
+            up: u,
+            offline: !u.online,
+            rank: rank(u),
+            conns: u.connections.load(Ordering::Relaxed),
+            hash: rendezvous(sid, &u.endpoint),
+        })
+        .collect();
+    let cmp = |a: &&PoolRanked<'_>, b: &&PoolRanked<'_>| {
+        (a.offline, a.rank)
+            .cmp(&(b.offline, b.rank))
+            .then_with(|| preference(a.up, a.conns, b.up, b.conns))
+            .then_with(|| a.hash.cmp(&b.hash))
     };
-    let best = cands().min_by_key(key)?;
-    // Prefer a peer of the one that just failed when it is as suitable.
-    let pick = if ex.soft.as_deref() == Some(&*best.endpoint) {
-        let best_rank = rank(best);
-        cands()
-            .filter(|u| u.endpoint != best.endpoint && rank(u) <= best_rank)
-            .min_by_key(key)
+    let best = ranked.iter().min_by(cmp)?;
+    // Prefer a peer of the one that just failed when it covers the block as
+    // well, whatever its priority tier.
+    let pick = if ex.soft.as_deref() == Some(&*best.up.endpoint) {
+        ranked
+            .iter()
+            .filter(|c| c.up.endpoint != best.up.endpoint && c.rank <= best.rank)
+            .min_by(cmp)
             .unwrap_or(best)
     } else {
         best
     };
     if let Some((_, block)) = route {
-        if rank(pick) >= 2 {
+        if pick.rank >= 2 {
             tracing::warn!(
                 block,
                 "no upstream covers the requested block; falling back to least-connections"
             );
         }
     }
-    Some(pick.index)
+    Some(pick.up.index)
 }
 
 #[cfg(test)]
@@ -1789,5 +1872,220 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(pick(&v, Some((need, 500)), None, false), Some(0));
+    }
+
+    // Upstream preference (`priority` and `weight`): the routing tests that
+    // came with it, ported to `pool_pick`, and the same order in `next_step`.
+
+    /// A pool upstream whose traces cover 1..500, with `priority` and
+    /// `weight`.
+    fn tiered(index: usize, conns: usize, priority: u32, weight: u32) -> ServerState {
+        let mut s = pool_server(index, conns, (1, 500), (0, 0));
+        s.priority = priority;
+        s.weight = weight;
+        s
+    }
+
+    #[test]
+    fn pool_lower_priority_tier_wins_over_fewer_connections() {
+        let v = pool_view(vec![tiered(0, 9, 0, 1), tiered(1, 0, 1, 1)]);
+        assert_eq!(pick(&v, at(100), None, false), Some(0));
+        assert_eq!(
+            pick(&v, None, None, false),
+            Some(0),
+            "priority also applies on initial connect, before any block is known"
+        );
+    }
+
+    #[test]
+    fn pool_backup_tier_serves_when_the_preferred_tier_is_offline() {
+        let mut primary = tiered(0, 0, 0, 1);
+        primary.online = false;
+        let v = pool_view(vec![primary, tiered(1, 3, 100, 1)]);
+        assert_eq!(pick(&v, at(100), None, false), Some(1));
+        assert_eq!(pick(&v, at(100), None, true), Some(1));
+    }
+
+    #[test]
+    fn pool_coverage_and_freshness_outrank_priority() {
+        // A live range is open-ended above its begin, so the preferred node
+        // that lacks block 100 is a pruned one whose traces begin above it.
+        let mut short = tiered(0, 0, 0, 1);
+        short.trace_begin_block = 200;
+        let v = pool_view(vec![short, tiered(1, 0, 5, 1)]);
+        assert_eq!(pick(&v, at(100), None, false), Some(1));
+
+        let mut stale = tiered(0, 0, 0, 1);
+        stale.stale = true;
+        let v = pool_view(vec![stale, tiered(1, 0, 5, 1)]);
+        assert_eq!(pick(&v, at(100), None, false), Some(1));
+    }
+
+    #[test]
+    fn pool_weight_splits_sessions_within_a_tier() {
+        let v = pool_view(vec![
+            tiered(0, 0, 0, 2),
+            tiered(1, 0, 0, 1),
+            tiered(2, 0, 1, 10),
+        ]);
+        for _ in 0..30 {
+            let picked = pick(&v, at(100), None, false).unwrap();
+            v.up(picked)
+                .unwrap()
+                .connections
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let conns = |i: usize| v.up(i).unwrap().connections.load(Ordering::Relaxed);
+        assert_eq!(conns(0), 20);
+        assert_eq!(conns(1), 10);
+        assert_eq!(conns(2), 0);
+    }
+
+    #[test]
+    fn pool_equal_load_prefers_the_higher_weight() {
+        let v = pool_view(vec![tiered(0, 1, 0, 1), tiered(1, 2, 0, 2)]);
+        assert_eq!(pick(&v, at(100), None, false), Some(1));
+    }
+
+    #[test]
+    fn pool_retry_leaves_a_failed_preferred_upstream_for_a_backup() {
+        let v = pool_view(vec![tiered(0, 0, 0, 1), tiered(1, 0, 5, 1)]);
+        assert_eq!(pick(&v, at(100), Some(0), true), Some(1));
+    }
+
+    #[test]
+    fn preference_compares_load_per_weight_exactly() {
+        let v = pool_view(vec![tiered(0, 0, 0, 3), tiered(1, 0, 0, 2)]);
+        let (a, b) = (v.up(0).unwrap(), v.up(1).unwrap());
+        // 2/3 < 1/2 is false; 1/3 < 1/2 is true; 3/3 == 2/2 goes to weight 3.
+        assert_eq!(preference(a, 2, b, 1), CmpOrdering::Greater);
+        assert_eq!(preference(a, 1, b, 1), CmpOrdering::Less);
+        assert_eq!(preference(a, 3, b, 2), CmpOrdering::Less);
+        assert_eq!(preference(b, 2, a, 3), CmpOrdering::Greater);
+        // Huge counts do not overflow: MAX/3 < MAX/2.
+        assert_eq!(preference(a, usize::MAX, b, usize::MAX), CmpOrdering::Less);
+    }
+
+    /// `next_step` at `from` for `v` with `policy`, `ex` and `own` slots.
+    fn plan_with(
+        v: &FleetView,
+        from: u32,
+        policy: &StitchingPolicy,
+        ex: &Excludes,
+        own: &[usize],
+    ) -> Step {
+        next_step(
+            v,
+            tip_of(v),
+            &shape(all(), u32::MAX),
+            from,
+            ex,
+            own,
+            1,
+            policy,
+            1200,
+            false,
+            now(),
+        )
+    }
+
+    fn tier(mut s: ServerState, priority: u32, weight: u32) -> ServerState {
+        s.priority = priority;
+        s.weight = weight;
+        s
+    }
+
+    #[test]
+    fn stitched_priority_and_weight_rank_after_role_and_capacity_before_the_longest_run() {
+        let pol = StitchingPolicy::default();
+        let none = Excludes::default();
+        // Priority beats fewer connections among replicas.
+        let busy = tier(frozen(0, 2, 1001), 0, 1);
+        busy.connections.store(5, Ordering::Relaxed);
+        let v = view(vec![busy, tier(frozen(1, 2, 1001), 1, 1)]);
+        assert_eq!(served_by(&plan_with(&v, 10, &pol, &none, &[])).0, 0);
+
+        // Weight splits sessions inside a tier; a backup tier gets none.
+        let v = view(vec![
+            tier(frozen(0, 2, 1001), 0, 2),
+            tier(frozen(1, 2, 1001), 0, 1),
+            tier(frozen(2, 2, 1001), 1, 10),
+        ]);
+        for _ in 0..30 {
+            let up = served_by(&plan_with(&v, 10, &pol, &none, &[])).0;
+            v.upstreams[up].connections.fetch_add(1, Ordering::Relaxed);
+        }
+        let conns = |i: usize| v.upstreams[i].connections.load(Ordering::Relaxed);
+        assert_eq!((conns(0), conns(1), conns(2)), (20, 10, 0));
+
+        // Role preference outranks priority: B and C overlap on [1900, 2001).
+        let fleet = || {
+            vec![
+                frozen(0, 2, 1001),
+                tier(frozen(1, 1001, 2001), 5, 1),
+                tier(live(2, 1900, 2300), 0, 1),
+            ]
+        };
+        let v = view(fleet());
+        assert_eq!(served_by(&plan_with(&v, 1950, &pol, &none, &[])).0, 1);
+
+        // Without a role preference, priority outranks the longest run...
+        let any = StitchingPolicy {
+            history_preference: HistoryPreference::Any,
+            ..Default::default()
+        };
+        assert_eq!(
+            served_by(&plan_with(&v, 1950, &any, &none, &[])),
+            (2, 1950, u32::MAX)
+        );
+        let mut swapped = fleet();
+        swapped[1].priority = 0;
+        swapped[2].priority = 5;
+        let v = view(swapped);
+        assert_eq!(
+            served_by(&plan_with(&v, 1950, &any, &none, &[])),
+            (1, 1950, 2001),
+            "the preferred tier serves although the live run is longer"
+        );
+        // ...and with equal preference the longest run still wins (PL3).
+        let v = view(vec![
+            frozen(0, 2, 1001),
+            frozen(1, 1001, 2001),
+            live(2, 1900, 2300),
+        ]);
+        assert_eq!(served_by(&plan_with(&v, 1950, &any, &none, &[])).0, 2);
+
+        // Capacity outranks priority: a full preferred replica loses.
+        let mut full = tier(frozen(0, 2, 1001), 0, 1);
+        full.max_sessions = Some(1);
+        full.connections.store(1, Ordering::Relaxed);
+        let v = view(vec![full, tier(frozen(1, 2, 1001), 9, 1)]);
+        assert_eq!(served_by(&plan_with(&v, 10, &pol, &none, &[])).0, 1);
+
+        // A failover leaves a failed preferred upstream for a backup tier.
+        let v = view(vec![
+            tier(frozen(0, 2, 1001), 0, 1),
+            tier(frozen(1, 2, 1001), 5, 1),
+        ]);
+        let soft = Excludes {
+            soft: Some(v.upstreams[0].endpoint.clone()),
+            ..Default::default()
+        };
+        assert_eq!(served_by(&plan_with(&v, 10, &pol, &none, &[])).0, 0);
+        assert_eq!(served_by(&plan_with(&v, 10, &pol, &soft, &[])).0, 1);
+    }
+
+    #[test]
+    fn stitched_load_does_not_count_the_sessions_own_slots() {
+        // One connection on each replica: on 0 it is the session's own link.
+        let a = frozen(0, 2, 1001);
+        let b = frozen(1, 2, 1001);
+        a.connections.store(1, Ordering::Relaxed);
+        b.connections.store(1, Ordering::Relaxed);
+        let v = view(vec![a, b]);
+        let pol = StitchingPolicy::default();
+        let none = Excludes::default();
+        assert_eq!(served_by(&plan_with(&v, 10, &pol, &none, &[0])).0, 0);
+        assert_eq!(served_by(&plan_with(&v, 10, &pol, &none, &[1])).0, 1);
     }
 }

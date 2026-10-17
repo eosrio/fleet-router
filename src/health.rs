@@ -552,6 +552,8 @@ struct MetricSnapshot {
     labels: String,
     online: bool,
     stale: bool,
+    priority: u32,
+    weight: u32,
     connections: usize,
     trace_begin_block: u32,
     trace_end_block: u32,
@@ -617,6 +619,8 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
                 labels: format_labels(l.name.as_deref(), endpoint, &state.name),
                 online: state.online,
                 stale: state.stale,
+                priority: state.priority,
+                weight: state.weight,
                 connections: state.connections.load(Ordering::Relaxed),
                 trace_begin_block: state.trace_begin_block,
                 trace_end_block: state.trace_end_block,
@@ -662,6 +666,24 @@ async fn render_metrics(listeners: &[ListenerHealthState]) -> String {
             "fleet_router_upstream_stale{{{}}} {}\n",
             s.labels,
             u8::from(s.stale)
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_priority Configured priority tier of an upstream (lower is preferred).\n");
+    out.push_str("# TYPE fleet_router_upstream_priority gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_priority{{{}}} {}\n",
+            s.labels, s.priority
+        ));
+    }
+
+    out.push_str("# HELP fleet_router_upstream_weight Configured weight of an upstream within its priority tier.\n");
+    out.push_str("# TYPE fleet_router_upstream_weight gauge\n");
+    for s in &snapshots {
+        out.push_str(&format!(
+            "fleet_router_upstream_weight{{{}}} {}\n",
+            s.labels, s.weight
         ));
     }
 
@@ -1414,6 +1436,8 @@ mod tests {
             name: nasty.to_string(),
             endpoint: "127.0.0.1:18080".to_string(),
             enabled: true,
+            priority: 2,
+            weight: 3,
             ..Default::default()
         }]);
         let named = build_state_db(vec![Server {
@@ -1458,6 +1482,8 @@ mod tests {
         let series = [
             ("fleet_router_upstream_up", "1", "0"),
             ("fleet_router_upstream_stale", "1", "0"),
+            ("fleet_router_upstream_priority", "2", "0"),
+            ("fleet_router_upstream_weight", "3", "1"),
             ("fleet_router_active_connections", "3", "0"),
             ("fleet_router_upstream_chain_state_end_block", "42", "5"),
             ("fleet_router_upstream_finality_data_begin_block", "7", "0"),

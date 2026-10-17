@@ -4,9 +4,12 @@
 # config at /etc/fleet-router/<network>.json (with distinct listen_port and
 # metrics_port), then enable and start per network:
 #
+#   sudo systemctl daemon-reload
 #   sudo systemctl enable --now fleet-router@eos
 #   sudo systemctl enable --now fleet-router@wax
 #   sudo systemctl enable --now fleet-router@telos
+#
+# See docs/operations.md#run-as-a-service for the full walkthrough.
 
 [Unit]
 Description=Fleet SHiP Router (%i)
@@ -15,12 +18,22 @@ Wants=network-online.target
 
 [Service]
 User=fleet
+Group=fleet
 ExecStart=/usr/local/bin/fleet-router run --config /etc/fleet-router/%i.json
 Restart=on-failure
+RestartSec=2
 # SIGTERM triggers a graceful, bounded drain. Allow more than shutdown_grace_ms
 # so systemd does not SIGKILL the process mid-drain.
 TimeoutStopSec=10
 Environment=RUST_LOG=info
+# Each client session holds two sockets (client and upstream). systemd's
+# default soft limit of 1024 open files caps the router at ~500 clients.
+LimitNOFILE=65536
+# The router only reads its config and writes to stdout/stderr (journald).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

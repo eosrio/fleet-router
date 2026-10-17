@@ -166,6 +166,10 @@ pub struct UpstreamView {
     /// The upstream's live link count (the same counter sessions update).
     pub connections: Arc<AtomicUsize>,
     pub max_sessions: Option<u32>,
+    /// Configured preference tier. Lower is preferred.
+    pub priority: u32,
+    /// Configured share within the tier. Always at least 1.
+    pub weight: u32,
     pub quarantines: Vec<BlockQuarantine>,
     pub abi_fp: Option<u64>,
     /// False when `abi_mismatch: "exclude"` drops this upstream for an ABI
@@ -268,6 +272,8 @@ impl PartialEq for UpstreamView {
             && self.lib == other.lib
             && Arc::ptr_eq(&self.connections, &other.connections)
             && self.max_sessions == other.max_sessions
+            && self.priority == other.priority
+            && self.weight == other.weight
             && self.quarantines == other.quarantines
             && self.abi_fp == other.abi_fp
             && self.abi_ok == other.abi_ok
@@ -649,6 +655,8 @@ fn upstream_view(ctx: &BuildCtx<'_>, endpoint: &str, s: &ServerState) -> Upstrea
                 role: s.role,
                 range: s.declared,
                 max_sessions: s.max_sessions,
+                priority: s.priority,
+                weight: s.weight,
             };
             (
                 Arc::from(endpoint),
@@ -687,6 +695,8 @@ fn upstream_view(ctx: &BuildCtx<'_>, endpoint: &str, s: &ServerState) -> Upstrea
         lib: s.lib,
         connections: s.connections.clone(),
         max_sessions: s.max_sessions,
+        priority: s.priority,
+        weight: s.weight.max(1),
         quarantines: s.quarantines.clone(),
         abi_fp: s.abi.as_ref().map(|abi| abi.fp),
         abi_ok: true,
@@ -1034,6 +1044,8 @@ pub(crate) mod fixtures {
             c.role = self.role;
             c.declared = self.declared;
             c.max_sessions = self.max_sessions;
+            c.priority = self.priority;
+            c.weight = self.weight;
             c.enabled = self.enabled;
             c.online = self.online;
             c.stale = self.stale;

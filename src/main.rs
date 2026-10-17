@@ -6,8 +6,9 @@
 //! WebSocket bidirectionally, transparently failing over to another upstream
 //! and de-duplicating replayed blocks on reconnect.
 //!
-//! Run with `fleet-router run --config config.json`. See the project README for
-//! the full configuration reference and operational guidance.
+//! Run with `fleet-router run --config config.json`. See `docs/configuration.md`
+//! for the full configuration reference and `docs/operations.md` for
+//! operational guidance.
 
 use std::any::Any;
 use std::collections::HashSet;

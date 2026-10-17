@@ -277,9 +277,8 @@ async fn listener_view(ctx: &ListenerContext, now: Instant) -> ListenerView {
         }
     }
     drop(db);
-    let ready = upstreams
-        .iter()
-        .any(|upstream| upstream.online && !upstream.operator_disabled);
+    // The verdict of `/ready`: a stitched listener needs a live upstream.
+    let ready = crate::health::tip_ready(&ctx.health).await;
     ListenerView {
         name: ctx.name().to_string(),
         port: ctx.port,
@@ -916,6 +915,81 @@ mod tests {
         assert_eq!(upstream_status(&mut state, now), "stale");
         state.operator_disabled = true;
         assert_eq!(upstream_status(&mut state, now), "disabled");
+    }
+
+    /// A stitched listener whose archives are online but whose live node is
+    /// not is shown as not ready, as `/ready` answers 503 for it.
+    #[tokio::test]
+    async fn a_stitched_listener_is_ready_on_the_dashboard_only_as_for_ready() {
+        use crate::fleet::FleetHub;
+        use crate::models::{
+            build_config_db, build_state_db, ResolvedListener, ResolvedTopology, Role,
+            StitchingPolicy,
+        };
+        let (archive, live) = ("127.0.0.1:18081", "127.0.0.1:18082");
+        let servers = vec![
+            Server {
+                name: "archive".to_string(),
+                endpoint: archive.to_string(),
+                enabled: true,
+                role: Role::Frozen,
+                range: Some(crate::ship::Range {
+                    begin: 1,
+                    end: 1001,
+                }),
+                ..Default::default()
+            },
+            Server {
+                name: "live".to_string(),
+                endpoint: live.to_string(),
+                enabled: true,
+                role: Role::Live,
+                ..Default::default()
+            },
+        ];
+        let resolved = ResolvedListener {
+            name: None,
+            listen_address: "127.0.0.1".to_string(),
+            listen_port: 0,
+            max_connections: 10,
+            expected_chain_id: None,
+            require_chain_id: false,
+            block_failure_quarantine: None,
+            servers: servers.clone(),
+            topology: ResolvedTopology::Stitched,
+            stitching: StitchingPolicy::default(),
+            abi_pin: None,
+        };
+        let hub = FleetHub::new(
+            &resolved,
+            build_state_db(servers.clone()),
+            build_config_db(servers.clone()),
+        );
+        let ctx = ListenerContext {
+            health: ListenerHealthState {
+                name: None,
+                state_db: hub.state.clone(),
+                hub: Some(hub.clone()),
+            },
+            config_db: build_config_db(servers),
+            order: vec![archive.to_string(), live.to_string()],
+            port: 0,
+            chain_id: None,
+            max_connections: 10,
+            stats: Arc::new(ListenerStats::default()),
+        };
+        let set_online = |endpoint: &'static str| {
+            let hub = hub.clone();
+            async move {
+                let mut db = hub.state.lock().await;
+                db.get_mut(endpoint).unwrap().online = true;
+                hub.rebuild(&db);
+            }
+        };
+        set_online(archive).await;
+        assert!(!listener_view(&ctx, Instant::now()).await.ready);
+        set_online(live).await;
+        assert!(listener_view(&ctx, Instant::now()).await.ready);
     }
 
     #[test]

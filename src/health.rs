@@ -110,6 +110,11 @@ impl Readiness {
 
 const NO_UPSTREAMS_ONLINE: &str = "no upstreams online";
 
+/// Whether `l` can serve the chain tip, as `GET /ready/<listener>` answers.
+pub(crate) async fn tip_ready(l: &ListenerHealthState) -> bool {
+    listener_readiness(l, Scope::Tip).await.ready()
+}
+
 async fn listener_readiness(l: &ListenerHealthState, scope: Scope) -> Readiness {
     let view = match &l.hub {
         Some(hub) if hub.topology == ResolvedTopology::Stitched => hub.view(),

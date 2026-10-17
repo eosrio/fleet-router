@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::abi::AbiEntry;
-use crate::models::{AbiMismatch, BlockQuarantine, ResolvedTopology, Role, Server, ServerState};
+use crate::models::{
+    AbiMismatch, BlockQuarantine, ResolvedTopology, Role, Server, ServerState, UpstreamCounters,
+};
 use crate::ship::{BlockPos, Range};
 
 use super::ObservedTip;
@@ -152,6 +154,10 @@ pub struct UpstreamView {
     pub url: Arc<str>,
     pub role: Role,
     pub enabled: bool,
+    /// Disabled or drained through the control API: never picked for a
+    /// session, and not counted as online for readiness. Its coverage stays,
+    /// like an offline upstream's.
+    pub operator_disabled: bool,
     pub online: bool,
     pub stale: bool,
     /// Ranges are usable: frozen, reported or declared; live, reported.
@@ -165,6 +171,8 @@ pub struct UpstreamView {
     pub lib: Option<BlockPos>,
     /// The upstream's live link count (the same counter sessions update).
     pub connections: Arc<AtomicUsize>,
+    /// The upstream's cumulative counters, shared with its state.
+    pub counters: Arc<UpstreamCounters>,
     pub max_sessions: Option<u32>,
     /// Configured preference tier. Lower is preferred.
     pub priority: u32,
@@ -181,6 +189,11 @@ pub struct UpstreamView {
 }
 
 impl UpstreamView {
+    /// Whether a session may be routed here (online or not).
+    pub fn routable(&self) -> bool {
+        self.enabled && !self.operator_disabled
+    }
+
     pub fn range(&self, log: Log) -> Range {
         match log {
             Log::Trace => self.trace,
@@ -262,6 +275,7 @@ impl PartialEq for UpstreamView {
             && self.url == other.url
             && self.role == other.role
             && self.enabled == other.enabled
+            && self.operator_disabled == other.operator_disabled
             && self.online == other.online
             && self.stale == other.stale
             && self.known == other.known
@@ -271,6 +285,7 @@ impl PartialEq for UpstreamView {
             && self.head == other.head
             && self.lib == other.lib
             && Arc::ptr_eq(&self.connections, &other.connections)
+            && Arc::ptr_eq(&self.counters, &other.counters)
             && self.max_sessions == other.max_sessions
             && self.priority == other.priority
             && self.weight == other.weight
@@ -569,7 +584,7 @@ pub(crate) fn build_view(
                     continue;
                 };
                 segs.push(seg);
-                if u.online {
+                if u.online && !u.operator_disabled {
                     online.push(seg);
                 }
                 if u.role == Role::Live {
@@ -593,10 +608,13 @@ pub(crate) fn build_view(
         .iter()
         .filter(|u| u.enabled && u.role == Role::Frozen && !u.known)
         .count();
-    let online = upstreams.iter().filter(|u| u.enabled && u.online).count();
+    let online = upstreams
+        .iter()
+        .filter(|u| u.routable() && u.online)
+        .count();
     let live_online = upstreams
         .iter()
-        .filter(|u| u.enabled && u.online && u.role == Role::Live)
+        .filter(|u| u.routable() && u.online && u.role == Role::Live)
         .count();
 
     let canonical = match ctx.topology {
@@ -685,6 +703,7 @@ fn upstream_view(ctx: &BuildCtx<'_>, endpoint: &str, s: &ServerState) -> Upstrea
         url,
         role: s.role,
         enabled: s.enabled,
+        operator_disabled: s.operator_disabled,
         online: s.online,
         stale: s.stale,
         known: s.ranges_usable(),
@@ -694,6 +713,7 @@ fn upstream_view(ctx: &BuildCtx<'_>, endpoint: &str, s: &ServerState) -> Upstrea
         head: s.head,
         lib: s.lib,
         connections: s.connections.clone(),
+        counters: s.counters.clone(),
         max_sessions: s.max_sessions,
         priority: s.priority,
         weight: s.weight.max(1),
@@ -1047,6 +1067,7 @@ pub(crate) mod fixtures {
             c.priority = self.priority;
             c.weight = self.weight;
             c.enabled = self.enabled;
+            c.operator_disabled = self.operator_disabled;
             c.online = self.online;
             c.stale = self.stale;
             c.ranges_known = self.ranges_known;
@@ -1064,6 +1085,7 @@ pub(crate) mod fixtures {
             c.quarantines = self.quarantines.clone();
             c.abi = self.abi.clone();
             c.connections = self.connections.clone();
+            c.counters = self.counters.clone();
             c
         }
     }

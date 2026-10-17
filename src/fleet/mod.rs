@@ -87,6 +87,10 @@ metric_label! {
         Violation => "violation",
         Uncovered => "uncovered",
         Send => "send",
+        /// No frame at all, not even a reply to a liveness ping.
+        Silent => "silent",
+        /// Moved by an operator through the control API.
+        Operator => "operator",
     }
 }
 

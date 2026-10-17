@@ -186,7 +186,7 @@ fn eligible_with(
     now: Instant,
     check_quarantine: bool,
 ) -> bool {
-    if !u.enabled || !u.known || !u.abi_ok {
+    if !u.routable() || !u.known || !u.abi_ok {
         return false;
     }
     if check_quarantine && u.quarantined_at(n, now) {
@@ -197,7 +197,7 @@ fn eligible_with(
         Union::Online => v
             .upstreams
             .iter()
-            .any(|w| w.enabled && w.online && w.covers(log, n)),
+            .any(|w| w.routable() && w.online && w.covers(log, n)),
     };
     if need.traces && has(Log::Trace) && !u.covers(Log::Trace, n) {
         return false;
@@ -231,6 +231,24 @@ fn preference(a: &UpstreamView, a_conns: usize, b: &UpstreamView, b_conns: usize
         .cmp(&b.priority)
         .then_with(|| load(a_conns, b_weight).cmp(&load(b_conns, a_weight)))
         .then_with(|| b_weight.cmp(&a_weight))
+}
+
+/// Whether `u` can take over a session whose next block is `next_block`, for
+/// an operator move or drain: routable, online and usable, and its trace
+/// range starts at or before the block. A live range that ends earlier still
+/// qualifies (a session at the tip waits for the node to advance, as on any
+/// failover); a frozen one must contain the block. A node whose range starts
+/// after the block (a pruned node, for a reader catching up on old history)
+/// does not. `None` (no block requested yet) accepts any such upstream.
+pub fn can_take_over(u: &UpstreamView, next_block: Option<u32>) -> bool {
+    u.routable()
+        && u.online
+        && u.known
+        && u.abi_ok
+        && next_block.is_none_or(|block| match u.role {
+            Role::Live => u.covers(Log::Trace, block),
+            Role::Frozen => u.covers_ids(block),
+        })
 }
 
 /// A live upstream more than `lag` blocks behind the fleet head, asked for a
@@ -399,7 +417,7 @@ pub fn next_step(
             if below {
                 // Below fleet begin only the owner of fleet begin serves; it
                 // answers with id-less results until its own begin.
-                u.enabled && u.known && u.abi_ok && u.ids_begin() == ids_begin
+                u.routable() && u.known && u.abi_ok && u.ids_begin() == ids_begin
             } else {
                 eligible(v, u, sh.need, from, Union::Sticky, now)
             }
@@ -408,6 +426,14 @@ pub fn next_step(
     if cands.is_empty() {
         let why = if v.upstreams.iter().any(|u| ex.hard_active(&u.endpoint, now)) {
             HoldWhy::Busy
+        } else if v
+            .upstreams
+            .iter()
+            .any(|u| u.enabled && u.operator_disabled && u.covers_ids(from))
+        {
+            // An operator took the covering upstream out of service: as if
+            // it were offline.
+            HoldWhy::Offline
         } else {
             HoldWhy::Quarantined
         };
@@ -533,7 +559,7 @@ pub fn pool_pick(
 ) -> Option<usize> {
     let cands = || {
         v.upstreams.iter().filter(move |u| {
-            u.enabled
+            u.routable()
                 && (u.online || failover)
                 && !ex.hard_active(&u.endpoint, now)
                 && !u.at_capacity()
@@ -2087,5 +2113,89 @@ mod tests {
         let none = Excludes::default();
         assert_eq!(served_by(&plan_with(&v, 10, &pol, &none, &[0])).0, 0);
         assert_eq!(served_by(&plan_with(&v, 10, &pol, &none, &[1])).0, 1);
+    }
+
+    // The control API: operator-disabled upstreams and operator moves.
+
+    #[test]
+    fn pool_operator_disabled_upstream_is_skipped_by_new_sessions_and_failover() {
+        let mut drained = tiered(0, 0, 0, 1);
+        drained.operator_disabled = true;
+        let v = pool_view(vec![drained, tiered(1, 5, 9, 1)]);
+        assert_eq!(pick(&v, at(100), None, false), Some(1));
+        assert_eq!(pick(&v, at(100), None, true), Some(1));
+
+        let mut drained = tiered(0, 0, 0, 1);
+        drained.operator_disabled = true;
+        let v = pool_view(vec![drained]);
+        assert_eq!(pick(&v, at(100), None, false), None);
+        assert_eq!(pick(&v, at(100), None, true), None);
+        assert!(!eligible(
+            &v,
+            v.up(0).unwrap(),
+            Need::default(),
+            100,
+            Union::Online,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn pool_move_needs_another_upstream_whose_range_starts_by_the_next_block() {
+        // The archive holds old history; the pruned node starts at 400.
+        let fleet =
+            |pruned: ServerState| pool_view(vec![pool_server(0, 0, (1, 500), (0, 0)), pruned]);
+        let alternative = |v: &FleetView, block: Option<u32>| {
+            v.upstreams
+                .iter()
+                .any(|u| u.index != 0 && can_take_over(u, block))
+        };
+        let v = fleet(pool_server(1, 0, (400, 500), (0, 0)));
+        // A reader catching up at block 100 has nowhere to go.
+        assert!(!alternative(&v, Some(100)));
+        // A session near the tip, even past the pruned node's end, can move.
+        assert!(alternative(&v, Some(450)));
+        assert!(alternative(&v, Some(500)));
+        // Before any block is requested, any online upstream will do.
+        assert!(alternative(&v, None));
+
+        let mut down = pool_server(1, 0, (400, 500), (0, 0));
+        down.online = false;
+        assert!(!alternative(&fleet(down), Some(450)));
+        let mut drained = pool_server(1, 0, (400, 500), (0, 0));
+        drained.operator_disabled = true;
+        assert!(!alternative(&fleet(drained), None));
+
+        // A frozen upstream must hold the block itself.
+        let v = view(vec![frozen(0, 2, 1001), frozen(1, 1001, 2001)]);
+        assert!(can_take_over(&v.upstreams[1], Some(1500)));
+        assert!(!can_take_over(&v.upstreams[1], Some(500)));
+        assert!(!can_take_over(&v.upstreams[1], Some(2001)));
+    }
+
+    #[test]
+    fn stitched_sessions_leave_an_operator_disabled_upstream() {
+        let pol = StitchingPolicy::default();
+        let none = Excludes::default();
+        // A disabled replica: its twin serves.
+        let mut drained = frozen(0, 2, 1001);
+        drained.operator_disabled = true;
+        let v = view(vec![drained, frozen(1, 2, 1001)]);
+        assert_eq!(served_by(&plan_with(&v, 10, &pol, &none, &[])).0, 1);
+        // The only archive of a range: the session holds as if it were
+        // offline (bounded), and its coverage stays.
+        let mut drained = frozen(0, 2, 1001);
+        drained.operator_disabled = true;
+        let v = view(vec![drained, frozen(1, 1001, 2001)]);
+        assert!(v.ids.has(500));
+        assert_eq!(
+            plan_with(&v, 500, &pol, &none, &[]),
+            Step::Hold {
+                block: 500,
+                why: HoldWhy::Offline,
+                bounded: true
+            }
+        );
+        assert_eq!(v.online, 1, "a disabled upstream is not counted online");
     }
 }

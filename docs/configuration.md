@@ -11,6 +11,7 @@ All `*_ms` fields are in **milliseconds**.
 
 - [Minimal example](#minimal-example)
 - [Top-level fields](#top-level-fields)
+  - [Dashboard](#dashboard)
 - [Upstream servers](#upstream-servers)
   - [Upstream preference](#upstream-preference)
 - [Upstream TLS (`wss://`)](#upstream-tls-wss)
@@ -78,6 +79,7 @@ A status that omits `chain_id` stays online unless `require_chain_id` is set. On
 - **`max_connections`** *(usize, optional, default `10000`)* — Max concurrent client connections; excess are rejected (backpressure), not queued. Acts as the default per-listener cap when `listeners` is used.
 - **`handshake_timeout_ms`** *(u64, optional, default `10000`)* — Client WebSocket handshake timeout; `0` disables it. The upstream monitor and `config test` use this same bound for connect and the first read, falling back to 10s when it is `0`.
 - **`idle_timeout_ms`** *(u64, optional, default `0` / disabled)* — Close a connection idle (no data in either direction) for this long. Set it to reap dead clients.
+- **`upstream_liveness_timeout_ms`** *(u64, optional, default `4000`, `0` disables)* — Detects an upstream that stops answering without closing the connection (cable pulled, VM frozen, firewall dropping packets, hung nodeos). After half this time with nothing from the upstream, the session sends it a WebSocket ping. If nothing at all arrives within the full time, the upstream is marked offline and the session fails over, resuming at the next block on the same client connection. When the monitor marks the upstream offline first, sessions on it ping right away and fail over after 1 second without a reply. An upstream that is quiet but answers pings (for example, waiting for a client to acknowledge blocks) is left alone. Raise it only if single blocks take seconds to transfer from your upstreams.
 - **`max_message_bytes`** *(usize, optional, default `268435456` / 256 MiB)* — Max WebSocket message size on proxied upstreams and monitor connections. Lower it only if you are sure upstream blocks fit.
 - **`max_client_message_bytes`** *(usize, optional, default `65536` / 64 KiB)* — Max WebSocket message and frame size accepted from a client. Omitting the field keeps existing configs valid and applies this default. See [Client message limits](#client-message-limits).
 - **`shutdown_grace_ms`** *(u64, optional, default `5000`)* — How long to wait for in-flight connections to drain on shutdown.
@@ -86,6 +88,27 @@ A status that omits `chain_id` stays online unless `require_chain_id` is set. On
 
 - **`metrics_address`** *(string, optional, defaults to `listen_address`)* — Bind address for the health/metrics HTTP endpoint.
 - **`metrics_port`** *(u16, optional, disabled when unset)* — Port for the health/metrics HTTP endpoint. Setting it enables the endpoint. See [Observability](observability.md).
+
+### Dashboard
+
+- **`dashboard`** *(object, optional, off when omitted)* — Live dashboard, status page, JSON API and control API on the `metrics_port` endpoint. See [Dashboard and control API](api.md).
+  - **`enabled`** *(bool, default `false`)* — Serve `/ui/`, `/status` and `/api/v1`. Requires `metrics_port`. While `false`, the endpoint serves only health, readiness and metrics, as before.
+  - **`control_token_file`** *(string, optional)* — Path to a file holding the control API bearer token. Surrounding whitespace is ignored.
+  - **`control_token`** *(string, optional)* — The token inline. Prefer the file or the environment variable. Set at most one of `control_token` and `control_token_file`.
+  - **`allowed_hosts`** *(array of strings, optional)* — Host names the dashboard answers to. Requests addressed by IP (`http://10.0.0.5:9090`) or `localhost` always work. Add a name here when you reach the dashboard by name, for example through a reverse proxy that keeps the original `Host` header. Requests for any other name get `403`; this blocks DNS-rebinding pages from reading the API from an operator's browser. Health, readiness and `/metrics` are not affected.
+
+The control API (drain, enable/disable, live priority and weight, clear quarantine, move or close a session) is on only when a token is configured. The `FLEET_ROUTER_CONTROL_TOKEN` environment variable overrides both fields. A token must be at least 16 characters; generate one with `openssl rand -hex 32`. Without a token the dashboard is read-only.
+
+```json
+"metrics_address": "127.0.0.1",
+"metrics_port": 9090,
+"dashboard": {
+  "enabled": true,
+  "control_token_file": "/etc/fleet-router/control.token"
+}
+```
+
+Read endpoints and the dashboard need no token, and they show client IP addresses and upstream addresses. Keep `metrics_address` on a private interface or behind a reverse proxy with access control. The router logs a warning when the control API is enabled on a non-loopback address. Changes made through the control API are not written back to this file.
 
 ## Upstream servers
 

@@ -29,6 +29,13 @@
 //!   in a byte-capped buffer while no link is up); malformed known requests
 //!   close the client with 1007.
 //!
+//! In both topologies an upstream that goes silent (a pulled cable, a frozen
+//! VM) is pinged after half of `upstream_liveness_timeout_ms` without a frame,
+//! and failed over when nothing at all arrives within the full time, or
+//! within 1 s once the monitor lost it. Every session is listed in the
+//! dashboard registry, where an operator can move it off its upstream (a
+//! failover that resumes at the client's cursor) or close it.
+//!
 //! In stitched topology (frozen range servers plus live nodes), the session
 //! presents the fleet as one SHiP node:
 //! - the client gets the listener's canonical ABI without a dial, and status
@@ -73,19 +80,21 @@ use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 
 use crate::abi::abi_fingerprint;
 use crate::fleet::planner::{
-    eligible, next_step, pool_pick, tip_region, Excludes, Need, ServeStep, Shape, Step, Union,
+    can_take_over, eligible, next_step, pool_pick, tip_region, Excludes, Need, ServeStep, Shape,
+    Step, Union,
 };
 use crate::fleet::view::UpstreamView;
 use crate::fleet::{
-    FleetHub, FleetView, HoldWhy, LinkPurpose, Log, MetricLabel, PredialResult, ProtocolError,
-    SessionGauge,
+    FailoverReason, FleetHub, FleetView, HoldWhy, LinkPurpose, Log, MetricLabel, PredialResult,
+    ProtocolError, SessionGauge,
 };
 use crate::models::{
     AbiMismatch, BlockFailureQuarantine, ProxyLimits, ResolvedListener, ResolvedTopology, Role,
-    StitchingPolicy,
+    StitchingPolicy, UpstreamCounters,
 };
 use crate::ship::wire::{self, BlocksRequest, ClientMsg, DecodeError, ResultHead, UpstreamMsg};
 use crate::ship::BlockPos;
+use crate::telemetry::{self, Event, EventKind, Level, SessionRegistration};
 
 use client::{
     commit, head_lib_for, judge, request_is_empty, ClientSide, Forward, Judgement,
@@ -99,7 +108,7 @@ use failover::{
 pub use link::ConnectionGuard;
 use link::{
     build_request, mark_offline, owed, quiescent, settled, DialError, DialTarget, DialTask,
-    Established, Link, Purpose, Target, UpCursor, MAX_DIAL_ATTEMPTS,
+    Established, Link, Purpose, Target, UpCursor, LIVENESS_PING, MAX_DIAL_ATTEMPTS,
 };
 use status::{router_status, status_ready, StatusFlow, StatusStep};
 
@@ -108,6 +117,10 @@ type ClientWs = WebSocketStream<TcpStream>;
 /// A link whose upstream the monitor marked offline is failed over after
 /// this much silence while it owes blocks.
 const MONITOR_OFFLINE_SILENCE: Duration = Duration::from_secs(5);
+
+/// When the monitor marks the current upstream offline, the session pings it
+/// at once and fails over if nothing arrives within this time.
+const OFFLINE_PROBE: Duration = Duration::from_secs(1);
 
 /// How long a status request waits for the fleet tip (or a link to relay it)
 /// when `handshake_timeout_ms` is 0.
@@ -137,6 +150,9 @@ const WAIT_RECHECK: Duration = Duration::from_secs(5);
 pub struct ListenerCtx {
     /// `None` in single-listener mode.
     pub name: Option<Arc<str>>,
+    /// The listener's name in the session registry and events: its name, or
+    /// `default` in single-listener mode.
+    pub label: Arc<str>,
     pub topology: ResolvedTopology,
     pub stitching: StitchingPolicy,
     pub limits: ProxyLimits,
@@ -160,6 +176,7 @@ impl ListenerCtx {
     ) -> Arc<Self> {
         Arc::new(ListenerCtx {
             name: listener.name.as_deref().map(Arc::from),
+            label: Arc::from(listener.name.as_deref().unwrap_or("default")),
             topology: listener.topology,
             stitching: listener.stitching.clone(),
             limits,
@@ -264,7 +281,7 @@ struct Counts {
 
 pub async fn handle_client(
     client_stream: TcpStream,
-    _client_address: SocketAddr,
+    client_address: SocketAddr,
     ctx: Arc<ListenerCtx>,
     shutdown: broadcast::Receiver<()>,
 ) {
@@ -275,7 +292,7 @@ pub async fn handle_client(
 
     let (client_tx, client_rx) = client_websocket.split();
     let stitched = ctx.stitched();
-    let mut session = Session::new(ctx, client_tx, client_rx, shutdown);
+    let mut session = Session::new(ctx, client_tx, client_rx, shutdown, client_address);
     let started = if stitched {
         session.send_canonical_abi().await
     } else {
@@ -417,6 +434,12 @@ struct Session {
     last_jump_warn: Option<Instant>,
     counts: Counts,
     end_reason: &'static str,
+    /// This session in the dashboard registry, which an operator moves or
+    /// closes it through. Removed when the session ends.
+    registry: SessionRegistration,
+    /// The upstream the last failover or operator move left, and why. The
+    /// move is reported once the next link is up.
+    moved_from: Option<(Arc<str>, FailoverReason)>,
 }
 
 impl Session {
@@ -425,11 +448,13 @@ impl Session {
         client_tx: SplitSink<ClientWs, Message>,
         client_rx: SplitStream<ClientWs>,
         shutdown: broadcast::Receiver<()>,
+        client: SocketAddr,
     ) -> Self {
         let id = ctx.next_session_id.fetch_add(1, Ordering::Relaxed);
         let view_rx = ctx.hub.subscribe();
         let view = view_rx.borrow().clone();
         let now = Instant::now();
+        let registry = telemetry::global().register_session(ctx.label.clone(), client, "");
         Session {
             ctx,
             id,
@@ -461,6 +486,8 @@ impl Session {
             last_jump_warn: None,
             counts: Counts::default(),
             end_reason: "client closed",
+            registry,
+            moved_from: None,
         }
     }
 
@@ -486,6 +513,11 @@ impl Session {
     fn stall_timeout(&self) -> Option<Duration> {
         (self.ctx.limits.stall_timeout_ms > 0)
             .then(|| Duration::from_millis(self.ctx.limits.stall_timeout_ms))
+    }
+
+    fn liveness_timeout(&self) -> Option<Duration> {
+        (self.ctx.limits.upstream_liveness_timeout_ms > 0)
+            .then(|| Duration::from_millis(self.ctx.limits.upstream_liveness_timeout_ms))
     }
 
     /// How long a status request may wait for the fleet tip or a link.
@@ -629,6 +661,14 @@ impl Session {
                 || matches!(self.phase, Phase::Waiting { .. } | Phase::Holding { .. })
                 || self.standby.is_some()
                 || self.standby_dial.is_some();
+            // Operator requests for this session.
+            let info = self.registry.info.clone();
+            // The monitor losing the link's upstream starts a probe.
+            let probe_on: Option<Arc<UpstreamCounters>> = self
+                .link
+                .as_ref()
+                .filter(|l| self.liveness_timeout().is_some() && l.st.probe_until.is_none())
+                .map(|l| l.counters.clone());
             // Biased: shutdown first, then the client, so its acks, status
             // requests and new requests are applied before more upstream
             // results are forwarded.
@@ -636,6 +676,7 @@ impl Session {
                 biased;
                 _ = self.shutdown.recv() => self.on_shutdown().await,
                 next = self.client_rx.next() => self.on_client(next).await,
+                () = info.control.notified() => self.on_control().await,
                 outcome = dial_outcome(&mut self.dial), if self.dial.is_some() => {
                     self.on_dial(outcome).await
                 }
@@ -644,6 +685,12 @@ impl Session {
                 }
                 next = next_frame(&mut self.link), if self.link.is_some() => {
                     self.on_upstream(next).await
+                }
+                // Before the view: the monitor publishes the view that shows
+                // the upstream offline right after this notification.
+                () = went_offline(probe_on.as_deref()), if probe_on.is_some() => {
+                    self.on_upstream_offline().await;
+                    Flow::Continue
                 }
                 changed = self.view_rx.changed(), if waits_on_view => {
                     if changed.is_ok() {
@@ -697,6 +744,7 @@ impl Session {
     }
 
     async fn on_view_change(&mut self) -> Flow {
+        self.probe_if_lost().await;
         if let Flow::Stop = self.drive_status().await {
             return Flow::Stop;
         }
@@ -725,6 +773,60 @@ impl Session {
             .await;
         self.end_reason = "shutdown";
         Flow::Stop
+    }
+
+    /// An operator asked, through the control API, to close this session or
+    /// to move it off its upstream.
+    async fn on_control(&mut self) -> Flow {
+        if self.registry.info.close_requested() {
+            tracing::info!("session closed by operator");
+            self.close_client(CloseCode::Normal, "closed by operator")
+                .await;
+            self.end_reason = "closed by operator";
+            return Flow::Stop;
+        }
+        if self.registry.info.take_move_request() {
+            return self.on_operator_move().await;
+        }
+        Flow::Continue
+    }
+
+    /// Move the session off its link's upstream, with the normal failover:
+    /// the client keeps its connection and resumes at its cursor. Skipped
+    /// when no other upstream can serve the next block.
+    async fn on_operator_move(&mut self) -> Flow {
+        let Some(endpoint) = self.link.as_ref().map(|l| l.endpoint.clone()) else {
+            tracing::info!("operator move skipped: the session has no upstream link");
+            return Flow::Continue;
+        };
+        self.sync_view();
+        let next_block = self.c.req.is_some().then_some(self.c.cursor);
+        let other = self
+            .view
+            .upstreams
+            .iter()
+            .any(|u| u.endpoint != endpoint && can_take_over(u, next_block));
+        if !other {
+            tracing::info!(
+                upstream = %endpoint,
+                ?next_block,
+                "operator move skipped: no other upstream can serve the next block"
+            );
+            return Flow::Continue;
+        }
+        tracing::info!(upstream = %endpoint, "moving session at operator request");
+        self.on_link_end(UpEnd::Moved).await
+    }
+
+    /// Record a session that ends with an error in the dashboard event log.
+    fn report_failure(&self, upstream: Option<&str>, reason: &str) {
+        let mut event = Event::new(Level::Error, EventKind::SessionFailed, reason)
+            .listener(&self.ctx.label)
+            .session(self.registry.info.id);
+        if let Some(upstream) = upstream {
+            event = event.upstream(upstream);
+        }
+        telemetry::global().emit(event);
     }
 
     // ------------------------------------------------------------------
@@ -862,6 +964,9 @@ impl Session {
             irreversible_only = r.irreversible_only,
             "client get_blocks"
         );
+        self.registry
+            .info
+            .note_request(r.start, r.v1 && r.fetch_finality_data);
         let pre = self.c.new_request(r.clone());
         self.stuck_at = None;
         if let Some(link) = self.link.as_mut() {
@@ -1092,11 +1197,13 @@ impl Session {
             Some((head, lib)) => self.apply_head_lib(frame, head, lib, Role::Live, up),
             None => frame,
         };
+        let len = out.len();
         if let Err(e) = self.client_tx.send(Message::Binary(out)).await {
             tracing::warn!(error = %e, "error sending status to client");
             self.end_reason = "client write failed";
             return Flow::Stop;
         }
+        self.note_forwarded(len, None);
         self.ctx.hub.stats.status_reply(v1, false);
         Flow::Continue
     }
@@ -1131,6 +1238,12 @@ impl Session {
                 return self.on_link_end(end).await;
             }
         };
+        // Any frame shows the upstream is alive; a reply to the router's own
+        // liveness ping is not data for the silence limits.
+        let liveness_pong =
+            matches!(&msg, Message::Pong(payload) if payload.as_ref() == LIVENESS_PING);
+        let read_ms = link.read_ms();
+        link.st.note_frame(read_ms, liveness_pong);
         match msg {
             Message::Binary(frame) => self.on_upstream_binary(frame).await,
             // Never forwarded: the stream end that follows is a clean
@@ -1166,11 +1279,13 @@ impl Session {
             }
             UpstreamMsg::Other if self.ctx.topology == ResolvedTopology::Pool => {
                 // Unknown to this router: passed through, as before.
+                let len = frame.len();
                 if let Err(e) = self.client_tx.send(Message::Binary(frame)).await {
                     tracing::warn!(error = %e, "error sending message to client");
                     self.end_reason = "client write failed";
                     return Flow::Stop;
                 }
+                self.note_forwarded(len, None);
                 Flow::Continue
             }
             UpstreamMsg::Other => {
@@ -1249,7 +1364,7 @@ impl Session {
         let need = Need::of(creq);
         self.view.upstreams.iter().any(|u| {
             &*u.endpoint != endpoint
-                && u.enabled
+                && u.routable()
                 && u.online
                 && !self.ex.hard_active(&u.endpoint, now)
                 && !u.at_capacity()
@@ -1321,11 +1436,13 @@ impl Session {
             tracing::debug!(upstream = %endpoint, block, "result forwarded with no client credit");
         }
         let out = self.apply_head_lib(frame, h.head, h.lib, role, up);
+        let len = out.len();
         if let Err(e) = self.client_tx.send(Message::Binary(out)).await {
             tracing::warn!(error = %e, "error sending message to client");
             self.end_reason = "client write failed";
             return Flow::Stop;
         }
+        self.note_forwarded(len, block);
         let Some(link) = self.link.as_mut() else {
             return Flow::Continue;
         };
@@ -1355,6 +1472,21 @@ impl Session {
             self.set_phase(Phase::Idle);
         }
         Flow::Continue
+    }
+
+    /// Count one frame forwarded from the link's upstream to the client:
+    /// `bytes`, and a block when it carries `block`.
+    fn note_forwarded(&self, bytes: usize, block: Option<u32>) {
+        if let Some(link) = self.link.as_ref() {
+            let counters = &link.counters;
+            counters
+                .bytes_total
+                .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+            if block.is_some() {
+                counters.blocks_total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.registry.info.note_frame(bytes, block);
     }
 
     fn log_jump(&mut self, endpoint: &str, expected: u32, got: Option<u32>) {
@@ -1498,6 +1630,7 @@ impl Session {
         let up = link.st.up;
         let endpoint = link.endpoint.clone();
         let name = link.name.clone();
+        let counters = link.counters.clone();
         let facts = EndFacts {
             role: link.st.role,
             unknown_forwarded_at: link.st.unknown_forwarded_at,
@@ -1516,9 +1649,15 @@ impl Session {
                 | UpEnd::Stall
                 | UpEnd::MonitorOffline
                 | UpEnd::SendFailed
+                | UpEnd::Silent
+                | UpEnd::Moved
         );
         if self.ctx.stitched() && finished && quiet {
             tracing::debug!(upstream = %endpoint, ?end, "idle upstream link ended");
+            if end == UpEnd::Moved {
+                // The next plan prefers another upstream.
+                self.ex.soft = Some(endpoint.clone());
+            }
             self.retire_link(false);
             if matches!(self.phase, Phase::Streaming) {
                 self.set_phase(Phase::Idle);
@@ -1592,6 +1731,7 @@ impl Session {
                         attempts = plan.failures,
                         "block {k} unavailable on all upstreams"
                     );
+                    self.report_failure(Some(&endpoint), &close_reason);
                     self.close_client(CloseCode::Error, &close_reason).await;
                     self.end_reason = "block unavailable";
                     return Flow::Stop;
@@ -1607,6 +1747,9 @@ impl Session {
                 }
                 stats.failovers.inc(reason);
                 self.counts.failovers += 1;
+                counters.failovers_total.fetch_add(1, Ordering::Relaxed);
+                self.registry.info.note_failover();
+                self.moved_from = Some((endpoint.clone(), reason));
                 if plan.failures > 0 {
                     tracing::warn!(
                         upstream = %endpoint,
@@ -1712,6 +1855,42 @@ impl Session {
         self.retired = None;
         self.dial_attempts = 0;
         self.link = Some(Link::new(target, est, Instant::now()));
+        self.note_link_up();
+    }
+
+    /// A new link (dialed, or a standby taken over) carries the session:
+    /// count it for its upstream, show it in the registry, and report the
+    /// failover or operator move that led here.
+    fn note_link_up(&mut self) {
+        let Some((endpoint, counters)) = self
+            .link
+            .as_ref()
+            .map(|l| (l.endpoint.clone(), l.counters.clone()))
+        else {
+            return;
+        };
+        counters.sessions_total.fetch_add(1, Ordering::Relaxed);
+        self.registry.info.set_upstream(&endpoint);
+        if let Some(link) = self.link.as_mut() {
+            link.st.upstream_online = self.view.up(link.st.up).is_some_and(|u| u.online);
+        }
+        if let Some((from, reason)) = self.moved_from.take() {
+            let level = if reason == FailoverReason::Operator {
+                Level::Info
+            } else {
+                Level::Warn
+            };
+            telemetry::global().emit(
+                Event::new(
+                    level,
+                    EventKind::SessionFailover,
+                    format!("moved from {from} to {endpoint} ({})", reason.as_str()),
+                )
+                .listener(&self.ctx.label)
+                .upstream(&endpoint)
+                .session(self.registry.info.id),
+            );
+        }
     }
 
     /// A failed dial: count it, avoid the upstream for this session for a
@@ -1836,6 +2015,8 @@ impl Session {
             "unable to establish an upstream connection"
         );
         tracing::error!("no upstream available after failover; closing client");
+        let from = self.moved_from.as_ref().map(|(from, _)| from.clone());
+        self.report_failure(from.as_deref(), "no upstream available after failover");
         self.close_client(CloseCode::Error, "no upstream available")
             .await;
         self.end_reason = "no upstream";
@@ -1996,8 +2177,9 @@ impl Session {
                     block,
                     "no upstream covers the block (a hole in the fleet's coverage); closing client"
                 );
-                self.close_client(CloseCode::Error, &block_unavailable_reason(block))
-                    .await;
+                let reason = block_unavailable_reason(block);
+                self.report_failure(None, &reason);
+                self.close_client(CloseCode::Error, &reason).await;
                 self.end_reason = "coverage gap";
                 Flow::Stop
             }
@@ -2087,6 +2269,7 @@ impl Session {
             self.retired = None;
             self.dial_attempts = 0;
             self.link = Some(standby.link);
+            self.note_link_up();
             self.ctx.hub.stats.predials.inc(PredialResult::Used);
             return self.send_request(st.req_end, purpose).await;
         }
@@ -2289,7 +2472,7 @@ impl Session {
         let usable = self
             .view
             .up(up)
-            .is_some_and(|u| u.enabled && u.online && u.abi_ok);
+            .is_some_and(|u| u.routable() && u.online && u.abi_ok);
         if !usable {
             self.discard_standby();
         }
@@ -2408,6 +2591,7 @@ impl Session {
             why = hold.why.as_str(),
             "hold expired; closing client"
         );
+        self.report_failure(None, &reason);
         self.close_client(CloseCode::Error, &reason).await;
         self.end_reason = "hold expired";
         Flow::Stop
@@ -2437,12 +2621,82 @@ impl Session {
         link.st.was_owed = is_owed;
     }
 
-    /// Start of the link's current silence: its last transport read, or when
+    /// Start of the link's current silence: its last transport read (one
+    /// that carried only a reply to a liveness ping does not count), or when
     /// it last started to owe blocks or made progress.
     fn silence_from(&self, link: &Link) -> Instant {
-        let read_ms = link.activity.load(Ordering::Relaxed);
+        let read_ms = link.st.data_activity_ms(link.read_ms());
         let read = self.epoch + Duration::from_millis(read_ms);
         read.max(link.st.became_owed_at)
+    }
+
+    /// When the link's liveness check acts next: a ping after half the
+    /// timeout without a frame, the failover after the full timeout, or the
+    /// end of a probe started because the monitor lost the upstream.
+    ///
+    /// A ping always gets half the timeout for its reply, so a link the
+    /// session could not read for a while (a standby taken over, or a long
+    /// write to a slow client) is not failed over before the upstream had a
+    /// chance to answer.
+    fn liveness_deadline(&self, link: &Link) -> Option<Instant> {
+        let limit = self.liveness_timeout()?;
+        let last_read = self.epoch + Duration::from_millis(link.read_ms());
+        let at = match link.st.ping_at {
+            None => last_read + limit / 2,
+            Some(ping) => (last_read + limit).max(ping + limit / 2),
+        };
+        Some(link.st.probe_until.map_or(at, |probe| probe.min(at)))
+    }
+
+    /// A view shows the link's upstream gone offline since the last one the
+    /// session saw: probe the link, as when the monitor's notification is
+    /// seen directly.
+    async fn probe_if_lost(&mut self) {
+        let enabled = self.liveness_timeout().is_some();
+        let Some(link) = self.link.as_mut() else {
+            return;
+        };
+        let online = self.view.up(link.st.up).is_some_and(|u| u.online);
+        let lost = link.st.upstream_online && !online;
+        link.st.upstream_online = online;
+        if lost && enabled {
+            self.on_upstream_offline().await;
+        }
+    }
+
+    /// The monitor marked the link's upstream offline: ping it now and fail
+    /// over unless a frame arrives within [`OFFLINE_PROBE`].
+    async fn on_upstream_offline(&mut self) {
+        let Some(link) = self.link.as_mut() else {
+            return;
+        };
+        if link.st.probe_until.is_none() {
+            tracing::debug!(upstream = %link.endpoint, "monitor lost the upstream; probing the link");
+            let now = Instant::now();
+            link.st.probe_until = Some(now + OFFLINE_PROBE);
+            link.st.ping_at = Some(now);
+            link.ping().await;
+        }
+    }
+
+    /// No frame at all from the link's upstream, not even a reply to a ping:
+    /// a live upstream is marked offline (new sessions skip it until the
+    /// monitor sees it answer again) and the session fails over.
+    async fn on_silent(&mut self) -> Flow {
+        let Some((endpoint, role)) = self.link.as_ref().map(|l| (l.endpoint.clone(), l.st.role))
+        else {
+            return Flow::Continue;
+        };
+        tracing::warn!(
+            upstream = %endpoint,
+            timeout_ms = self.ctx.limits.upstream_liveness_timeout_ms,
+            "upstream silent: no frames and no reply to a ping; failing over"
+        );
+        if role == Role::Live {
+            mark_offline(&self.ctx.hub, &endpoint).await;
+            self.sync_view();
+        }
+        self.on_link_end(UpEnd::Silent).await
     }
 
     /// The silence limits that apply to an owed link, shortest first.
@@ -2484,7 +2738,8 @@ impl Session {
         });
         let linger = self.link.as_ref().and_then(|l| l.st.linger_until);
         let standby = self.standby.as_ref().map(|s| s.until);
-        [client, status, phase, hold, link, linger, standby]
+        let liveness = self.link.as_ref().and_then(|l| self.liveness_deadline(l));
+        [client, status, phase, hold, link, linger, standby, liveness]
             .into_iter()
             .flatten()
             .min()
@@ -2537,6 +2792,21 @@ impl Session {
                 }
             }
             return self.on_link_end(end).await;
+        }
+        let liveness_due = self
+            .link
+            .as_ref()
+            .and_then(|l| self.liveness_deadline(l))
+            .is_some_and(|at| now >= at);
+        if liveness_due {
+            if let Some(link) = self.link.as_mut() {
+                if link.st.ping_at.is_none() && link.st.probe_until.is_none() {
+                    link.st.ping_at = Some(now);
+                    link.ping().await;
+                } else {
+                    return self.on_silent().await;
+                }
+            }
         }
         match self.phase {
             Phase::Backoff { until, purpose } if now >= until => {
@@ -2598,6 +2868,14 @@ async fn next_frame(link: &mut Option<Link>) -> Option<Result<Message, WsError>>
     }
 }
 
+/// Completes when the monitor marks the upstream of `counters` offline.
+async fn went_offline(counters: Option<&UpstreamCounters>) {
+    match counters {
+        Some(counters) => counters.went_offline.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn wait_until(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => sleep_until(deadline).await,
@@ -2649,6 +2927,7 @@ mod tests {
         ProxyLimits {
             handshake_timeout_ms: 2_000,
             idle_timeout_ms,
+            upstream_liveness_timeout_ms: 0,
             max_message_bytes: 1 << 20,
             max_client_message_bytes: 64 * 1024,
             stall_timeout_ms: 0,
@@ -2692,6 +2971,10 @@ mod tests {
     /// would report it: online, trace and chain state `[begin, end)`, head =
     /// LIB = `end - 1`, and the mock's ABI. The fleet tip is the top archive's.
     async fn start_stitched(archives: &[(&str, u32, u32)]) -> Harness {
+        start_stitched_with(archives, limits(0)).await
+    }
+
+    async fn start_stitched_with(archives: &[(&str, u32, u32)], limits: ProxyLimits) -> Harness {
         let servers: Vec<Server> = archives
             .iter()
             .enumerate()
@@ -2735,7 +3018,7 @@ mod tests {
             }
             hub.rebuild(&db);
         }
-        serve_one(&resolved, hub, limits(0)).await
+        serve_one(&resolved, hub, limits).await
     }
 
     /// Serve one client of `resolved` with `handle_client` behind a local
@@ -3335,5 +3618,254 @@ mod tests {
             vec![1200, 1201, 1202]
         );
         assert_eq!(mock.sessions_accepted(), 2, "the next range dials again");
+    }
+
+    /// An upstream that completes the handshake and sends the ABI, then
+    /// neither reads nor writes, like a frozen VM: no pong ever comes.
+    async fn dead_upstream() -> (String, JoinHandle<()>) {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = tcp.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = tcp.accept().await {
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                ws.send(Message::text(mock_ship::SHIP_ABI_JSON))
+                    .await
+                    .unwrap();
+                held.push(ws);
+            }
+        });
+        (endpoint, task)
+    }
+
+    fn liveness(ms: u64) -> ProxyLimits {
+        ProxyLimits {
+            upstream_liveness_timeout_ms: ms,
+            ..limits(0)
+        }
+    }
+
+    /// A silent upstream gets a ping after half the liveness timeout and is
+    /// failed over after the full timeout: marked offline, without a strike,
+    /// and the client resumes at its next block.
+    #[tokio::test]
+    async fn a_silent_upstream_is_pinged_then_failed_over_and_marked_offline() {
+        let (dead, dead_task) = dead_upstream().await;
+        let (healthy, _healthy_mock) = start_mock(MockShipConfig {
+            blocks_to_stream: 0,
+            ..Default::default()
+        })
+        .await;
+        let harness = start_session_with(&[&dead, &healthy], &[&dead], liveness(400)).await;
+        let started = Instant::now();
+        let mut client = connect(&harness.url).await;
+        set_online(&harness.hub, &healthy).await;
+
+        client.send(blocks_request(100, 103, 10)).await.unwrap();
+        assert_eq!(read_block_nums(&mut client, 3).await, vec![100, 101, 102]);
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(350),
+            "failed over after {waited:?}"
+        );
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Silent), 1);
+        let state = harness.hub.state.lock().await;
+        assert!(
+            !state[&dead].online,
+            "the silent upstream is marked offline"
+        );
+        assert_eq!(state[&dead].block_failures, 0, "no strike");
+        drop(state);
+        dead_task.abort();
+    }
+
+    /// When the monitor loses the link's upstream, the session pings it at
+    /// once and fails over after 1 s without a reply, well before its own
+    /// liveness timeout or the 5 s offline silence.
+    #[tokio::test]
+    async fn the_monitor_losing_the_upstream_probes_the_link_for_one_second() {
+        let (dead, dead_task) = dead_upstream().await;
+        let (healthy, _healthy_mock) = start_mock(MockShipConfig {
+            blocks_to_stream: 0,
+            ..Default::default()
+        })
+        .await;
+        let harness = start_session_with(&[&dead, &healthy], &[&dead], liveness(20_000)).await;
+        let mut client = connect(&harness.url).await;
+        set_online(&harness.hub, &healthy).await;
+        client.send(blocks_request(100, 103, 10)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let lost = Instant::now();
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&dead)
+                .unwrap()
+                .mark_offline(std::time::Instant::now());
+            harness.hub.rebuild(&db);
+        }
+        assert_eq!(read_block_nums(&mut client, 3).await, vec![100, 101, 102]);
+        let waited = lost.elapsed();
+        assert!(
+            waited >= Duration::from_millis(900) && waited < Duration::from_secs(4),
+            "failed over after {waited:?}"
+        );
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Silent), 1);
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Offline), 0);
+        dead_task.abort();
+    }
+
+    /// An upstream that answers every liveness ping but sends no data while
+    /// blocks are owed still reaches the idle timeout: replies to the
+    /// router's own pings are not upstream activity.
+    #[tokio::test]
+    async fn idle_time_counts_from_the_last_data_frame_not_from_liveness_pongs() {
+        let (holding, _holding_mock) = start_mock(MockShipConfig {
+            blocks_to_stream: 0,
+            hold_at_block: Some(103),
+            ..Default::default()
+        })
+        .await;
+        let (healthy, _healthy_mock) = start_mock(MockShipConfig {
+            blocks_to_stream: 0,
+            ..Default::default()
+        })
+        .await;
+        let quiet = ProxyLimits {
+            idle_timeout_ms: 800,
+            upstream_liveness_timeout_ms: 200,
+            ..limits(0)
+        };
+        let harness = start_session_with(&[&holding, &healthy], &[&holding], quiet).await;
+        let mut client = connect(&harness.url).await;
+        set_online(&harness.hub, &healthy).await;
+        client.send(blocks_request(100, 106, 100)).await.unwrap();
+        assert_eq!(read_block_nums(&mut client, 3).await, vec![100, 101, 102]);
+
+        // The client pings to stay clear of its own idle timeout.
+        let (mut tx, mut rx) = client.split();
+        let blocks = timeout(Duration::from_secs(5), async {
+            let mut blocks = Vec::new();
+            let mut ping = tokio::time::interval(Duration::from_millis(200));
+            while blocks.len() < 3 {
+                tokio::select! {
+                    msg = rx.next() => match msg {
+                        Some(Ok(Message::Binary(data))) => {
+                            let view = BlockView::parse(&data).expect("a block result");
+                            blocks.extend(view.num());
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("unexpected {other:?}"),
+                    },
+                    _ = ping.tick() => tx.send(Message::Ping(Vec::new().into())).await.unwrap(),
+                }
+            }
+            blocks
+        })
+        .await
+        .expect("the idle link should fail over");
+        assert_eq!(blocks, vec![103, 104, 105]);
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Idle), 1);
+        assert_eq!(
+            harness.hub.stats.failovers.get(FailoverReason::Silent),
+            0,
+            "the holding upstream answers pings"
+        );
+    }
+
+    /// The session's entry in the dashboard registry, by its client address.
+    fn registered(client: &TestClient) -> Arc<telemetry::SessionInfo> {
+        let addr = match client.get_ref() {
+            tokio_tungstenite::MaybeTlsStream::Plain(tcp) => tcp.local_addr().unwrap(),
+            _ => unreachable!("plain test client"),
+        };
+        telemetry::global()
+            .sessions()
+            .into_iter()
+            .find(|s| s.client == addr)
+            .expect("the session is registered")
+    }
+
+    /// Stitched: an operator move leaves the replica the session streams
+    /// from for its twin, resuming at the cursor without a gap, and an
+    /// operator close ends the session with 1000.
+    #[tokio::test]
+    async fn an_operator_move_resumes_on_another_replica_and_close_ends_the_session() {
+        let replica = || MockShipConfig {
+            block_delay: Some(Duration::from_millis(5)),
+            ..MockShipConfig::frozen(1, 2001)
+        };
+        let (a, mock_a) = start_mock(replica()).await;
+        let (b, mock_b) = start_mock(replica()).await;
+        let harness = start_stitched(&[(&a, 1, 2001), (&b, 1, 2001)]).await;
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        assert_eq!(&*info.listener, "default");
+
+        client.send(blocks_request(10, 1000, 1000)).await.unwrap();
+        let mut blocks = read_block_nums(&mut client, 20).await;
+        assert_eq!(info.start_block(), Some(10));
+        let first = info.upstream();
+        assert!(first == a || first == b, "{first}");
+
+        info.request_move();
+        blocks.extend(read_block_nums(&mut client, 50).await);
+        assert_eq!(blocks, (10..80).collect::<Vec<_>>(), "no gap, no duplicate");
+        let second = info.upstream();
+        assert_ne!(second, first, "moved to the other replica");
+        assert_eq!(info.failovers(), 1);
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Operator), 1);
+        let resumed = if second == a { &mock_a } else { &mock_b };
+        let resume = blocks_requests(resumed)[0].1;
+        assert!(
+            (30..80).contains(&resume),
+            "the twin resumed at the cursor, got {resume}"
+        );
+
+        info.request_close();
+        let close = timeout(WAIT, async {
+            loop {
+                match client.next().await {
+                    Some(Ok(Message::Close(frame))) => return frame,
+                    Some(Ok(_)) => {}
+                    other => panic!("no close frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("closed by the operator");
+        let frame = close.expect("a close frame with a code");
+        assert_eq!(frame.code, CloseCode::Normal);
+        assert_eq!(frame.reason.as_str(), "closed by operator");
+        timeout(WAIT, harness.session).await.unwrap().unwrap();
+        assert!(
+            telemetry::global().session(info.id).is_none(),
+            "a finished session leaves the registry"
+        );
+    }
+
+    /// Stitched: the next leg's pre-dialed link sat unread for longer than
+    /// the liveness timeout. Taking it over pings it and leaves the reply
+    /// time to arrive instead of failing the link over as silent.
+    #[tokio::test]
+    async fn a_standby_link_taken_over_after_the_liveness_timeout_is_kept() {
+        let leg = |begin, end| MockShipConfig {
+            block_delay: Some(Duration::from_millis(5)),
+            ..MockShipConfig::frozen(begin, end)
+        };
+        let (a, _mock_a) = start_mock(leg(1, 1001)).await;
+        let (b, mock_b) = start_mock(leg(1001, 2001)).await;
+        let harness = start_stitched_with(&[(&a, 1, 1001), (&b, 1001, 2001)], liveness(400)).await;
+        let mut client = connect(&harness.url).await;
+        // A's 200 blocks take about a second at 5 ms each, while B's
+        // standby link waits unread.
+        client.send(blocks_request(800, 1100, 1000)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 300).await,
+            (800..1100).collect::<Vec<_>>()
+        );
+        assert_eq!(harness.hub.stats.predials.get(PredialResult::Used), 1);
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Silent), 0);
+        assert_eq!(mock_b.sessions_accepted(), 1, "the standby link is kept");
     }
 }

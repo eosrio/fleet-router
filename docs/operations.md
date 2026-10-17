@@ -13,7 +13,7 @@ A client connects over WebSocket. The router selects an upstream, forwards that 
 
 - **Selection.** The router prefers an upstream whose trace range covers the requested block; otherwise it routes to the least-loaded healthy upstream. Among equally suitable upstreams, the optional per-server [`priority` and `weight`](configuration.md#upstream-preference) pick a preferred tier and split load inside it. A `get_blocks_request_v1` with `fetch_finality_data` is sent only to an upstream whose finality-data range covers that block (learned from `get_status_result_v1`). If no upstream reports a covering range, routing stays on the trace-range rules.
 - **Health.** Background loops poll each upstream's status and block progress. An upstream that stops advancing is marked stale and deprioritized, not hard-excluded. An upstream whose status reply misses the `upstream_status_ms` deadline is marked offline.
-- **Failover.** If the active upstream drops, the router selects another suitable upstream, resends the in-flight `get_blocks` request resumed at the next block, de-duplicates blocks the client has already received, and replays any client frames buffered during the swap. The client connection stays open throughout. Repeated unclean drops at the same block are bounded; see [Corrupted SHiP logs](#corrupted-ship-logs).
+- **Failover.** If the active upstream drops, or goes silent without closing the connection (see [`upstream_liveness_timeout_ms`](configuration.md#limits-and-timeouts)), the router selects another suitable upstream, resends the in-flight `get_blocks` request resumed at the next block, de-duplicates blocks the client has already received, and replays any client frames buffered during the swap. The client connection stays open throughout. Repeated unclean drops at the same block are bounded; see [Corrupted SHiP logs](#corrupted-ship-logs).
 
 fleet-router is written in Rust on [tokio](https://tokio.rs/) and [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite), and uses [rs_abieos](https://github.com/eosrio/rs-abieos) (pure-Rust backend) to check that an upstream SHiP ABI parses. Each handshake, failover, and monitor builds a short-lived `AbiHandle` and drops it; connections do not share an abieos context. Upstream TLS uses rustls with the [aws-lc-rs](https://github.com/aws/aws-lc-rs) provider.
 
@@ -26,6 +26,10 @@ fleet-router is written in Rust on [tokio](https://tokio.rs/) and [tokio-tungste
 - `rs_abieos` (pure Rust) parses untrusted upstream data; treat your upstreams as part of the trust boundary.
 
 Deploy on a trusted or internal network, and/or behind a TLS-terminating reverse proxy (nginx, Caddy, Envoy) that adds access control.
+
+The optional [dashboard](api.md) is off by default. When you enable it, it is served on `metrics_port` with no login for reading, and it shows client IP addresses. Its control actions need a bearer token. Keep `metrics_address` on a private interface (for example `127.0.0.1` behind an SSH tunnel or an authenticating reverse proxy).
+
+**Maintenance without dropping clients.** With the control API enabled, `POST /api/v1/listeners/<listener>/upstreams/<endpoint>/drain` (or the Drain button on the dashboard) stops new sessions on that upstream and moves its current sessions to other upstreams. They resume at the next block and their clients stay connected. Restart or resync the node, then enable it again.
 
 To report a vulnerability, see [SECURITY.md](../SECURITY.md).
 

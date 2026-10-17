@@ -14,6 +14,7 @@ use std::any::Any;
 use std::collections::HashSet;
 use std::fs::{read_to_string, write};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,14 +45,17 @@ use crate::tasks::{
 };
 
 mod abi;
+mod api;
 mod config_sample;
 mod fleet;
 mod functions;
 mod health;
+mod http;
 mod models;
 mod session;
 mod ship;
 mod tasks;
+mod telemetry;
 mod zcd;
 
 #[tokio::main]
@@ -82,6 +86,15 @@ async fn main() -> Result<()> {
     for warning in config.warnings() {
         tracing::warn!("{warning}");
     }
+    let control_token = if config.dashboard.enabled {
+        config.dashboard.resolve_control_token()?
+    } else {
+        if config.dashboard.control_token.is_some() || config.dashboard.control_token_file.is_some()
+        {
+            tracing::warn!("a control token is configured but dashboard.enabled is false; the control API stays off");
+        }
+        None
+    };
 
     let static_config = StaticConfig {
         upstream_status_ms: config.upstream_status_ms,
@@ -131,6 +144,7 @@ async fn main() -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(64);
 
     let mut health_states = Vec::with_capacity(bound_listeners.len());
+    let mut listener_contexts = Vec::with_capacity(bound_listeners.len());
     let mut conn_limits = Vec::with_capacity(bound_listeners.len());
     let mut accept_handles = Vec::with_capacity(bound_listeners.len());
 
@@ -149,11 +163,27 @@ async fn main() -> Result<()> {
             server_config_db.clone(),
         );
 
-        health_states.push(health::ListenerHealthState {
+        let health_state = health::ListenerHealthState {
             name: listener_cfg.name.clone(),
             state_db: server_state_db.clone(),
             hub: Some(hub.clone()),
+        };
+        let listener_stats = Arc::new(telemetry::ListenerStats::default());
+        listener_contexts.push(api::ListenerContext {
+            health: health_state.clone(),
+            config_db: server_config_db.clone(),
+            order: listener_cfg
+                .servers
+                .iter()
+                .filter(|s| s.enabled)
+                .map(|s| s.endpoint.clone())
+                .collect(),
+            port: listener_cfg.listen_port,
+            chain_id: listener_cfg.expected_chain_id,
+            max_connections: listener_cfg.max_connections,
+            stats: listener_stats.clone(),
         });
+        health_states.push(health_state);
 
         // Per-upstream monitoring loops for this listener's pool.
         for server in listener_cfg.servers.iter().filter(|s| s.enabled).cloned() {
@@ -217,12 +247,14 @@ async fn main() -> Result<()> {
                         let permit = match conn_limit.clone().try_acquire_owned() {
                             Ok(p) => p,
                             Err(_) => {
+                                listener_stats.rejected_total.fetch_add(1, Ordering::Relaxed);
                                 tracing::warn!(%client_addr, max = max_connections, "connection limit reached; rejecting");
                                 drop(client_stream);
                                 continue;
                             }
                         };
 
+                        listener_stats.accepted_total.fetch_add(1, Ordering::Relaxed);
                         tracing::debug!(%client_addr, "accepted tcp connection");
 
                         let ctx = ctx.clone();
@@ -248,15 +280,38 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // Optional health/metrics HTTP endpoint.
+    // Optional health/metrics HTTP endpoint, with the opt-in dashboard.
     if let Some((host, port)) = config.resolved_metrics_host_port() {
         let addr = format_bind_addr(&host, port);
-        spawn(health::run_metrics_server(
-            addr,
-            health_states,
-            shutdown_tx.subscribe(),
-        ));
+        if control_token.is_some() && !is_loopback_host(&host) {
+            tracing::warn!(
+                %addr,
+                "the control API is enabled on a non-loopback address; restrict access to this port"
+            );
+        }
+        let app = Arc::new(api::AppState {
+            listeners: listener_contexts,
+            health: health_states,
+            dashboard: config.dashboard.enabled,
+            control_token,
+            allowed_hosts: config
+                .dashboard
+                .allowed_hosts
+                .iter()
+                .map(|host| host.trim().to_ascii_lowercase())
+                .collect(),
+            streams: Arc::new(tokio::sync::Semaphore::new(api::MAX_STREAMS)),
+        });
+        if app.dashboard {
+            spawn(api::run_sampler(app.clone(), shutdown_tx.subscribe()));
+        }
+        spawn(http::run_http_server(addr, app, shutdown_tx.subscribe()));
     }
+    telemetry::global().emit(telemetry::Event::new(
+        telemetry::Level::Info,
+        telemetry::EventKind::Started,
+        format!("fleet-router {} started", env!("CARGO_PKG_VERSION")),
+    ));
 
     shutdown_signal().await;
     tracing::info!("shutdown signal received; draining connections");
@@ -274,6 +329,15 @@ fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(filter).with_target(false).init();
+}
+
+/// Whether `host` only accepts local connections.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Resolve when a shutdown signal (SIGINT/Ctrl+C, or SIGTERM on Unix) arrives.

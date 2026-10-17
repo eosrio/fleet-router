@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 
 use crate::abi::{accept_upstream_abi, AbiEntry};
 use crate::ship::{BlockPos, Range};
@@ -26,6 +27,9 @@ fn default_handshake_timeout_ms() -> u64 {
 }
 fn default_idle_timeout_ms() -> u64 {
     0 // 0 = disabled
+}
+fn default_upstream_liveness_timeout_ms() -> u64 {
+    4_000
 }
 fn default_max_message_bytes() -> usize {
     256 * 1024 * 1024 // 256 MiB
@@ -551,6 +555,15 @@ pub struct ServerConfig {
     /// Idle timeout (ms): close a connection that exchanges no data for this long. 0 = disabled.
     #[serde(default = "default_idle_timeout_ms")]
     pub idle_timeout_ms: u64,
+    /// Fail a session over when its upstream socket goes silent (ms).
+    ///
+    /// After half this time with no frame from the upstream, the session
+    /// sends a WebSocket ping. If no frame at all arrives within the full
+    /// time, the upstream is treated as dead: it is marked offline and the
+    /// session fails over. Catches a node that stops answering without
+    /// closing the connection. 0 = disabled.
+    #[serde(default = "default_upstream_liveness_timeout_ms")]
+    pub upstream_liveness_timeout_ms: u64,
     /// Maximum WebSocket message size (bytes) accepted on upstream links.
     #[serde(default = "default_max_message_bytes")]
     pub max_message_bytes: usize,
@@ -586,6 +599,60 @@ pub struct ServerConfig {
     /// Optional port for the HTTP health/metrics endpoint. When unset, the endpoint is disabled.
     #[serde(default)]
     pub metrics_port: Option<u16>,
+    /// Opt-in dashboard, status page, JSON API and control API on the
+    /// health/metrics endpoint. Off when omitted.
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
+}
+
+/// Minimum length of a control API token.
+pub const MIN_CONTROL_TOKEN_LEN: usize = 16;
+
+/// Environment variable that supplies the control API token.
+pub const CONTROL_TOKEN_ENV: &str = "FLEET_ROUTER_CONTROL_TOKEN";
+
+/// `dashboard` settings. Everything here is served on `metrics_port`.
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct DashboardConfig {
+    /// Serve `/ui/`, `/status` and `/api/v1`. Requires `metrics_port`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bearer token for the control API, inline. Prefer
+    /// [`Self::control_token_file`] or [`CONTROL_TOKEN_ENV`].
+    #[serde(default)]
+    pub control_token: Option<String>,
+    /// File holding the control API token. Surrounding whitespace is ignored.
+    #[serde(default)]
+    pub control_token_file: Option<String>,
+    /// Host names the dashboard answers to besides IP literals and
+    /// `localhost`, for access through a reverse proxy that keeps the name.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+impl DashboardConfig {
+    /// Resolve the control API token: the environment variable first, then
+    /// `control_token_file`, then `control_token`. `Ok(None)` disables control.
+    pub fn resolve_control_token(&self) -> Result<Option<String>> {
+        let env = std::env::var(CONTROL_TOKEN_ENV).ok();
+        let token = if let Some(token) = env.filter(|token| !token.trim().is_empty()) {
+            Some(token)
+        } else if let Some(path) = &self.control_token_file {
+            Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| anyhow!("dashboard.control_token_file '{path}': {e}"))?,
+            )
+        } else {
+            self.control_token.clone()
+        };
+        let Some(token) = token.map(|token| token.trim().to_string()) else {
+            return Ok(None);
+        };
+        if token.len() < MIN_CONTROL_TOKEN_LEN {
+            bail!("the control API token must be at least {MIN_CONTROL_TOKEN_LEN} characters");
+        }
+        Ok(Some(token))
+    }
 }
 
 /// Format a `host` and `port` for `TcpListener::bind`, bracketing bare IPv6
@@ -861,6 +928,19 @@ impl ServerConfig {
         }
         if self.upstream_stall_timeout_ms != 0 && self.upstream_stall_timeout_ms < 1_000 {
             bail!("upstream_stall_timeout_ms must be 0 or at least 1000");
+        }
+        if self.dashboard.enabled && self.metrics_port.is_none() {
+            bail!("dashboard.enabled requires metrics_port");
+        }
+        if self.dashboard.control_token.is_some() && self.dashboard.control_token_file.is_some() {
+            bail!("set only one of dashboard.control_token and dashboard.control_token_file");
+        }
+        if let Some(token) = &self.dashboard.control_token {
+            if token.trim().len() < MIN_CONTROL_TOKEN_LEN {
+                bail!(
+                    "dashboard.control_token must be at least {MIN_CONTROL_TOKEN_LEN} characters"
+                );
+            }
         }
 
         if !self.servers.is_empty() && !self.listeners.is_empty() {
@@ -1139,6 +1219,7 @@ impl ServerConfig {
         ProxyLimits {
             handshake_timeout_ms: self.handshake_timeout_ms,
             idle_timeout_ms: self.idle_timeout_ms,
+            upstream_liveness_timeout_ms: self.upstream_liveness_timeout_ms,
             max_message_bytes: self.max_message_bytes,
             max_client_message_bytes: self.max_client_message_bytes,
             stall_timeout_ms: self.upstream_stall_timeout_ms,
@@ -1169,6 +1250,24 @@ fn resolve_stitching(
     (resolved, policy, abi_pin)
 }
 
+/// Cumulative per-upstream counters, updated by sessions without taking the
+/// state lock.
+#[derive(Debug, Default)]
+pub struct UpstreamCounters {
+    /// Sessions assigned to this upstream, including failovers to it.
+    pub sessions_total: AtomicU64,
+    /// Sessions that left this upstream through failover or an operator move.
+    pub failovers_total: AtomicU64,
+    /// Block frames forwarded from this upstream to clients.
+    pub blocks_total: AtomicU64,
+    /// Bytes forwarded from this upstream to clients.
+    pub bytes_total: AtomicU64,
+    /// Woken when the upstream goes from online to offline, so sessions on
+    /// it can check their socket right away instead of waiting for their own
+    /// liveness timeout.
+    pub went_offline: Notify,
+}
+
 /// Live state tracked per upstream by the monitoring loop and the proxy.
 #[derive(Debug)]
 pub struct ServerState {
@@ -1179,7 +1278,11 @@ pub struct ServerState {
     /// `Arc<AtomicUsize>` so [`crate::session::ConnectionGuard`] can
     /// decrement synchronously on drop without locking the whole map.
     pub connections: Arc<AtomicUsize>,
+    pub counters: Arc<UpstreamCounters>,
     pub enabled: bool,
+    /// Set through the control API. Unlike [`Self::enabled`], the monitor never
+    /// clears it. New sessions and failovers skip the upstream while it is set.
+    pub operator_disabled: bool,
     pub online: bool,
     /// Set by the monitoring loop when an upstream stops advancing its chain
     /// state. Stale upstreams are deprioritized (but not excluded) when routing.
@@ -1278,7 +1381,9 @@ impl ServerState {
         ServerState {
             name: String::new(),
             connections: Arc::new(AtomicUsize::new(0)),
+            counters: Arc::new(UpstreamCounters::default()),
             enabled: true,
+            operator_disabled: false,
             online: false,
             stale: false,
             priority: 0,
@@ -1311,13 +1416,17 @@ impl ServerState {
         }
     }
 
-    /// Record that the monitor lost this upstream.
+    /// Record that the monitor (or a session) lost this upstream.
     ///
     /// Clears `online` and the reported `chain_id`. Ranges, head, LIB and the
     /// ABI are kept, so coverage stays sticky. `offline_since` keeps the first
-    /// instant of an outage.
+    /// instant of an outage. Going from online to offline wakes the sessions
+    /// on this upstream (see [`UpstreamCounters::went_offline`]).
     pub fn mark_offline(&mut self, now: Instant) {
-        self.online = false;
+        if self.online {
+            self.online = false;
+            self.counters.went_offline.notify_waiters();
+        }
         self.chain_id = None;
         if self.offline_since.is_none() {
             self.offline_since = Some(now);
@@ -1401,6 +1510,17 @@ impl ServerState {
         true
     }
 
+    /// Whether selection may use this upstream (online or not).
+    pub fn routable(&self) -> bool {
+        self.enabled && !self.operator_disabled
+    }
+
+    /// Remove every block-range exclusion and pending strike.
+    pub fn clear_quarantines(&mut self) {
+        self.quarantines.clear();
+        self.block_strikes.clear();
+    }
+
     /// Drop exclusions whose TTL has passed so the list cannot grow without bound.
     pub fn prune_expired_quarantines(&mut self, now: Instant) {
         self.quarantines.retain(|quarantine| quarantine.active(now));
@@ -1465,6 +1585,8 @@ pub struct StaticConfig {
 pub struct ProxyLimits {
     pub handshake_timeout_ms: u64,
     pub idle_timeout_ms: u64,
+    /// See [`ServerConfig::upstream_liveness_timeout_ms`]. 0 = disabled.
+    pub upstream_liveness_timeout_ms: u64,
     /// Upstream WebSocket message/frame cap.
     pub max_message_bytes: usize,
     /// Client WebSocket message/frame cap.
@@ -1640,6 +1762,65 @@ mod tests {
         assert!(servers[0].get("weight").is_none());
         assert_eq!(servers[1]["priority"], 10);
         assert_eq!(servers[1]["weight"], 3);
+    }
+
+    #[test]
+    fn dashboard_is_off_by_default_and_needs_metrics_port() {
+        let cfg: ServerConfig = serde_json::from_value(minimal_config()).unwrap();
+        assert_eq!(cfg.dashboard, DashboardConfig::default());
+        assert!(!cfg.dashboard.enabled);
+
+        let mut value = minimal_config();
+        value["dashboard"] = serde_json::json!({ "enabled": true });
+        let cfg: ServerConfig = serde_json::from_value(value.clone()).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("requires metrics_port"),
+            "unexpected error: {err}"
+        );
+
+        value["metrics_port"] = serde_json::json!(9090);
+        let cfg: ServerConfig = serde_json::from_value(value).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn control_token_must_be_long_and_from_one_config_source() {
+        let mut value = minimal_config();
+        value["metrics_port"] = serde_json::json!(9090);
+        value["dashboard"] = serde_json::json!({ "enabled": true, "control_token": "short" });
+        let cfg: ServerConfig = serde_json::from_value(value.clone()).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("at least 16"), "unexpected error: {err}");
+
+        value["dashboard"] = serde_json::json!({
+            "enabled": true,
+            "control_token": "0123456789abcdef",
+            "control_token_file": "/tmp/token"
+        });
+        let cfg: ServerConfig = serde_json::from_value(value).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("only one of"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn control_token_file_is_trimmed() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, b"  0123456789abcdef\n").unwrap();
+        let dashboard = DashboardConfig {
+            enabled: true,
+            control_token: None,
+            control_token_file: Some(file.path().display().to_string()),
+            allowed_hosts: Vec::new(),
+        };
+        // The environment variable takes precedence; only check the file
+        // when it is not set in this test environment.
+        if std::env::var(CONTROL_TOKEN_ENV).is_err() {
+            assert_eq!(
+                dashboard.resolve_control_token().unwrap().as_deref(),
+                Some("0123456789abcdef")
+            );
+        }
     }
 
     #[test]

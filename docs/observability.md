@@ -1,6 +1,6 @@
 # Observability
 
-fleet-router reports through structured logs and an optional HTTP endpoint for health checks and Prometheus metrics.
+fleet-router reports through structured logs and an optional HTTP endpoint for health checks and Prometheus metrics. The same endpoint can also serve an opt-in live dashboard; see [Dashboard and control API](api.md).
 
 ## Logging
 
@@ -20,7 +20,7 @@ RUST_LOG=fleet_router=debug,info \
 Set `metrics_port` (and optionally `metrics_address`) in the [config](configuration.md#health-and-metrics-endpoint) to enable an HTTP endpoint. It serves `GET` requests on:
 
 - **`/health`**, **`/healthz`** — `200` while the process is running.
-- **`/ready`**, **`/readyz`** — `200` if at least one upstream is online (or, in `listeners` mode, if **every** listener has at least one upstream online), otherwise `503`.
+- **`/ready`**, **`/readyz`** — `200` if at least one upstream is online and not disabled by an operator (or, in `listeners` mode, if **every** listener has at least one upstream online), otherwise `503`.
 - **`/ready/<listener>`**, **`/readyz/<listener>`** — `200` if the named listener has at least one online upstream, `503` if none are online, or `404` if the listener name is unknown.
 - **`/metrics`** — Prometheus text exposition of router and upstream state.
 
@@ -32,6 +32,7 @@ Each per-upstream series carries `server="<name>"` from the configured server na
 fleet_router_up
 fleet_router_upstream_up{endpoint,server}
 fleet_router_upstream_stale{endpoint,server}
+fleet_router_upstream_operator_disabled{endpoint,server}
 fleet_router_upstream_priority{endpoint,server}
 fleet_router_upstream_weight{endpoint,server}
 fleet_router_active_connections{endpoint,server}
@@ -58,3 +59,7 @@ fleet_router_upstream_quarantine_block{endpoint,server}
 `fleet_router_upstream_quarantined` is `1` while that upstream is excluded for any block range. `fleet_router_upstream_quarantine_block` is the start block of that exclusion, or `0` when none is active; if several ranges are active it is the lowest start block. The block number is the gauge value, not a label.
 
 See [Corrupted SHiP logs](operations.md#corrupted-ship-logs) for when these move.
+
+### Operator overrides
+
+`fleet_router_upstream_priority` and `fleet_router_upstream_weight` report the values in effect. They differ from the config file after an operator changes them through the [control API](api.md#control-endpoints). `fleet_router_upstream_operator_disabled` is `1` while an operator has disabled or drained that upstream. An operator-disabled upstream does not count toward `/ready`.

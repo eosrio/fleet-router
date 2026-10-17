@@ -3,7 +3,7 @@ members = [".", "mock-ship"]
 
 [package]
 name = "fleet-router"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.99"
 description = "Reverse proxy and load balancer for the Antelope SHiP (State History Plugin) WebSocket protocol."
@@ -16,9 +16,12 @@ license = "MIT"
 categories = ["network-programming"]
 keywords = ["antelope", "ship", "state-history", "load-balancer", "websockets"]
 # Keep the published crate lean: ship only what's needed to build and run the
-# binary. Tests, Docker assets, the TypeScript client, and CI config stay in git.
+# binary (including the embedded dashboard under ui/). Tests, Docker assets,
+# the TypeScript client, and CI config stay in git.
 include = [
+    "build.rs",
     "src/**/*.rs",
+    "ui/**",
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
@@ -49,6 +52,9 @@ tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"]
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "service"] }
 
 [dev-dependencies]
 mock-ship = { path = "mock-ship" }

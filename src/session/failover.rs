@@ -9,6 +9,7 @@ use tokio::time::Instant;
 use crate::abi::fnv1a64;
 use crate::fleet::{ContractViolation, FailoverReason, FleetHub, HoldWhy};
 use crate::models::{BlockFailureQuarantine, Role};
+use crate::telemetry::{self, Event, EventKind, Level};
 
 /// Per session, how many times the upstream stream may die with the same next
 /// block before the client is closed. The drop that starts the loop counts, so
@@ -173,6 +174,12 @@ pub(super) enum UpEnd {
     TooLarge,
     /// The request write failed on a link that never produced a frame.
     SendFailed,
+    /// No frame at all, not even a reply to a liveness ping, within
+    /// `upstream_liveness_timeout_ms` (1 s once the monitor lost the
+    /// upstream). The socket may still look open.
+    Silent,
+    /// An operator moved the session off this upstream.
+    Moved,
 }
 
 /// Which upstream a session avoids after a link end.
@@ -216,8 +223,8 @@ pub(super) struct EndFacts {
 
 /// The link-end table. Only unclean drops, frozen stalls and frozen contract
 /// violations strike the upstream; a clean close, an idle or live stall, a
-/// busy or uncovered upstream, an oversized message or a client-induced drop
-/// never do. `cursor` is the client's next block.
+/// busy, uncovered or silent upstream, an operator move, an oversized message
+/// or a client-induced drop never do. `cursor` is the client's next block.
 pub(super) fn classify(end: UpEnd, facts: &EndFacts, cursor: u32, now: Instant) -> EndAction {
     let failover = |strike: bool, budget: bool, delay: Duration, exclusion: Exclusion, reason| {
         EndAction::Failover {
@@ -312,6 +319,22 @@ pub(super) fn classify(end: UpEnd, facts: &EndFacts, cursor: u32, now: Instant) 
             Exclusion::Hard(DIAL_EXCLUSION),
             FailoverReason::Send,
         ),
+        // A dead node, not a bad block: prefer another upstream, but no
+        // strike against the block.
+        UpEnd::Silent => failover(
+            false,
+            false,
+            CLEAN_DELAY,
+            Exclusion::Soft,
+            FailoverReason::Silent,
+        ),
+        UpEnd::Moved => failover(
+            false,
+            false,
+            CLEAN_DELAY,
+            Exclusion::Soft,
+            FailoverReason::Operator,
+        ),
     }
 }
 
@@ -347,6 +370,16 @@ pub(super) async fn note_block_failure(
             block,
             range,
             "upstream quarantined after repeated mid-stream block failures"
+        );
+        let last = block.saturating_add(range.saturating_sub(1));
+        telemetry::global().emit(
+            Event::new(
+                Level::Warn,
+                EventKind::UpstreamQuarantined,
+                format!("{} quarantined for blocks {block}..={last}", state.name),
+            )
+            .listener(hub.name.as_deref().unwrap_or("default"))
+            .upstream(endpoint),
         );
     }
     hub.rebuild(&db);
@@ -604,6 +637,42 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A silent upstream and an operator move fail over to another upstream
+    /// without a strike or the same-block budget.
+    #[test]
+    fn silent_upstreams_and_operator_moves_are_avoided_without_a_block_strike() {
+        let now = Instant::now();
+        for role in [Role::Live, Role::Frozen] {
+            for (end, reason) in [
+                (UpEnd::Silent, FailoverReason::Silent),
+                (UpEnd::Moved, FailoverReason::Operator),
+            ] {
+                assert_eq!(
+                    classify(end, &facts(role, None), 115, now),
+                    EndAction::Failover {
+                        strike: false,
+                        budget: false,
+                        delay: Duration::from_millis(100),
+                        exclusion: Exclusion::Soft,
+                        reason,
+                    },
+                    "{end:?} on {role:?}"
+                );
+            }
+        }
+        let mut stuck_at = None;
+        for _ in 0..8 {
+            let plan = plan_same_block_failover(&mut stuck_at, false, Some(115), CLEAN_DELAY);
+            assert!(
+                plan.close_reason.is_none(),
+                "a dead node must not close with 1011"
+            );
+            assert_eq!(plan.failures, 0);
+            assert_eq!(plan.delay, Duration::from_millis(100));
+        }
+        assert!(stuck_at.is_none(), "a dead node is not a bad block");
     }
 
     /// F2: jitter is within ±20 % and deterministic.

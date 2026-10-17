@@ -30,7 +30,7 @@ use tracing::Instrument;
 use crate::abi::accept_upstream_abi;
 use crate::fleet::view::UpstreamView;
 use crate::fleet::{DialFailure, FleetHub, LinkPurpose};
-use crate::models::{ProxyLimits, ResolvedTopology, Role};
+use crate::models::{ProxyLimits, ResolvedTopology, Role, UpstreamCounters};
 use crate::ship::wire::BlocksRequest;
 use crate::ship::BlockPos;
 
@@ -43,6 +43,10 @@ pub(super) type UpstreamWs = WebSocketStream<MaybeTlsStream<ActivityStream<TcpSt
 /// Upstream picks per connect or failover before the client is closed. A pick
 /// that finds no candidate ends the attempts.
 pub(super) const MAX_DIAL_ATTEMPTS: u32 = 3;
+
+/// Payload of the router's own pings to an upstream. Pongs carrying it are
+/// liveness replies, not upstream activity.
+pub(super) const LIVENESS_PING: &[u8] = b"fleet-router-liveness";
 
 /// Holds one unit of an upstream's active-connection counter. Decrements
 /// synchronously (and underflow-safely) when dropped — no spawn, no lock, no
@@ -155,6 +159,20 @@ pub(super) struct LinkState {
     /// Stitched: a link kept open with nothing to send (its leg is done) is
     /// closed at this instant unless a new request reuses it first.
     pub linger_until: Option<Instant>,
+    /// When a liveness ping went out, while no frame has arrived since.
+    pub ping_at: Option<Instant>,
+    /// The monitor lost this upstream: the link fails over at this instant
+    /// unless a frame arrives first.
+    pub probe_until: Option<Instant>,
+    /// Transport activity (ms since the session epoch) when the last frame
+    /// that was not a liveness pong was read.
+    pub data_ms: u64,
+    /// Transport activity when the last liveness pong was read, while no
+    /// other frame has been read since.
+    pub pong_ms: Option<u64>,
+    /// The upstream was online in the last fleet view the session saw, so
+    /// the view that shows it offline starts a probe.
+    pub upstream_online: bool,
 }
 
 impl LinkState {
@@ -176,6 +194,37 @@ impl LinkState {
             was_owed: false,
             frames: 0,
             linger_until: None,
+            ping_at: None,
+            probe_until: None,
+            data_ms: 0,
+            pong_ms: None,
+            upstream_online: false,
+        }
+    }
+
+    /// A frame was read; `read_ms` is the transport activity now. Any frame
+    /// shows the upstream is alive. Only frames other than a reply to the
+    /// router's own liveness ping count as data for the idle, stall and
+    /// monitor-offline silence limits.
+    pub fn note_frame(&mut self, read_ms: u64, liveness_pong: bool) {
+        self.ping_at = None;
+        self.probe_until = None;
+        if liveness_pong {
+            self.pong_ms = Some(read_ms);
+        } else {
+            self.data_ms = read_ms;
+            self.pong_ms = None;
+        }
+    }
+
+    /// Transport activity (ms since the session epoch) that counts as data:
+    /// the last read, unless all it carried was a liveness pong. Bytes read
+    /// after that pong (part of a large message, say) count again.
+    pub fn data_activity_ms(&self, read_ms: u64) -> u64 {
+        if self.pong_ms == Some(read_ms) {
+            self.data_ms
+        } else {
+            read_ms
         }
     }
 
@@ -498,6 +547,7 @@ pub(super) struct DialTarget {
     pub name: Arc<str>,
     pub url: Arc<str>,
     pub role: Role,
+    pub counters: Arc<UpstreamCounters>,
 }
 
 impl DialTarget {
@@ -508,6 +558,7 @@ impl DialTarget {
             name: u.name.clone(),
             url: u.url.clone(),
             role: u.role,
+            counters: u.counters.clone(),
         }
     }
 }
@@ -677,20 +728,39 @@ pub(super) struct Link {
     pub rx: SplitStream<UpstreamWs>,
     /// Milliseconds since the session epoch of the last transport read.
     pub activity: Arc<AtomicU64>,
+    /// The upstream's cumulative counters.
+    pub counters: Arc<UpstreamCounters>,
     guard: ConnectionGuard,
 }
 
 impl Link {
     pub fn new(target: &DialTarget, est: Established, now: Instant) -> Self {
         let (tx, rx) = est.ws.split();
+        let mut st = LinkState::new(target.up, target.role, now);
+        st.data_ms = est.activity.load(Ordering::Relaxed);
         Link {
-            st: LinkState::new(target.up, target.role, now),
+            st,
             endpoint: target.endpoint.clone(),
             name: target.name.clone(),
             tx,
             rx,
             activity: est.activity,
+            counters: target.counters.clone(),
             guard: est.guard,
+        }
+    }
+
+    /// Milliseconds since the session epoch of the last transport read.
+    pub fn read_ms(&self) -> u64 {
+        self.activity.load(Ordering::Relaxed)
+    }
+
+    /// Send a liveness ping. Bounded, so a stuck socket cannot hold the
+    /// session loop.
+    pub async fn ping(&mut self) {
+        let ping = self.tx.send(Message::Ping(LIVENESS_PING.into()));
+        if !matches!(timeout(Duration::from_secs(1), ping).await, Ok(Ok(()))) {
+            tracing::debug!(upstream = %self.endpoint, "liveness ping to upstream not sent");
         }
     }
 
@@ -743,6 +813,7 @@ mod tests {
         ProxyLimits {
             handshake_timeout_ms: 2_000,
             idle_timeout_ms: 0,
+            upstream_liveness_timeout_ms: 0,
             max_message_bytes: 1 << 20,
             max_client_message_bytes: 64 * 1024,
             stall_timeout_ms: 0,
@@ -757,6 +828,7 @@ mod tests {
             name: Arc::from("test-upstream"),
             url: Arc::from(format!("ws://{endpoint}")),
             role: Role::Live,
+            counters: Arc::default(),
         }
     }
 

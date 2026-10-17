@@ -632,6 +632,7 @@ async fn legacy_session<S>(
     let config = &shared.config;
     let clock = &shared.clock;
     let (mut writer, mut reader) = ws_stream.split();
+    let close_generation = shared.control.close_generation();
 
     // Step 1: Send ABI as Text frame
     if writer.send(config.abi_message()).await.is_err() {
@@ -731,6 +732,10 @@ async fn legacy_session<S>(
                             deltas: deltas_data.as_deref(),
                             finality: None,
                         });
+                        if shared.control.close_requested(close_generation) {
+                            let _ = writer.send(Message::Close(None)).await;
+                            return;
+                        }
                         if writer.send(Message::Binary(result.into())).await.is_err() {
                             return;
                         }
@@ -744,8 +749,16 @@ async fn legacy_session<S>(
             }
         }
 
-        // Read next request from client
-        let msg = match reader.next().await {
+        // Read next request from client, unless a clean close is requested
+        // first (as nodeos does when it shuts down).
+        let next = tokio::select! {
+            next = reader.next() => next,
+            () = wait_for_close(&shared.control, close_generation) => {
+                let _ = writer.send(Message::Close(None)).await;
+                return;
+            }
+        };
+        let msg = match next {
             Some(Ok(msg)) => msg,
             Some(Err(_)) | None => return,
         };
@@ -978,9 +991,15 @@ impl<'a> SpringSession<'a> {
             return;
         }
         let clock = self.shared.clock.clone();
+        let control = &self.shared.control;
+        let close_generation = control.close_generation();
         loop {
             let changed = clock.notified();
             self.sync_clock();
+            if control.close_requested(close_generation) {
+                let _ = writer.send(Message::Close(None)).await;
+                return;
+            }
             if let Some(due) = self.due() {
                 // Spring reads on its own coroutine: requests already waiting
                 // (status, acks, a new get_blocks) are handled before the
@@ -1003,6 +1022,7 @@ impl<'a> SpringSession<'a> {
                     }
                 }
                 _ = changed => {}
+                () = wait_for_close(control, close_generation) => {}
             }
         }
     }
@@ -1333,6 +1353,10 @@ struct SessionControl {
     /// one it was accepted under.
     epoch: AtomicU64,
     kill: Notify,
+    /// Bumped by [`MockShipHandle::close_sessions`]. A session closes when the
+    /// value differs from the one it started with.
+    close_epoch: AtomicU64,
+    close: Notify,
 }
 
 impl SessionControl {
@@ -1341,12 +1365,41 @@ impl SessionControl {
             stall: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
             kill: Notify::new(),
+            close_epoch: AtomicU64::new(0),
+            close: Notify::new(),
         }
     }
 
     fn drop_sessions(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.kill.notify_waiters();
+    }
+
+    /// The close generation a session starts under.
+    fn close_generation(&self) -> u64 {
+        self.close_epoch.load(Ordering::Acquire)
+    }
+
+    /// Whether a clean close was requested after `generation`.
+    fn close_requested(&self, generation: u64) -> bool {
+        self.close_epoch.load(Ordering::Acquire) != generation
+    }
+
+    fn close_sessions(&self) {
+        self.close_epoch.fetch_add(1, Ordering::AcqRel);
+        self.close.notify_waiters();
+    }
+}
+
+/// Completes once a clean close was requested after `generation`. Registers
+/// interest before the check, like [`wait_until_killed`].
+async fn wait_for_close(control: &SessionControl, generation: u64) {
+    loop {
+        let notified = control.close.notified();
+        if control.close_requested(generation) {
+            return;
+        }
+        notified.await;
     }
 }
 
@@ -1394,6 +1447,13 @@ impl MockShipHandle {
     /// accepting new connections normally.
     pub fn drop_sessions(&self) {
         self.shared.control.drop_sessions();
+    }
+
+    /// Send a WebSocket Close on every open session, as nodeos does when it
+    /// shuts down cleanly. New connections are still accepted, like a node
+    /// that has restarted.
+    pub fn close_sessions(&self) {
+        self.shared.control.close_sessions();
     }
 
     /// WebSocket upgrades completed so far (refused or stalled ones excluded).

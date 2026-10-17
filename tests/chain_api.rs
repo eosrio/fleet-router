@@ -937,19 +937,33 @@ async fn targets_options_and_cors_follow_nodeos() {
         options,
         post(cors_port, GET_INFO, "").await,
         post(cors_port, "/v1/history/get_actions", "{}").await,
-        exchange(
-            addr(cors_port),
-            b"OPTIONS * HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
-            WAIT,
-        )
-        .await
-        .unwrap(),
     ] {
         assert_eq!(answer.header("access-control-allow-origin"), Some("*"));
         assert_eq!(answer.header("access-control-max-age"), Some("600"));
         assert!(answer.header("access-control-allow-methods").is_none());
         assert!(answer.header("access-control-allow-credentials").is_none());
     }
+    // nodeos checks the target before it sets its CORS headers, so its
+    // "Illegal request-target" answer has none.
+    let illegal = exchange(
+        addr(cors_port),
+        b"OPTIONS * HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+        WAIT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (illegal.status, illegal.text()),
+        (400, ILLEGAL_TARGET.to_string())
+    );
+    assert!(
+        illegal
+            .headers
+            .iter()
+            .all(|(name, _)| !name.to_ascii_lowercase().starts_with("access-control-")),
+        "{:?}",
+        illegal.headers
+    );
 }
 
 // CA17
@@ -1056,6 +1070,36 @@ async fn an_archived_block_never_ends_on_a_late_live_nodes_unknown_block() {
     assert_eq!(answer.status, 400);
     assert_eq!(answer.body, direct(&late, GET_BLOCK, &raw(500)).await.body);
     // Above the archive's range, the late node is a candidate again.
+    let answer = post(port, RAW_BLOCK, &raw(2000)).await;
+    assert_eq!(answer.status, 400);
+    assert!(answer.text().contains("3100002"));
+}
+
+// The same rule for a node that does not report where its log begins (an
+// EOSIO 2.0 or FIO node, say): it is still asked, but for a block an
+// archive claims its Unknown Block is never the answer.
+#[tokio::test]
+async fn an_archived_block_never_ends_on_an_unknown_block_from_a_node_without_earliest() {
+    let archive = frozen_node("archive-a", (2, 1001), (1, 1001), 4).await;
+    let legacy = live_api_only("live-legacy", CHAIN, None, 5000, 4990).await;
+    let (_router, port) = start(config(
+        &[archive.frozen((2, 1001)), legacy.live()],
+        json!({}),
+    ))
+    .await;
+    wait_served(port, RAW_BLOCK, &raw(500), "archive-a").await;
+    archive.api.set_fault(Some(RAW_BLOCK), Some(Fault::Busy));
+    legacy
+        .api
+        .set_fault(Some(RAW_BLOCK), Some(Fault::UnknownBlock));
+    legacy.api.clear_requests();
+    let answer = post(port, RAW_BLOCK, &raw(500)).await;
+    assert_eq!(
+        (answer.status, answer.text()),
+        (503, NO_UPSTREAM.to_string())
+    );
+    assert_eq!(legacy.hits(RAW_BLOCK), 1, "asked once");
+    // Outside every claim, its Unknown Block is the answer.
     let answer = post(port, RAW_BLOCK, &raw(2000)).await;
     assert_eq!(answer.status, 400);
     assert!(answer.text().contains("3100002"));

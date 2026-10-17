@@ -25,6 +25,7 @@
 //! - this module serves the listener: one hyper HTTP/1.1 connection per
 //!   client, nodeos's framing (no `Date`, title-case header names), and the
 //!   request flows of each endpoint class;
+//! - [`socket`] cuts off a client that takes none of its answer;
 //! - [`stats`] counts what happens.
 
 pub mod directory;
@@ -33,6 +34,7 @@ pub mod hint;
 pub mod pick;
 pub mod probe;
 pub mod route;
+pub mod socket;
 pub mod stats;
 pub mod upstream;
 
@@ -45,8 +47,9 @@ use bytes::{Bytes, BytesMut};
 use http_body_util::BodyExt;
 use hyper::body::{Body, Incoming};
 use hyper::header::{
-    HeaderMap, HeaderValue, ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS,
-    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_MAX_AGE, CONNECTION, CONTENT_TYPE,
+    HeaderMap, HeaderName, HeaderValue, ACCESS_CONTROL_ALLOW_CREDENTIALS,
+    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_MAX_AGE, CONNECTION,
+    CONTENT_TYPE,
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -63,22 +66,28 @@ use crate::models::{ApiClass, ChainApiConfig, ChainApiCors, ResolvedChainApi, Ro
 use directory::{ApiDirectory, ApiSlot, Snapshot};
 use errors::{Busy, RouterError, OPTIONS_BODY};
 use pick::{
-    classify, exhausted, info_order, info_primary, needs_peek, next_attempt, plan_block,
+    classify, exhausted, info_order, info_primary, keeps, needs_peek, next_attempt, plan_block,
     push_targets, state_order, Answer, ApiView, BlockPlan, BlockQuery, NextAttempt, Outcome,
     Region, RetryReason, StateQuery, PEEK_LIMIT,
 };
 use route::{BlockEndpoint, Route};
+use socket::Socket;
 use stats::{AnswerRole, ApiStats, BlockRegion, PushResult, Rejection, UpstreamResult};
 use upstream::{
-    full, peek, streamed, ApiBody, Attempt, Buffered, Call, Hold, Peeked, Replay, UpstreamClient,
+    full, peek, streamed, ApiBody, Attempt, Buffered, Call, Hold, Peeked, Replay, StallGuard,
+    UpstreamClient,
 };
 
 /// Largest request head and buffered body chunk read from a client.
 const MAX_BUF: usize = 16 * 1024;
 /// Most request headers a client may send.
 const MAX_HEADERS: usize = 64;
-/// The client header and body read time when `handshake_timeout_ms` is 0.
+/// The client header and body read time, and the longest a write to a
+/// client may wait with no progress, when `handshake_timeout_ms` is 0.
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// The pause after an accept error other than a failed connection (out of
+/// file descriptors, say): retrying at once would spin.
+const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 /// Idle connections kept per upstream API.
 const POOL_PER_UPSTREAM: usize = 32;
 /// Idle connections the probes keep per upstream API.
@@ -129,15 +138,22 @@ impl CorsHeaders {
 /// `Access-Control-*` header is removed, then the configured ones are set.
 /// Without `cors` the answer has none, like a nodeos with no CORS
 /// configured. `Access-Control-Allow-Methods` is never set (nodeos sets
-/// none).
+/// none). The other headers keep their order.
 pub fn apply_cors(headers: &mut HeaderMap, cors: Option<&CorsHeaders>) {
-    let upstream: Vec<_> = headers
-        .keys()
-        .filter(|name| name.as_str().starts_with("access-control-"))
-        .cloned()
-        .collect();
-    for name in upstream {
-        headers.remove(name);
+    let is_cors = |name: &HeaderName| name.as_str().starts_with("access-control-");
+    if headers.keys().any(is_cors) {
+        // Rebuilt rather than removed from: `HeaderMap::remove` moves the
+        // last entry into the gap, which would reorder the relayed head.
+        let mut current: Option<HeaderName> = None;
+        for (name, value) in std::mem::take(headers) {
+            // `None` continues the previous name.
+            if name.is_some() {
+                current = name;
+            }
+            if let Some(name) = current.as_ref().filter(|name| !is_cors(name)) {
+                headers.append(name.clone(), value);
+            }
+        }
     }
     let Some(cors) = cors else {
         return;
@@ -198,8 +214,10 @@ fn busy(why: Busy) -> Response<ApiBody> {
 /// How the attempts of one request move on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Policy {
-    /// A hinted block request in a region ([`classify`]).
-    Block(Region),
+    /// A hinted block request in a region ([`classify`]). `claimed`: a
+    /// frozen range server claims the block, so no Unknown Block is kept
+    /// as the answer ([`keeps`]).
+    Block { region: Region, claimed: bool },
     /// State calls and unhinted block bodies: a transport failure or a 503
     /// moves on, any other answer is final.
     State,
@@ -250,6 +268,18 @@ enum BodyError {
     Failed,
 }
 
+/// Whether an accept error is about one connection only (it failed before
+/// the accept completed), so the next accept can follow at once.
+fn connection_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
 /// The upstream result an answer counts as.
 fn result_of(status: u16, reason: Option<RetryReason>) -> UpstreamResult {
     match (reason, status) {
@@ -287,7 +317,8 @@ pub struct ChainApiCtx {
     /// `ServerState::index` of each `push_servers` entry.
     push: Vec<usize>,
     live_lag_blocks: u32,
-    /// Client header read, and body read after the headers.
+    /// Client header read, body read after the headers, and the longest a
+    /// write to the client may wait with no progress.
     read_timeout: Duration,
     /// The sticky `get_info` primary.
     primary: Mutex<Option<usize>>,
@@ -366,9 +397,19 @@ impl ChainApiCtx {
                 accepted = listener.accept() => {
                     let (stream, peer) = match accepted {
                         Ok(pair) => pair,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "chain API accept error");
+                        Err(e) if connection_error(&e) => {
+                            tracing::debug!(error = %e, "chain API connection failed before its accept");
                             continue;
+                        }
+                        Err(e) => {
+                            // Out of file descriptors, say: the pending
+                            // connection stays queued, so an immediate retry
+                            // would spin.
+                            tracing::warn!(error = %e, "chain API accept error; pausing accepts");
+                            tokio::select! {
+                                _ = tokio::time::sleep(ACCEPT_BACKOFF) => continue,
+                                _ = shutdown.recv() => break,
+                            }
                         }
                     };
                     // Excess connections are closed at once.
@@ -394,13 +435,15 @@ impl ChainApiCtx {
 
     /// Serve one client connection: HTTP/1.1, keep-alive, nodeos framing.
     /// On shutdown, the request in progress finishes and the connection
-    /// closes.
+    /// closes. A write that waits the read timeout with no progress closes
+    /// the connection ([`Socket`]).
     async fn connection(
         self: Arc<Self>,
         stream: tokio::net::TcpStream,
         mut shutdown: broadcast::Receiver<()>,
     ) {
         let _ = stream.set_nodelay(true);
+        let stream = Socket::new(stream, self.read_timeout, self.stats.clone());
         let ctx = self.clone();
         let service = service_fn(move |request| {
             let ctx = ctx.clone();
@@ -432,23 +475,54 @@ impl ChainApiCtx {
 
     /// Answer one request. An `Err` closes the connection without an
     /// answer (a body that did not arrive in time).
+    ///
+    /// The whole body is read first, as nodeos reads it before it handles a
+    /// request, for the answers the router writes itself too: hyper closes
+    /// a connection whose request body was left unread, which resets a
+    /// client still writing it and loses the keep-alive connection.
     async fn handle(
         self: Arc<Self>,
         request: Request<Incoming>,
     ) -> Result<Response<ApiBody>, Unanswered> {
         let started = Instant::now();
         let route = route::classify(request.method(), request.uri(), &self.cfg.allow);
+        let (parts, body) = request.into_parts();
+        let body = match self.read_body(body, route.class().is_some()).await {
+            Ok(body) => body,
+            Err(BodyError::TooLarge) => {
+                self.stats.rejected.inc(Rejection::BodyTooLarge);
+                let mut response = router_error(RouterError::TooLarge(self.cfg.max_body_bytes));
+                // The rest of the body is never read: the connection closes.
+                response
+                    .headers_mut()
+                    .insert(CONNECTION, HeaderValue::from_static("close"));
+                return Ok(self.finish(route, started, Answered::router(response, 0)));
+            }
+            Err(BodyError::Timeout) => {
+                self.stats.rejected.inc(Rejection::Timeout);
+                return Err(Unanswered("request body not received in time"));
+            }
+            Err(BodyError::Failed) => return Err(Unanswered("request body read failed")),
+        };
         let answered = match route {
             Route::IllegalTarget => Answered::router(router_error(RouterError::IllegalTarget), 0),
             Route::Options => Answered::router(generated(200, OPTIONS_BODY), 0),
             Route::SupportedApis => Answered::router(generated(200, self.supported_apis()), 0),
             Route::NotFound => Answered::router(router_error(RouterError::NotFound), 0),
             Route::Block(_) | Route::Info | Route::State | Route::Exec | Route::Push => {
-                self.proxy(route, request).await?
+                self.proxy(route, parts, body).await
             }
         };
+        Ok(self.finish(route, started, answered))
+    }
+
+    /// The CORS headers, the counters and the log line of an answer.
+    fn finish(&self, route: Route, started: Instant, answered: Answered) -> Response<ApiBody> {
         let mut response = answered.response;
-        apply_cors(response.headers_mut(), self.cors.as_ref());
+        // nodeos checks the target before it sets its CORS headers, so its
+        // "Illegal request-target" answer never carries them.
+        let cors = self.cors.as_ref().filter(|_| route != Route::IllegalTarget);
+        apply_cors(response.headers_mut(), cors);
         let status = response.status().as_u16();
         self.stats.request(route.label(), status, started.elapsed());
         tracing::debug!(
@@ -459,58 +533,31 @@ impl ChainApiCtx {
             micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
             "chain API request"
         );
-        Ok(response)
+        response
     }
 
     /// The router's `get_supported_apis`: what the APIs a request may use
     /// advertise.
     fn supported_apis(&self) -> Vec<u8> {
-        let sets: Vec<Arc<BTreeSet<String>>> = self
-            .directory
-            .slots()
+        let snaps = self.snapshot();
+        let sets = snaps
             .iter()
-            .filter_map(|slot| {
-                let state = slot.state();
-                let usable = state.up
-                    && !state.chain_mismatch
-                    && (slot.role.is_live() || state.verification.verified().is_some());
-                usable.then(|| state.apis.clone()).flatten()
-            })
-            .collect();
-        supported_apis_body(sets.iter().map(|set| &**set), &self.cfg.allow)
+            .filter(|s| s.up && (s.role.is_live() || s.verified))
+            .filter_map(|s| s.apis.as_deref());
+        supported_apis_body(sets, &self.cfg.allow)
     }
 
-    /// Read the body, take an in-flight permit and run the route's flow.
+    /// Take an in-flight permit and run the route's flow with the body.
     async fn proxy(
         &self,
         route: Route,
-        request: Request<Incoming>,
-    ) -> Result<Answered, Unanswered> {
-        let (parts, body) = request.into_parts();
+        parts: hyper::http::request::Parts,
+        body: Bytes,
+    ) -> Answered {
         let target = route::origin_target(&parts.uri).unwrap_or("/").to_string();
-        let body = match self.read_body(body).await {
-            Ok(body) => body,
-            Err(BodyError::TooLarge) => {
-                self.stats.rejected.inc(Rejection::BodyTooLarge);
-                let mut response = router_error(RouterError::TooLarge(self.cfg.max_body_bytes));
-                // The rest of the body is never read: the connection closes.
-                response
-                    .headers_mut()
-                    .insert(CONNECTION, HeaderValue::from_static("close"));
-                return Ok(Answered::router(response, 0));
-            }
-            Err(BodyError::Timeout) => {
-                self.stats.rejected.inc(Rejection::Timeout);
-                return Err(Unanswered("request body not received in time"));
-            }
-            Err(BodyError::Failed) => return Err(Unanswered("request body read failed")),
-        };
         let Ok(permit) = self.in_flight.clone().try_acquire_owned() else {
             self.stats.rejected.inc(Rejection::InFlight);
-            return Ok(Answered::router(
-                busy(Busy::InFlight(self.cfg.max_in_flight)),
-                0,
-            ));
+            return Answered::router(busy(Busy::InFlight(self.cfg.max_in_flight)), 0);
         };
         self.stats.enter();
         let mut permit = Some(RequestPermit {
@@ -519,7 +566,7 @@ impl ChainApiCtx {
         });
         let call = Call::new(parts.method, &target, &parts.headers, body);
         let deadline = Instant::now() + Duration::from_millis(self.cfg.request_deadline_ms);
-        Ok(match route {
+        match route {
             Route::Block(ep) => self.block(ep, &call, deadline, &mut permit).await,
             Route::Info => self.info(&call, deadline, &mut permit).await,
             Route::State => {
@@ -530,26 +577,32 @@ impl ChainApiCtx {
                 self.state(&call, &call.target, Policy::Exec, deadline, &mut permit)
                     .await
             }
-            Route::Push => self.push(&call, &mut permit).await,
+            Route::Push => self.push(&call, deadline, &mut permit).await,
             _ => Answered::router(router_error(RouterError::NotFound), 0),
-        })
+        }
     }
 
-    /// The whole body, within `max_body_bytes` and the read timeout.
-    async fn read_body(&self, mut body: Incoming) -> Result<Bytes, BodyError> {
+    /// The whole body, within `max_body_bytes` and the read timeout. Without
+    /// `keep` it is read and dropped: the router answers such a request
+    /// itself.
+    async fn read_body(&self, mut body: Incoming, keep: bool) -> Result<Bytes, BodyError> {
         let max = self.cfg.max_body_bytes;
         if body.size_hint().exact().is_some_and(|len| len > max as u64) {
             return Err(BodyError::TooLarge);
         }
         let read = async {
             let mut buf = BytesMut::new();
+            let mut len = 0usize;
             while let Some(frame) = body.frame().await {
                 let frame = frame.map_err(|_| BodyError::Failed)?;
                 if let Ok(data) = frame.into_data() {
-                    if buf.len() + data.len() > max {
+                    len += data.len();
+                    if len > max {
                         return Err(BodyError::TooLarge);
                     }
-                    buf.extend_from_slice(&data);
+                    if keep {
+                        buf.extend_from_slice(&data);
+                    }
                 }
             }
             Ok(buf.freeze())
@@ -608,7 +661,12 @@ impl ChainApiCtx {
                     .block_request(BlockRegion::Unhinted, answer_role(answered.role));
                 answered
             }
-            BlockPlan::Routed { n, region, order } => {
+            BlockPlan::Routed {
+                n,
+                region,
+                order,
+                claimed,
+            } => {
                 drop(views);
                 let answered = if order.is_empty() {
                     Answered::router(busy(Busy::NoUpstream), 0)
@@ -616,7 +674,7 @@ impl ChainApiCtx {
                     self.attempts(
                         call,
                         &order,
-                        Policy::Block(region),
+                        Policy::Block { region, claimed },
                         Busy::NoUpstream,
                         deadline,
                         permit,
@@ -748,6 +806,9 @@ impl ChainApiCtx {
                 continue;
             };
             let remaining = deadline.saturating_duration_since(Instant::now());
+            // The deadline leaves this attempt less than its own timeout: a
+            // timeout is then the request's, not the upstream's.
+            let cut_short = remaining < head_timeout;
             let attempt = self.client.send(request, head_timeout.min(remaining)).await;
             let response = match attempt {
                 Attempt::Response(response) => response,
@@ -766,31 +827,42 @@ impl ChainApiCtx {
                     lost_after_send = true;
                     break;
                 }
+                Attempt::ConnectTimeout | Attempt::Timeout if cut_short => {
+                    // The deadline passed: no attempt is left, and the API
+                    // is not taken down for it.
+                    slot.results.inc(UpstreamResult::Timeout);
+                    break;
+                }
                 Attempt::Lost => {
                     self.transport_failed(&slot, Answer::Connect, UpstreamResult::Connect);
                     continue;
                 }
-                Attempt::Timeout => {
+                Attempt::ConnectTimeout | Attempt::Timeout => {
                     self.transport_failed(&slot, Answer::Timeout, UpstreamResult::Timeout);
                     continue;
                 }
             };
             let status = response.status().as_u16();
-            let region = match policy {
-                Policy::Block(region) => region,
-                Policy::State | Policy::Info | Policy::Exec => Region::Reversible,
+            let (region, claimed) = match policy {
+                Policy::Block { region, claimed } => (region, claimed),
+                Policy::State | Policy::Info | Policy::Exec => (Region::Reversible, false),
             };
             let more = order.iter().any(|i| !tried.contains(i));
             // get_info fails over on any 5xx while another node may answer.
             if policy == Policy::Info && status >= 500 && more {
                 slot.results.inc(result_of(status, None));
-                self.moved_on(&slot, RetryReason::Busy, status == 503);
+                let reason = if status == 503 {
+                    RetryReason::Busy
+                } else {
+                    RetryReason::Error
+                };
+                self.moved_on(&slot, reason, reason.marks_busy());
                 continue;
             }
             if policy == Policy::Exec {
                 slot.results.inc(result_of(status, None));
                 return self.answered(
-                    streamed(response, self.hold(permit, Some(guard))),
+                    streamed(response, self.hold(permit, Some(guard)), head_timeout),
                     &slot,
                     tried.len(),
                 );
@@ -801,7 +873,7 @@ impl ChainApiCtx {
                     Outcome::Final => {
                         slot.results.inc(result_of(status, None));
                         return self.answered(
-                            streamed(response, self.hold(permit, Some(guard))),
+                            streamed(response, self.hold(permit, Some(guard)), head_timeout),
                             &slot,
                             tried.len(),
                         );
@@ -822,7 +894,7 @@ impl ChainApiCtx {
                     // Larger than anything worth classifying: final.
                     slot.results.inc(result_of(status, None));
                     let mut out = Response::new(upstream::Held::body(
-                        Replay::body(prefix, rest),
+                        StallGuard::body(Replay::body(prefix, rest), head_timeout),
                         self.hold(permit, Some(guard)),
                     ));
                     *out.status_mut() = parts.status;
@@ -863,7 +935,7 @@ impl ChainApiCtx {
                 Outcome::Next { reason, keep } => {
                     slot.results.inc(result_of(status, Some(reason)));
                     self.moved_on(&slot, reason, false);
-                    if keep {
+                    if keep && keeps(reason, claimed) {
                         kept.push((slot.role, buffered));
                     }
                 }
@@ -935,10 +1007,16 @@ impl ChainApiCtx {
         }
     }
 
-    /// A push: written once, to the first reachable target. A connection
-    /// that cannot be made moves on to the next target; a failure after the
-    /// push was written is answered Busy and never resent.
-    async fn push(&self, call: &Call, permit: &mut Option<RequestPermit>) -> Answered {
+    /// A push: written once, to the first reachable target, within the
+    /// request's deadline. A connection that cannot be made moves on to the
+    /// next target; a failure after the push was written is answered Busy
+    /// and never resent.
+    async fn push(
+        &self,
+        call: &Call,
+        deadline: Instant,
+        permit: &mut Option<RequestPermit>,
+    ) -> Answered {
         let snaps = self.snapshot();
         let views: Vec<ApiView<'_>> = snaps.iter().map(Snapshot::view).collect();
         let primary = self.primary(&views);
@@ -948,15 +1026,16 @@ impl ChainApiCtx {
         let head_timeout = Duration::from_millis(self.cfg.upstream_timeout_ms);
         let mut tries = 0;
         for index in targets {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
             let Some(slot) = self.directory.slot(index) else {
                 continue;
             };
             let guard = match slot.try_acquire() {
                 Some(guard) => guard,
-                None => match slot
-                    .acquire_until(tokio::time::Instant::now() + queue)
-                    .await
-                {
+                None => match slot.acquire_until((now + queue).min(deadline).into()).await {
                     Some(guard) => guard,
                     None => continue,
                 },
@@ -965,7 +1044,9 @@ impl ChainApiCtx {
                 continue;
             };
             tries += 1;
-            match self.client.send(request, head_timeout).await {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let cut_short = remaining < head_timeout;
+            match self.client.send(request, head_timeout.min(remaining)).await {
                 Attempt::Response(response) => {
                     let status = response.status().as_u16();
                     slot.results.inc(result_of(status, None));
@@ -975,13 +1056,21 @@ impl ChainApiCtx {
                         PushResult::Error
                     });
                     return self.answered(
-                        streamed(response, self.hold(permit, Some(guard))),
+                        streamed(response, self.hold(permit, Some(guard)), head_timeout),
                         slot,
                         tries,
                     );
                 }
                 Attempt::Connect => {
                     self.transport_failed(slot, Answer::Connect, UpstreamResult::Connect);
+                }
+                // Nothing was written, and the deadline passed.
+                Attempt::ConnectTimeout if cut_short => {
+                    slot.results.inc(UpstreamResult::Timeout);
+                    break;
+                }
+                Attempt::ConnectTimeout => {
+                    self.transport_failed(slot, Answer::Timeout, UpstreamResult::Timeout);
                 }
                 Attempt::Lost | Attempt::Timeout => {
                     slot.results.inc(UpstreamResult::Connect);

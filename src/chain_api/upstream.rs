@@ -3,8 +3,9 @@
 //! bodies that carry an upstream answer to the client.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -16,10 +17,10 @@ use hyper::header::{
     HOST, TE, TRAILER, TRANSFER_ENCODING, UPGRADE, USER_AGENT,
 };
 use hyper::{Method, Request, Response};
-use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::connect::{capture_connection, HttpConnector};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout, Sleep};
 
 use super::directory::{ApiSlot, SlotGuard};
 use super::RequestPermit;
@@ -29,8 +30,11 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// The body of every chain API answer.
 pub type ApiBody = UnsyncBoxBody<Bytes, BoxError>;
 
-/// How long an idle pooled upstream connection is kept.
-const POOL_IDLE: Duration = Duration::from_secs(30);
+/// How long an idle pooled upstream connection is kept. Below the 10 s a
+/// frozen range server (like hyper's own servers) keeps an idle connection
+/// open, so the router never writes a request into a connection the
+/// upstream is closing at that moment, which would look like a lost one.
+const POOL_IDLE: Duration = Duration::from_secs(5);
 
 /// Request headers copied to the upstream. Everything else, `Expect`,
 /// `Accept-Encoding` and hop-by-hop headers included, is dropped; the
@@ -104,9 +108,13 @@ pub enum Attempt {
     Response(Response<Incoming>),
     /// The connection could not be made: nothing was written.
     Connect,
+    /// The head timeout ran out while the connection was still being made
+    /// (DNS or TCP connect): nothing was written.
+    ConnectTimeout,
     /// The connection failed after the request may have been written.
     Lost,
-    /// No response head in time.
+    /// No response head in time, on a connection the request may have been
+    /// written to.
     Timeout,
 }
 
@@ -118,7 +126,7 @@ pub struct UpstreamClient {
 
 impl UpstreamClient {
     /// `connect_timeout` bounds each TCP connect; at most `max_idle` idle
-    /// connections are kept per upstream, for 30 s.
+    /// connections are kept per upstream, for [`POOL_IDLE`].
     pub fn new(connect_timeout: Duration, max_idle: usize) -> UpstreamClient {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(connect_timeout));
@@ -135,8 +143,16 @@ impl UpstreamClient {
     /// Send `request`; the response head must arrive within `head_timeout`.
     /// hyper-util retries on a new connection only a request it never
     /// wrote (a pooled connection that turned out closed).
-    pub async fn send(&self, request: Request<Full<Bytes>>, head_timeout: Duration) -> Attempt {
+    ///
+    /// `head_timeout` also covers getting a connection (DNS and the TCP
+    /// connect run inside the request). When it runs out before the request
+    /// had a connection, nothing was written: that is
+    /// [`Attempt::ConnectTimeout`], so a push or an exec call still moves on
+    /// to its next target.
+    pub async fn send(&self, mut request: Request<Full<Bytes>>, head_timeout: Duration) -> Attempt {
+        let connection = capture_connection(&mut request);
         match timeout(head_timeout, self.client.request(request)).await {
+            Err(_) if connection.connection_metadata().is_none() => Attempt::ConnectTimeout,
             Err(_) => Attempt::Timeout,
             Ok(Ok(response)) => Attempt::Response(response),
             Ok(Err(e)) if e.is_connect() => Attempt::Connect,
@@ -187,14 +203,90 @@ pub fn relay_headers(upstream: &HeaderMap) -> HeaderMap {
     out
 }
 
-/// An upstream answer streamed to the client.
-pub fn streamed(response: Response<Incoming>, hold: Hold) -> Response<ApiBody> {
+/// An upstream answer streamed to the client. It ends with an error, which
+/// closes the client connection, when the upstream sends nothing for
+/// `stall` while the client waits for more ([`StallGuard`]).
+pub fn streamed(response: Response<Incoming>, hold: Hold, stall: Duration) -> Response<ApiBody> {
     let (parts, body) = response.into_parts();
-    let body = Held::body(body.map_err(BoxError::from).boxed_unsync(), hold);
-    let mut out = Response::new(body);
+    let body = StallGuard::body(body.map_err(BoxError::from).boxed_unsync(), stall);
+    let mut out = Response::new(Held::body(body, hold));
     *out.status_mut() = parts.status;
     *out.headers_mut() = relay_headers(&parts.headers);
     out
+}
+
+/// Why an upstream answer was cut off: the upstream sent its head and then
+/// stopped sending.
+#[derive(Debug)]
+pub struct UpstreamStalled;
+
+impl std::fmt::Display for UpstreamStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the upstream stopped sending its answer")
+    }
+}
+
+impl std::error::Error for UpstreamStalled {}
+
+/// A body that fails with [`UpstreamStalled`] once a poll has waited
+/// `stall` for its next frame. The timer runs only while the listener waits
+/// for the upstream: a client that reads slowly keeps hyper from asking for
+/// more, which never counts against the upstream.
+pub struct StallGuard {
+    inner: ApiBody,
+    stall: Duration,
+    timer: Option<Pin<Box<Sleep>>>,
+    /// A poll found no frame and `timer` runs.
+    waiting: bool,
+}
+
+impl StallGuard {
+    pub fn body(inner: ApiBody, stall: Duration) -> ApiBody {
+        StallGuard {
+            inner,
+            stall,
+            timer: None,
+            waiting: false,
+        }
+        .boxed_unsync()
+    }
+}
+
+impl Body for StallGuard {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        if polled.is_ready() {
+            this.waiting = false;
+            return polled;
+        }
+        let stall = this.stall;
+        let timer = this.timer.get_or_insert_with(|| Box::pin(sleep(stall)));
+        if !this.waiting {
+            this.waiting = true;
+            timer.as_mut().reset(tokio::time::Instant::now() + stall);
+        }
+        ready!(timer.as_mut().poll(cx));
+        tracing::debug!(
+            stall_ms = u64::try_from(stall.as_millis()).unwrap_or(u64::MAX),
+            "chain API upstream stopped sending its answer; closing the client connection"
+        );
+        Poll::Ready(Some(Err(UpstreamStalled.into())))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 /// What [`peek`] read of a body.
@@ -325,6 +417,64 @@ pub fn full(bytes: impl Into<Bytes>) -> ApiBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A body whose frames arrive when the test sends them.
+    struct Fed(tokio::sync::mpsc::Receiver<Bytes>);
+
+    impl Body for Fed {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+            self.0
+                .poll_recv(cx)
+                .map(|chunk| chunk.map(|bytes| Ok(Frame::data(bytes))))
+        }
+    }
+
+    async fn next(body: &mut ApiBody) -> Result<Bytes, BoxError> {
+        let frame = body.frame().await.expect("a frame")?;
+        Ok(frame.into_data().expect("data"))
+    }
+
+    // Only the upstream's own silence ends an answer: time the listener
+    // spends not asking (a slow client) never counts, nor does a frame that
+    // waits to be read.
+    #[tokio::test]
+    async fn an_upstream_body_that_stops_sending_fails_after_the_stall_time() {
+        let stall = Duration::from_millis(200);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut body = StallGuard::body(Fed(rx).boxed_unsync(), stall);
+        tx.send(Bytes::from_static(b"a")).await.unwrap();
+        tokio::time::sleep(stall * 2).await;
+        assert_eq!(next(&mut body).await.unwrap(), "a");
+        // A poll that waits, then a long pause while a frame arrives.
+        assert!(timeout(Duration::from_millis(50), next(&mut body))
+            .await
+            .is_err());
+        tx.send(Bytes::from_static(b"b")).await.unwrap();
+        tokio::time::sleep(stall * 2).await;
+        assert_eq!(next(&mut body).await.unwrap(), "b");
+        // Frames within the stall time keep it going.
+        let feeder = tokio::spawn(async move {
+            for chunk in [&b"c"[..], b"d"] {
+                tokio::time::sleep(stall / 2).await;
+                tx.send(Bytes::from_static(chunk)).await.unwrap();
+            }
+            tx
+        });
+        assert_eq!(next(&mut body).await.unwrap(), "c");
+        assert_eq!(next(&mut body).await.unwrap(), "d");
+        let _tx = feeder.await.unwrap();
+        // Then nothing: an error after the stall time.
+        let started = tokio::time::Instant::now();
+        let err = next(&mut body).await.unwrap_err();
+        assert!(err.is::<UpstreamStalled>(), "{err}");
+        assert!(started.elapsed() >= stall - Duration::from_millis(20));
+    }
 
     #[test]
     fn only_end_to_end_headers_are_relayed() {

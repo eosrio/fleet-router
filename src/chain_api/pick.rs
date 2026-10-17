@@ -58,6 +58,8 @@ pub struct ApiView<'a> {
     pub busy: bool,
     /// Requests in flight to this API.
     pub in_flight: usize,
+    /// Every slot of this API is taken.
+    pub full: bool,
     /// The paths the API advertises. `None` is unknown: a live API is
     /// assumed to serve every path, a frozen one none.
     pub apis: Option<&'a BTreeSet<String>>,
@@ -97,12 +99,17 @@ impl ApiView<'_> {
         self.role == Role::Frozen && self.verified && self.blocks.is_some_and(|r| r.contains(n))
     }
 
-    /// A frozen API that answers for `n` by configuration or by
-    /// verification: its declared range or its verified blocks hold `n`. Up
-    /// or not, busy or not.
+    /// A frozen API that answers for `n`, up or not, busy or not. Once
+    /// verified, its `blocks` are its exact coverage; until then, its
+    /// declared range is.
     fn claims(&self, n: u32) -> bool {
-        self.role == Role::Frozen
-            && (self.declared.is_some_and(|r| r.contains(n)) || self.archives(n))
+        if self.role != Role::Frozen {
+            return false;
+        }
+        match (self.verified, self.blocks) {
+            (true, Some(blocks)) => blocks.contains(n),
+            _ => self.declared.is_some_and(|r| r.contains(n)),
+        }
     }
 }
 
@@ -116,13 +123,16 @@ fn by_load(a: &ApiView<'_>, b: &ApiView<'_>) -> Ordering {
         .then(wb.cmp(&wa))
 }
 
-/// Order inside a candidate tier: priority, weighted load, then rendezvous
-/// on the block's chunk (highest first), then index.
+/// Order inside a candidate tier: free before full (a full candidate is
+/// skipped anyway, and must not take one of the `max_attempts` places from a
+/// free one), priority, weighted load, then rendezvous on the block's chunk
+/// (highest first), then index.
 fn tier_cmp(n: u32) -> impl Fn(&&ApiView<'_>, &&ApiView<'_>) -> Ordering {
     let chunk = u64::from(n >> RENDEZVOUS_CHUNK_SHIFT);
     move |a, b| {
-        a.priority
-            .cmp(&b.priority)
+        a.full
+            .cmp(&b.full)
+            .then(a.priority.cmp(&b.priority))
             .then_with(|| by_load(a, b))
             .then_with(|| rendezvous(chunk, b.endpoint).cmp(&rendezvous(chunk, a.endpoint)))
             .then(a.index.cmp(&b.index))
@@ -187,10 +197,14 @@ pub enum BlockPlan {
     Unhinted,
     /// Attempt order, as [`ApiView::index`] values, at most `max_attempts`
     /// long. Empty when no API is a candidate: the client gets Busy.
+    /// `claimed`: an irreversible block a frozen range server claims for
+    /// this endpoint ([`claimed`]), so no Unknown Block is the answer
+    /// ([`keeps`]).
     Routed {
         n: u32,
         region: Region,
         order: Vec<usize>,
+        claimed: bool,
     },
 }
 
@@ -201,11 +215,30 @@ pub fn plan_block(q: &BlockQuery, apis: &[ApiView<'_>]) -> BlockPlan {
     };
     let cap = usize::try_from(q.max_attempts.max(1)).unwrap_or(usize::MAX);
     let region = region(n, fleet_lib(q.ship_lib, apis), apis);
-    let order = match region {
-        Region::Reversible => reversible_order(n, q.endpoint.path(), apis, cap),
-        Region::Irreversible => irreversible_order(n, q, apis, cap),
+    let (order, claimed) = match region {
+        Region::Reversible => (reversible_order(n, q.endpoint.path(), apis, cap), false),
+        Region::Irreversible => {
+            let claimed = claimed(n, q.endpoint, apis);
+            (irreversible_order(n, q, claimed, apis, cap), claimed)
+        }
     };
-    BlockPlan::Routed { n, region, order }
+    BlockPlan::Routed {
+        n,
+        region,
+        order,
+        claimed,
+    }
+}
+
+/// Whether a frozen range server claims block `n` for `endpoint`: an
+/// endpoint archives serve, and an archive that answers for `n`
+/// ([`ApiView::claims`]). The block then exists, so an Unknown Block from a
+/// node whose log begins above it must not become the answer.
+pub fn claimed(n: u32, endpoint: BlockEndpoint, apis: &[ApiView<'_>]) -> bool {
+    matches!(
+        endpoint,
+        BlockEndpoint::BlockInfo | BlockEndpoint::BlockHeader | BlockEndpoint::RawBlock
+    ) && apis.iter().any(|a| a.claims(n))
 }
 
 /// Up live APIs serving `path`: those whose head reached `n` first, by
@@ -240,19 +273,24 @@ fn reversible_order(n: u32, path: &str, apis: &[ApiView<'_>], cap: usize) -> Vec
 ///
 /// - F: verified frozen APIs whose blocks hold `n`.
 /// - L: live APIs whose block log holds `n` (`earliest <= n <= head`).
-/// - U: live APIs that do not report `earliest`.
+/// - U: live APIs that do not report `earliest`, with `n <= head`.
 /// - X: live APIs whose block log begins above `n`. They answer a genuine
 ///   Unknown Block.
 ///
 /// `frozen_first` tries F, L, U, X; `live_first` L, F, U, X. `get_block`
 /// (decoded action data) is served by live nodes only: L, U, X.
 ///
-/// For the endpoints a frozen range server serves, X is dropped when a
-/// frozen API claims `n` ([`ApiView::claims`]): the block exists, so an
-/// Unknown Block from a node whose log begins above it must not become the
-/// answer. When the archives cannot answer, the client gets Busy and
+/// X is dropped when the block is `claimed` ([`claimed`]): the block exists,
+/// so an Unknown Block from a node whose log begins above it must not become
+/// the answer. When the archives cannot answer, the client gets Busy and
 /// retries.
-fn irreversible_order(n: u32, q: &BlockQuery, apis: &[ApiView<'_>], cap: usize) -> Vec<usize> {
+fn irreversible_order(
+    n: u32,
+    q: &BlockQuery,
+    claimed: bool,
+    apis: &[ApiView<'_>],
+    cap: usize,
+) -> Vec<usize> {
     let path = q.endpoint.path();
     let live = |pred: &dyn Fn(&ApiView<'_>) -> bool| -> Vec<&ApiView<'_>> {
         let mut tier: Vec<&ApiView<'_>> = apis
@@ -262,13 +300,10 @@ fn irreversible_order(n: u32, q: &BlockQuery, apis: &[ApiView<'_>], cap: usize) 
         tier.sort_by(tier_cmp(n));
         tier
     };
-    let archived = matches!(
-        q.endpoint,
-        BlockEndpoint::BlockInfo | BlockEndpoint::BlockHeader | BlockEndpoint::RawBlock
-    ) && apis.iter().any(|a| a.claims(n));
-    let l = live(&|a| a.earliest.is_some_and(|e| e <= n) && a.head.is_some_and(|h| n <= h));
-    let u = live(&|a| a.earliest.is_none());
-    let x = if archived {
+    let reached = |a: &ApiView<'_>| a.head.is_some_and(|h| n <= h);
+    let l = live(&|a| a.earliest.is_some_and(|e| e <= n) && reached(a));
+    let u = live(&|a| a.earliest.is_none() && reached(a));
+    let x = if claimed {
         Vec::new()
     } else {
         live(&|a| a.earliest.is_some_and(|e| e > n))
@@ -477,6 +512,8 @@ pub enum RetryReason {
     Connect,
     /// No response head within `upstream_timeout_ms`.
     Timeout,
+    /// A 5xx other than 503 (`get_info` only).
+    Error,
 }
 
 impl MetricLabel for RetryReason {
@@ -486,6 +523,7 @@ impl MetricLabel for RetryReason {
         RetryReason::Busy,
         RetryReason::Connect,
         RetryReason::Timeout,
+        RetryReason::Error,
     ];
 
     fn as_str(self) -> &'static str {
@@ -495,6 +533,7 @@ impl MetricLabel for RetryReason {
             RetryReason::Busy => "busy",
             RetryReason::Connect => "connect",
             RetryReason::Timeout => "timeout",
+            RetryReason::Error => "error",
         }
     }
 
@@ -591,6 +630,13 @@ fn is_unknown_block(body: &[u8]) -> bool {
     serde_json::from_slice::<ErrorBody>(body).is_ok_and(|b| b.error.code == UNKNOWN_BLOCK_CODE)
 }
 
+/// Whether an answer [`classify`] keeps may still become the final answer.
+/// For a `claimed` block an Unknown Block may not: the block exists, so
+/// when no attempt serves it the client gets Busy and retries.
+pub fn keeps(reason: RetryReason, claimed: bool) -> bool {
+    !(claimed && reason == RetryReason::UnknownBlock)
+}
+
 /// The answer once every attempt is used: the last kept answer from a live
 /// API, else the last kept answer. `None` (nothing kept) means Busy.
 pub fn exhausted<T>(kept: &[(Role, T)]) -> Option<&T> {
@@ -648,6 +694,7 @@ mod tests {
             up: true,
             busy: false,
             in_flight: 0,
+            full: false,
             apis: None,
             head: None,
             lib: None,
@@ -907,6 +954,126 @@ mod tests {
         for ep in [BlockEndpoint::Block, BlockEndpoint::BlockHeaderState] {
             assert_eq!(order(&q(ep, 500), &[frozen(0, 1, 1001), x]).1, vec![6]);
         }
+    }
+
+    // A node that does not report `earliest` (tier U) is a candidate only
+    // up to its head, like an L node: above it, it cannot hold the block.
+    #[test]
+    fn a_u_node_is_no_candidate_above_its_head() {
+        let l = live(4, Some(1), 990, 1000);
+        let lagging = live(5, None, 490, 500);
+        let q = BlockQuery {
+            max_attempts: 8,
+            ..raw(800)
+        };
+        assert_eq!(order(&q, &[l, lagging]), (Region::Irreversible, vec![4]));
+        // At or below its head it stays a candidate.
+        assert_eq!(order(&raw(500), &[l, lagging]).1, vec![4, 5]);
+        // Its head is known only through probes and SHiP; unknown, it is no
+        // candidate either.
+        let headless = ApiView {
+            head: None,
+            ..lagging
+        };
+        assert_eq!(order(&raw(500), &[l, headless]).1, vec![4]);
+    }
+
+    // A block a frozen range server claims never ends on an Unknown Block,
+    // whoever wrote it: the block exists. Busy instead, and the client
+    // retries.
+    #[test]
+    fn a_claimed_block_never_ends_on_an_unknown_block() {
+        let archive = frozen(0, 1, 1001);
+        let u = live(5, None, 5000, 6000);
+        let claimed_of = |q: &BlockQuery, apis: &[ApiView<'_>]| match plan_block(q, apis) {
+            BlockPlan::Routed { claimed, .. } => claimed,
+            BlockPlan::Unhinted => panic!("unhinted"),
+        };
+        for ep in [
+            BlockEndpoint::RawBlock,
+            BlockEndpoint::BlockHeader,
+            BlockEndpoint::BlockInfo,
+        ] {
+            assert!(claimed_of(&query(ep, 500), &[archive, u]), "{ep:?}");
+            // Above the archive's blocks, or without an archive: unclaimed.
+            assert!(!claimed_of(&query(ep, 1500), &[archive, u]), "{ep:?}");
+            assert!(!claimed_of(&query(ep, 500), &[u]), "{ep:?}");
+        }
+        // Live-only endpoints are never claimed.
+        for ep in [BlockEndpoint::Block, BlockEndpoint::BlockHeaderState] {
+            assert!(!claimed_of(&query(ep, 500), &[archive, u]), "{ep:?}");
+        }
+        // A reversible block is never claimed.
+        let q = BlockQuery {
+            ship_lib: Some(5990),
+            ..raw(5995)
+        };
+        assert!(!claimed_of(&q, &[archive, u]));
+
+        assert!(!keeps(RetryReason::UnknownBlock, true));
+        assert!(keeps(RetryReason::UnknownBlock, false));
+        assert!(keeps(RetryReason::NotFound, true));
+    }
+
+    // Once an archive is verified, its `blocks` are its exact claim: a
+    // block below them is no archive's, so a node whose log begins above it
+    // answers (its genuine Unknown Block) instead of Busy forever.
+    #[test]
+    fn a_verified_archive_claims_its_blocks_not_its_declared_range() {
+        let pruned = ApiView {
+            blocks: Some(Range {
+                begin: 500,
+                end: 1001,
+            }),
+            declared: Some(Range {
+                begin: 2,
+                end: 1001,
+            }),
+            ..frozen(0, 500, 1001)
+        };
+        let x = live(6, Some(3000), 5000, 6000);
+        assert_eq!(
+            order(&raw(100), &[pruned, x]),
+            (Region::Irreversible, vec![6])
+        );
+        assert_eq!(order(&raw(600), &[pruned, x]).1, vec![0]);
+        // Not verified yet: the declared range is the claim.
+        let unverified = ApiView {
+            verified: false,
+            ..pruned
+        };
+        assert!(order(&raw(100), &[unverified, x]).1.is_empty());
+    }
+
+    // A full candidate never takes one of the max_attempts places from a
+    // free one: here the reserved live place would otherwise push out the
+    // only replica with free slots.
+    #[test]
+    fn full_candidates_never_take_a_place_from_a_free_one() {
+        let full = |index| ApiView {
+            in_flight: 4,
+            full: true,
+            ..frozen(index, 1, 1001)
+        };
+        let free = ApiView {
+            in_flight: 5,
+            ..frozen(2, 1, 1001)
+        };
+        let l = live(4, Some(1), 5000, 6000);
+        let o = order(&raw(500), &[full(0), full(1), free, l]).1;
+        assert_eq!(o.len(), 3);
+        assert_eq!(o[0], 2, "the free replica first");
+        assert_eq!(o[2], 4, "the live place");
+        // Before priority too: a full primary is skipped at run time anyway.
+        let primary = ApiView {
+            priority: 0,
+            ..full(0)
+        };
+        let backup = ApiView {
+            priority: 1,
+            ..free
+        };
+        assert_eq!(order(&raw(500), &[primary, backup]).1, vec![2, 0]);
     }
 
     // CU4: get_block
@@ -1179,7 +1346,8 @@ mod tests {
             BlockPlan::Routed {
                 n: 5,
                 region: Region::Reversible,
-                order: vec![]
+                order: vec![],
+                claimed: false,
             }
         );
     }
@@ -1393,6 +1561,8 @@ mod tests {
         assert!(!RetryReason::Busy.marks_down());
         assert!(RetryReason::Busy.marks_busy());
         assert!(!RetryReason::UnknownBlock.marks_busy());
+        assert!(!RetryReason::Error.marks_busy() && !RetryReason::Error.marks_down());
+        assert_eq!(RetryReason::Error.as_str(), "error");
         assert_eq!(BUSY_TTL, Duration::from_secs(2));
         assert_eq!(RetryReason::UnknownBlock.as_str(), "unknown_block");
         for (i, reason) in RetryReason::ALL.iter().enumerate() {

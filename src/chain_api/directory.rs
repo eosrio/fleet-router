@@ -302,6 +302,7 @@ pub struct Snapshot {
     pub up: bool,
     pub busy: bool,
     pub in_flight: usize,
+    pub full: bool,
     pub apis: Option<Arc<BTreeSet<String>>>,
     pub head: Option<u32>,
     pub lib: Option<u32>,
@@ -322,6 +323,7 @@ impl Snapshot {
             up: self.up,
             busy: self.busy,
             in_flight: self.in_flight,
+            full: self.full,
             apis: self.apis.as_deref(),
             head: self.head,
             lib: self.lib,
@@ -375,14 +377,19 @@ impl ApiDirectory {
     /// Every API as a request sees it now. A live API's head is the highest
     /// of its probed head and the head its SHiP endpoint reported or
     /// streamed, so a block a client got over SHiP is routable at once.
+    ///
+    /// The control API's changes to the server apply here as they do to
+    /// SHiP sessions: the priority and weight in effect, and a server an
+    /// operator disabled or drained is not used.
     pub fn snapshot(&self, hub: &FleetHub, now: Instant) -> Vec<Snapshot> {
         let view = hub.view();
         self.slots
             .iter()
             .map(|slot| {
+                let upstream = view.up(slot.index);
                 let state = slot.state();
                 let ship_head = || {
-                    let reported = view.up(slot.index).and_then(|u| u.head).map(|p| p.num);
+                    let reported = upstream.and_then(|u| u.head).map(|p| p.num);
                     let streamed = hub
                         .tips
                         .get(slot.index)
@@ -394,15 +401,17 @@ impl ApiDirectory {
                     Role::Live => state.head.max(ship_head()),
                     Role::Frozen => None,
                 };
+                let disabled = upstream.is_some_and(|u| u.operator_disabled);
                 Snapshot {
                     index: slot.index,
                     endpoint: slot.endpoint.clone(),
                     role: slot.role,
-                    priority: slot.priority,
-                    weight: slot.weight,
-                    up: state.up && !state.chain_mismatch,
+                    priority: upstream.map_or(slot.priority, |u| u.priority),
+                    weight: upstream.map_or(slot.weight, |u| u.weight.max(1)),
+                    up: state.up && !state.chain_mismatch && !disabled,
                     busy: state.busy_until.is_some_and(|until| now < until),
                     in_flight: slot.in_flight(),
+                    full: slot.is_full(),
                     apis: state.apis.clone(),
                     head,
                     lib: state.lib,

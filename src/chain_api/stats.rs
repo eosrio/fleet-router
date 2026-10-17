@@ -63,7 +63,8 @@ pub enum Rejection {
     InFlight,
     /// A body over `max_body_bytes`, answered 413.
     BodyTooLarge,
-    /// A body that did not arrive in time; the connection was closed.
+    /// A body that did not arrive in time, or a client that took none of
+    /// its answer for the read timeout; the connection was closed.
     Timeout,
 }
 

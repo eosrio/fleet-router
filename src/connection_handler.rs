@@ -643,6 +643,8 @@ pub async fn handle_client(
         let mut operator_move = false;
         // Liveness of the current upstream socket.
         let mut last_upstream_frame = Instant::now();
+        // Last frame other than a reply to a liveness ping, for idle_timeout_ms.
+        let mut last_data_frame = last_upstream_frame;
         let mut ping_sent = false;
         // Set when the monitor reported this upstream offline: fail over at
         // this instant unless a frame arrives first.
@@ -719,27 +721,21 @@ pub async fn handle_client(
                     }
                     continue;
                 }
-                r = async {
-                    if idle_ms > 0 {
-                        timeout(Duration::from_millis(idle_ms), sr_guard.next())
-                            .await
-                            .map_err(|_| ())
-                    } else {
-                        Ok(sr_guard.next().await)
-                    }
-                } => match r {
-                    Ok(Some(Ok(m))) => Some(m),
-                    Ok(_) => {
+                // Idle time counts from the last data frame, against a fixed
+                // deadline: replies to the router's own pings do not reset it.
+                _ = sleep_until((last_data_frame + Duration::from_millis(idle_ms)).into()), if idle_ms > 0 => {
+                    tracing::debug!("upstream idle timeout; failing over");
+                    upstream_stop = Some(UpstreamStop::Idle);
+                    break;
+                }
+                r = sr_guard.next() => match r {
+                    Some(Ok(m)) => Some(m),
+                    _ => {
                         upstream_stop = Some(if upstream_sent_close {
                             UpstreamStop::Clean
                         } else {
                             UpstreamStop::Unclean
                         });
-                        None
-                    }
-                    Err(()) => {
-                        tracing::debug!("upstream idle timeout; failing over");
-                        upstream_stop = Some(UpstreamStop::Idle);
                         None
                     }
                 }
@@ -750,10 +746,12 @@ pub async fn handle_client(
             ping_sent = false;
             probe_until = None;
 
-            // Replies to the router's own liveness pings stay here.
+            // Replies to the router's own liveness pings stay here, and do not
+            // count as upstream activity for idle_timeout_ms.
             if matches!(&msg, Message::Pong(payload) if payload.as_ref() == LIVENESS_PING) {
                 continue;
             }
+            last_data_frame = last_upstream_frame;
 
             if matches!(msg, Message::Close(_)) {
                 upstream_sent_close = true;

@@ -19,10 +19,13 @@ use tungstenite::Message;
 
 use crate::abi::accept_upstream_abi;
 use crate::functions::{
-    parse_blocks_route, select_backend_server, select_failover_server, should_reroute_for_finality,
-    RouteRequest,
+    has_alternative_for, parse_blocks_route, select_backend_server, select_failover_server,
+    should_reroute_for_finality, RouteRequest,
 };
-use crate::models::{BlockFailureQuarantine, ProxyLimits, ServerConfigDb, ServerStateDb};
+use crate::models::{
+    BlockFailureQuarantine, ProxyLimits, ServerConfigDb, ServerStateDb, UpstreamCounters,
+};
+use crate::telemetry::{self, Event, EventKind, Level};
 
 type UpstreamStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -174,6 +177,20 @@ enum FailoverAttempt {
 /// dependency on a live runtime handle.
 pub struct ConnectionGuard {
     counter: Arc<AtomicUsize>,
+    /// Cumulative counters of the same upstream, for traffic accounting.
+    counters: Arc<UpstreamCounters>,
+}
+
+impl ConnectionGuard {
+    /// Count one frame forwarded from this upstream to the client.
+    fn note_frame(&self, bytes: usize, is_block: bool) {
+        self.counters
+            .bytes_total
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+        if is_block {
+            self.counters.blocks_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Drop for ConnectionGuard {
@@ -203,6 +220,7 @@ async fn mark_offline(backend_servers: &ServerStateDb, endpoint: &str) {
 /// Record an unclean mid-`get_blocks` drop. Does not mark the upstream offline.
 async fn note_block_failure(
     backend_servers: &ServerStateDb,
+    listener: &str,
     endpoint: &str,
     block: u32,
     policy: Option<BlockFailureQuarantine>,
@@ -218,6 +236,16 @@ async fn note_block_failure(
             block,
             range,
             "upstream quarantined after repeated mid-stream block failures"
+        );
+        let last = block.saturating_add(range.saturating_sub(1));
+        telemetry::global().emit(
+            Event::new(
+                Level::Warn,
+                EventKind::UpstreamQuarantined,
+                format!("{} quarantined for blocks {block}..={last}", state.name),
+            )
+            .listener(listener)
+            .upstream(endpoint),
         );
     }
 }
@@ -281,11 +309,12 @@ async fn establish_upstream(
                 continue;
             };
             let counter = server_state.connections.clone();
+            let counters = server_state.counters.clone();
             let Some(cfg) = server_config_db.lock().await.get(&selected).cloned() else {
                 continue;
             };
             counter.fetch_add(1, Ordering::Relaxed);
-            (cfg, ConnectionGuard { counter })
+            (cfg, ConnectionGuard { counter, counters })
         };
 
         let mut config = WebSocketConfig::default();
@@ -305,6 +334,10 @@ async fn establish_upstream(
         match read_first_abi(&mut ws, limits.handshake_timeout_ms).await {
             Some(abi) => {
                 tracing::debug!(upstream = %cfg.name, "connected to upstream");
+                guard
+                    .counters
+                    .sessions_total
+                    .fetch_add(1, Ordering::Relaxed);
                 return Some((guard, ws, abi, cfg.endpoint));
             }
             None => {
@@ -337,9 +370,11 @@ fn extract_block_num(msg: &Message) -> Option<u32> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_client(
     client_stream: TcpStream,
-    _client_address: SocketAddr,
+    client_address: SocketAddr,
+    listener: Arc<str>,
     backend_servers: ServerStateDb,
     server_config_db: ServerConfigDb,
     limits: ProxyLimits,
@@ -413,6 +448,11 @@ pub async fn handle_client(
         return;
     }
 
+    // Visible to the dashboard and the control API until this function returns.
+    let registration =
+        telemetry::global().register_session(listener.clone(), client_address, &endpoint);
+    let session = registration.info.clone();
+
     let (client_writer, mut client_reader) = client_websocket.split();
     let client_writer = Arc::new(Mutex::new(client_writer));
     let current_endpoint = Arc::new(Mutex::new(endpoint));
@@ -454,6 +494,7 @@ pub async fn handle_client(
         let backend_servers = backend_servers.clone();
         let current_endpoint = current_endpoint.clone();
         let reroute_notify = reroute_notify.clone();
+        let session = session.clone();
         AbortOnDrop(spawn(async move {
             loop {
                 let next = if idle_ms > 0 {
@@ -474,6 +515,7 @@ pub async fn handle_client(
                 // this upstream's range misses and another upstream covers it.
                 if let Message::Binary(ref bin) = msg {
                     if let Some(parsed) = parse_blocks_route(bin) {
+                        session.note_request(parsed.start_block_num, parsed.fetch_finality_data);
                         *last_request.lock().await = Some(bin.to_vec());
                         let endpoint = current_endpoint.lock().await.clone();
                         let start = parsed.start_block_num;
@@ -561,6 +603,8 @@ pub async fn handle_client(
         let mut rerouted = false;
         let mut upstream_stop: Option<UpstreamStop> = None;
         let mut upstream_sent_close = false;
+        let mut operator_close = false;
+        let mut operator_move = false;
         // Kept across iterations so a permit is not lost when another branch wins.
         let reroute_fut = reroute_notify.notified();
         tokio::pin!(reroute_fut);
@@ -581,6 +625,23 @@ pub async fn handle_client(
                     }
                     _ = client_disconnect_notify.notified() => { client_down = true; break; }
                     _ = &mut reroute_fut => { rerouted = true; break; }
+                    _ = session.control.notified() => {
+                        if session.close_requested() {
+                            operator_close = true;
+                            break;
+                        }
+                        if session.take_move_request() {
+                            let current = current_endpoint.lock().await.clone();
+                            let next_block = session.next_block();
+                            if has_alternative_for(&*backend_servers.lock().await, &current, next_block) {
+                                operator_move = true;
+                                rerouted = true;
+                                break;
+                            }
+                            tracing::info!(upstream = %current, ?next_block, "operator move skipped: no other upstream can serve the next block");
+                        }
+                        continue;
+                    }
                     r = timeout(Duration::from_millis(idle_ms), sr_guard.next()) => match r {
                         Ok(Some(Ok(m))) => Some(m),
                         Ok(_) => {
@@ -609,6 +670,23 @@ pub async fn handle_client(
                     }
                     _ = client_disconnect_notify.notified() => { client_down = true; break; }
                     _ = &mut reroute_fut => { rerouted = true; break; }
+                    _ = session.control.notified() => {
+                        if session.close_requested() {
+                            operator_close = true;
+                            break;
+                        }
+                        if session.take_move_request() {
+                            let current = current_endpoint.lock().await.clone();
+                            let next_block = session.next_block();
+                            if has_alternative_for(&*backend_servers.lock().await, &current, next_block) {
+                                operator_move = true;
+                                rerouted = true;
+                                break;
+                            }
+                            tracing::info!(upstream = %current, ?next_block, "operator move skipped: no other upstream can serve the next block");
+                        }
+                        continue;
+                    }
                     r = sr_guard.next() => match r {
                         Some(Ok(m)) => Some(m),
                         _ => {
@@ -650,6 +728,10 @@ pub async fn handle_client(
                 last_seen_block = Some(b_num);
             }
 
+            let frame_len = msg.len();
+            active_conn.note_frame(frame_len, current_block.is_some());
+            session.note_frame(frame_len, current_block);
+
             if let Err(e) = cw_guard.send(msg).await {
                 tracing::warn!(error = %e, "error sending message to client");
                 client_down = true;
@@ -661,6 +743,17 @@ pub async fn handle_client(
             // `notified()` can lose its permit if another select branch wins, so
             // re-read the flag the client task sets before it notifies.
             close_for_pending_limit = pending_limit_hit.load(Ordering::Acquire);
+            break 'session;
+        }
+
+        if operator_close {
+            tracing::info!("session closed by operator");
+            let _ = cw_guard
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "closed by operator".into(),
+                })))
+                .await;
             break 'session;
         }
 
@@ -687,7 +780,14 @@ pub async fn handle_client(
         let budget = plan_same_block_failover(&mut stuck_at, upstream_stop, rerouted, next_block);
         if budget.failures > 0 {
             if let Some(block) = next_block {
-                note_block_failure(&backend_servers, &failed_endpoint, block, quarantine).await;
+                note_block_failure(
+                    &backend_servers,
+                    &listener,
+                    &failed_endpoint,
+                    block,
+                    quarantine,
+                )
+                .await;
             }
         }
         if let Some(reason) = budget.close_reason {
@@ -699,6 +799,12 @@ pub async fn handle_client(
                     "block {block} unavailable on all upstreams"
                 );
             }
+            telemetry::global().emit(
+                Event::new(Level::Error, EventKind::SessionFailed, reason.clone())
+                    .listener(&listener)
+                    .upstream(&failed_endpoint)
+                    .session(session.id),
+            );
             let _ = cw_guard
                 .send(Message::Close(Some(CloseFrame {
                     code: CloseCode::Error,
@@ -708,9 +814,23 @@ pub async fn handle_client(
             break 'session;
         }
 
-        let exclude = budget.exclude_failed.then_some(failed_endpoint.as_str());
+        let exclude = (budget.exclude_failed || operator_move).then_some(failed_endpoint.as_str());
         let retry_delay = budget.delay;
-        if rerouted {
+        let failover_reason = if operator_move {
+            "operator move"
+        } else if rerouted {
+            "reroute"
+        } else {
+            match upstream_stop {
+                Some(UpstreamStop::Unclean) => "stream dropped",
+                Some(UpstreamStop::Clean) => "upstream closed the stream",
+                Some(UpstreamStop::Idle) => "upstream idle",
+                None => "stream ended",
+            }
+        };
+        if operator_move {
+            tracing::info!(upstream = %failed_endpoint, "moving session at operator request");
+        } else if rerouted {
             tracing::info!("selecting an upstream whose finality range covers the request");
         } else if budget.failures > 0 {
             if let Some(block) = next_block {
@@ -811,6 +931,16 @@ pub async fn handle_client(
             }
             FailoverAttempt::Unavailable => {
                 tracing::error!("no upstream available after failover; closing client");
+                telemetry::global().emit(
+                    Event::new(
+                        Level::Error,
+                        EventKind::SessionFailed,
+                        "no upstream available after failover",
+                    )
+                    .listener(&listener)
+                    .upstream(&failed_endpoint)
+                    .session(session.id),
+                );
                 let _ = cw_guard
                     .send(Message::Close(Some(CloseFrame {
                         code: CloseCode::Error,
@@ -821,7 +951,27 @@ pub async fn handle_client(
             }
             FailoverAttempt::Ready(established) => *established,
         };
+        active_conn
+            .counters
+            .failovers_total
+            .fetch_add(1, Ordering::Relaxed);
         active_conn = new_conn; // drops the old guard (synchronous decrement)
+        session.note_failover();
+        session.set_upstream(&endpoint);
+        telemetry::global().emit(
+            Event::new(
+                if operator_move || rerouted {
+                    Level::Info
+                } else {
+                    Level::Warn
+                },
+                EventKind::SessionFailover,
+                format!("moved from {failed_endpoint} to {endpoint} ({failover_reason})"),
+            )
+            .listener(&listener)
+            .upstream(&endpoint)
+            .session(session.id),
+        );
         *current_endpoint.lock().await = endpoint;
 
         if let Err(e) = accept_upstream_abi(&new_abi) {
@@ -872,6 +1022,7 @@ pub async fn handle_client(
     }
 
     let _ = active_conn; // keep the guard alive for the whole session
+    drop(registration);
 }
 
 #[cfg(test)]

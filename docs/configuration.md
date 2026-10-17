@@ -11,6 +11,7 @@ All `*_ms` fields are in **milliseconds**.
 
 - [Minimal example](#minimal-example)
 - [Top-level fields](#top-level-fields)
+  - [Dashboard](#dashboard)
 - [Upstream servers](#upstream-servers)
   - [Upstream preference](#upstream-preference)
 - [Upstream TLS (`wss://`)](#upstream-tls-wss)
@@ -86,6 +87,27 @@ A status that omits `chain_id` stays online unless `require_chain_id` is set. On
 
 - **`metrics_address`** *(string, optional, defaults to `listen_address`)* — Bind address for the health/metrics HTTP endpoint.
 - **`metrics_port`** *(u16, optional, disabled when unset)* — Port for the health/metrics HTTP endpoint. Setting it enables the endpoint. See [Observability](observability.md).
+
+### Dashboard
+
+- **`dashboard`** *(object, optional, off when omitted)* — Live dashboard, status page, JSON API and control API on the `metrics_port` endpoint. See [Dashboard and control API](api.md).
+  - **`enabled`** *(bool, default `false`)* — Serve `/ui/`, `/status` and `/api/v1`. Requires `metrics_port`. While `false`, the endpoint serves only health, readiness and metrics, as before.
+  - **`control_token_file`** *(string, optional)* — Path to a file holding the control API bearer token. Surrounding whitespace is ignored.
+  - **`control_token`** *(string, optional)* — The token inline. Prefer the file or the environment variable. Set at most one of `control_token` and `control_token_file`.
+  - **`allowed_hosts`** *(array of strings, optional)* — Host names the dashboard answers to. Requests addressed by IP (`http://10.0.0.5:9090`) or `localhost` always work. Add a name here when you reach the dashboard by name, for example through a reverse proxy that keeps the original `Host` header. Requests for any other name get `403`; this blocks DNS-rebinding pages from reading the API from an operator's browser. Health, readiness and `/metrics` are not affected.
+
+The control API (drain, enable/disable, live priority and weight, clear quarantine, move or close a session) is on only when a token is configured. The `FLEET_ROUTER_CONTROL_TOKEN` environment variable overrides both fields. A token must be at least 16 characters; generate one with `openssl rand -hex 32`. Without a token the dashboard is read-only.
+
+```json
+"metrics_address": "127.0.0.1",
+"metrics_port": 9090,
+"dashboard": {
+  "enabled": true,
+  "control_token_file": "/etc/fleet-router/control.token"
+}
+```
+
+Read endpoints and the dashboard need no token, and they show client IP addresses and upstream addresses. Keep `metrics_address` on a private interface or behind a reverse proxy with access control. The router logs a warning when the control API is enabled on a non-loopback address. Changes made through the control API are not written back to this file.
 
 ## Upstream servers
 

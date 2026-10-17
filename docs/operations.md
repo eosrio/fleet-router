@@ -27,6 +27,10 @@ fleet-router is written in Rust on [tokio](https://tokio.rs/) and [tokio-tungste
 
 Deploy on a trusted or internal network, and/or behind a TLS-terminating reverse proxy (nginx, Caddy, Envoy) that adds access control.
 
+The optional [dashboard](api.md) is off by default. When you enable it, it is served on `metrics_port` with no login for reading, and it shows client IP addresses. Its control actions need a bearer token. Keep `metrics_address` on a private interface (for example `127.0.0.1` behind an SSH tunnel or an authenticating reverse proxy).
+
+**Maintenance without dropping clients.** With the control API enabled, `POST /api/v1/listeners/<listener>/upstreams/<endpoint>/drain` (or the Drain button on the dashboard) stops new sessions on that upstream and moves its current sessions to other upstreams. They resume at the next block and their clients stay connected. Restart or resync the node, then enable it again.
+
 To report a vulnerability, see [SECURITY.md](../SECURITY.md).
 
 ## Run as a service

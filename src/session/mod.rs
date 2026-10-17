@@ -1493,8 +1493,17 @@ impl Session {
                 if purpose == Purpose::Failover {
                     tracing::info!(upstream = %target.name, "reconnected to upstream after failover");
                 }
-                if self.c.in_progress() {
-                    let end = self.c.req.as_ref().map_or(0, |r| r.end);
+                // Every request Spring could still answer goes to the new
+                // link, even with the cursor at its end: positions below the
+                // start, or a fork, rewind it. Only an empty request is never
+                // sent.
+                if let Some(end) = self
+                    .c
+                    .req
+                    .as_ref()
+                    .filter(|r| !request_is_empty(r))
+                    .map(|r| r.end)
+                {
                     if let Flow::Stop = self.send_request(end, purpose).await {
                         return Flow::Stop;
                     }
@@ -1873,6 +1882,44 @@ mod tests {
         (endpoint, mock.start())
     }
 
+    fn positions_request(
+        start: u32,
+        end: u32,
+        max_in_flight: u32,
+        have_positions: Vec<(u32, [u8; 32])>,
+    ) -> Message {
+        Message::binary(mock_ship::client::blocks(&mock_ship::client::BlocksReq {
+            start,
+            end,
+            max_in_flight,
+            have_positions,
+            ..Default::default()
+        }))
+    }
+
+    /// The get_blocks requests `mock` received, in order: (mock session,
+    /// start, end, position block numbers).
+    fn blocks_requests(mock: &mock_ship::MockShipHandle) -> Vec<(u32, u32, u32, Vec<u32>)> {
+        mock.requests()
+            .into_iter()
+            .filter_map(|o| match o {
+                mock_ship::Observed::Blocks {
+                    session,
+                    start,
+                    end,
+                    have_positions,
+                    ..
+                } => Some((
+                    session,
+                    start,
+                    end,
+                    have_positions.iter().map(|(n, _)| *n).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     async fn read_block_nums(client: &mut TestClient, n: usize) -> Vec<u32> {
         let mut blocks = Vec::new();
         while blocks.len() < n {
@@ -2201,5 +2248,91 @@ mod tests {
             moved.elapsed()
         );
         assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Stall), 1);
+    }
+
+    /// A request Spring answers only by rewinding to a stale position
+    /// (`end <= start`) is still sent when the old request's link has to be
+    /// replaced first.
+    #[tokio::test]
+    async fn a_positions_only_request_is_sent_on_the_replacement_link() {
+        for (start, end, stale) in [(150, 150, 145), (150, 140, 135)] {
+            let (up, mock) = start_mock(MockShipConfig::live(1, 200)).await;
+            let harness = start_session(&[&up], &[&up], 0).await;
+            let mut client = connect(&harness.url).await;
+            // Streaming at the tip with credit left: the link is not
+            // quiescent.
+            client
+                .send(blocks_request(190, 1_000_000, 100))
+                .await
+                .unwrap();
+            assert_eq!(
+                read_block_nums(&mut client, 11).await,
+                (190..=200).collect::<Vec<_>>()
+            );
+
+            client
+                .send(positions_request(start, end, 10, vec![(stale, [0xEE; 32])]))
+                .await
+                .unwrap();
+            assert_eq!(
+                read_block_nums(&mut client, 5).await,
+                (stale..stale + 5).collect::<Vec<_>>(),
+                "a Spring node rewinds to the stale position"
+            );
+            assert_eq!(mock.sessions_accepted(), 2, "the busy link was replaced");
+            assert_eq!(
+                blocks_requests(&mock).last(),
+                Some(&(2, start, end, vec![stale])),
+                "the client's request, verbatim"
+            );
+        }
+    }
+
+    /// A satisfied reversible range keeps its request across a failover, so
+    /// a later fork still re-delivers the forked blocks, as on one node. The
+    /// resumed link owes nothing, so its silence is no stall.
+    #[tokio::test]
+    async fn a_satisfied_reversible_range_is_resumed_and_follows_a_fork() {
+        // LIB 189: the whole range is reversible.
+        let (up, mock) = start_mock(MockShipConfig::live(1, 199)).await;
+        let stall = ProxyLimits {
+            stall_timeout_ms: 300,
+            ..limits(0)
+        };
+        let harness = start_session_with(&[&up], &[&up], stall).await;
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(190, 200, 100)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 10).await,
+            (190..200).collect::<Vec<_>>()
+        );
+
+        // A transparent failover while the range is satisfied.
+        mock.drop_sessions();
+        timeout(WAIT, async {
+            while blocks_requests(&mock).len() < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the replacement link gets the request");
+        assert_eq!(
+            blocks_requests(&mock).last(),
+            Some(&(2, 200, 200, (190..200).collect())),
+            "start at the cursor, with the reversible tail"
+        );
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Stall), 0);
+
+        mock.fork(195, 7);
+        assert_eq!(
+            read_block_nums(&mut client, 5).await,
+            (195..200).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            harness.hub.stats.fork_redeliveries.load(Ordering::Relaxed),
+            1,
+            "the rewind to 195 is one fork re-delivery"
+        );
     }
 }

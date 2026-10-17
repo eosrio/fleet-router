@@ -214,6 +214,11 @@ pub(super) fn quiescent(st: &LinkState, pre_credit: u32, legacy_status: bool) ->
 /// upstream cursor below its end and (live) at or below the gate a Spring
 /// node would send up to. The gate is the link's own last head (LIB for
 /// `irreversible_only`) or, failing that, the fleet's (`fleet_gate`).
+///
+/// An uncertain cursor is judged at its upper bound, where every position
+/// matched and the upstream owes the least. A resume whose start is already
+/// at its end, or past the gate, may rightly get nothing, so its silence is
+/// never a stall.
 pub(super) fn owed(
     st: &LinkState,
     credit: u32,
@@ -225,24 +230,21 @@ pub(super) fn owed(
     if credit == 0 {
         return false;
     }
-    match st.up_cursor {
-        UpCursor::Uncertain { .. } => true,
-        UpCursor::Exact(u) => {
-            if u >= req.end {
-                return false;
-            }
-            if st.role == Role::Frozen {
-                return true;
-            }
-            let own = if req.irreversible_only {
-                st.last_lib
-            } else {
-                st.last_head
-            };
-            own.is_some_and(|g| u <= g.num)
-                || fleet_gate(req.irreversible_only).is_some_and(|g| u <= g)
-        }
+    let u = match st.up_cursor {
+        UpCursor::Exact(u) | UpCursor::Uncertain { hi: u, .. } => u,
+    };
+    if u >= req.end {
+        return false;
     }
+    if st.role == Role::Frozen {
+        return true;
+    }
+    let own = if req.irreversible_only {
+        st.last_lib
+    } else {
+        st.last_head
+    };
+    own.is_some_and(|g| u <= g.num) || fleet_gate(req.irreversible_only).is_some_and(|g| u <= g)
 }
 
 /// What the router knows about the upstream a request goes to, besides its
@@ -1053,6 +1055,28 @@ mod tests {
         irr.last_head = Some(pos(500));
         irr.last_lib = Some(pos(149));
         assert!(!owed(&irr, 5, |lib| (!lib).then_some(1000)), "gated on LIB");
+    }
+
+    /// A resume with positions leaves the cursor uncertain. It owes blocks
+    /// only if it would with every position matched.
+    #[test]
+    fn an_uncertain_cursor_is_owed_only_at_its_upper_bound() {
+        // A satisfied range resumed with its reversible tail: start == end.
+        let mut st = live_state(190, 200);
+        st.up_cursor = UpCursor::Uncertain { lo: 190, hi: 200 };
+        assert!(!owed(&st, 90, |_| Some(1000)), "start at end: nothing due");
+        // A positions-only request (end <= start) on a fresh link.
+        let mut st = live_state(150, 150);
+        st.up_cursor = UpCursor::Uncertain { lo: 145, hi: 150 };
+        assert!(!owed(&st, 10, |_| Some(1000)));
+        // A resume at the tip: due once the fleet reaches its start.
+        let mut st = live_state(1001, u32::MAX);
+        st.up_cursor = UpCursor::Uncertain { lo: 991, hi: 1001 };
+        st.last_head = None;
+        assert!(!owed(&st, 10, |_| Some(1000)), "past the gate");
+        assert!(owed(&st, 10, |_| Some(1001)), "the fleet reached the start");
+        st.role = Role::Frozen;
+        assert!(owed(&st, 10, |_| None), "frozen ignores the gate");
     }
 
     fn client_with(r: BlocksRequest, delivered: &[u32], lib: u32) -> ClientSide {

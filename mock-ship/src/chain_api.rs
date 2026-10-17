@@ -22,9 +22,10 @@
 //! ([`block_answer`]).
 //!
 //! Responses carry `Content-Type: application/json`, `Content-Length`
-//! framing and title-case header names, and no `Date`. Every request is
-//! recorded ([`ApiRequest`]). [`Fault`]s inject delays, 503s, dropped
-//! connections and canned answers per target.
+//! framing and title-case header names, and no `Date`. A HEAD answer is
+//! followed by its body, as nodeos writes it. Every request is recorded
+//! ([`ApiRequest`]). [`Fault`]s inject delays, 503s, dropped connections and
+//! canned answers per target.
 //!
 //! **Block ids** are nodeos-shaped: the first four bytes hold the block
 //! number big-endian ([`block_id`]), so a router reads the same block from an
@@ -37,8 +38,10 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Full};
@@ -48,7 +51,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Notify};
 use tokio::time::{sleep, timeout};
@@ -955,9 +958,11 @@ async fn serve_connection(shared: Arc<Shared>, stream: TcpStream) {
     let epoch = shared.kill.epoch();
     let local = stream.local_addr().ok().map(|addr| addr.ip());
     let _ = stream.set_nodelay(true);
+    let head_body = HeadBody::default();
     let service = {
         let shared = shared.clone();
-        service_fn(move |request| handle(shared.clone(), local, request))
+        let head_body = head_body.clone();
+        service_fn(move |request| handle(shared.clone(), local, head_body.clone(), request))
     };
     let mut builder = http1::Builder::new();
     builder
@@ -966,16 +971,147 @@ async fn serve_connection(shared: Arc<Shared>, stream: TcpStream) {
         .auto_date_header(false)
         .title_case_headers(true)
         .keep_alive(true);
-    let connection = builder.serve_connection(TokioIo::new(stream), service);
+    let io = HeadBodyIo {
+        stream,
+        head_body,
+        owed: Vec::new(),
+        tail: Vec::new(),
+    };
+    let connection = builder.serve_connection(TokioIo::new(io), service);
     tokio::select! {
         _ = connection => {}
         _ = shared.kill.wait(epoch) => {}
     }
 }
 
+/// The body of the HEAD answer hyper is about to write, shared between a
+/// connection's service and its IO.
+#[derive(Clone, Default)]
+struct HeadBody(Arc<Mutex<Option<Bytes>>>);
+
+impl HeadBody {
+    fn set(&self, body: Bytes) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(body);
+    }
+
+    fn armed(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    fn take(&self) -> Option<Bytes> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// The connection's socket. nodeos writes the whole body of a HEAD answer,
+/// as for any other method; hyper writes only its head. So while a HEAD
+/// answer is pending, this IO watches the bytes hyper writes for the end of
+/// the head and then writes the body itself, before anything else.
+struct HeadBodyIo {
+    stream: TcpStream,
+    head_body: HeadBody,
+    /// A HEAD answer's body, still to be written.
+    owed: Vec<u8>,
+    /// The last bytes written while a HEAD answer is pending, to find the
+    /// head's end across writes.
+    tail: Vec<u8>,
+}
+
+impl HeadBodyIo {
+    /// Write what is owed. `Ready(Ok)` once nothing is.
+    fn poll_owed(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while !self.owed.is_empty() {
+            let n = ready!(Pin::new(&mut self.stream).poll_write(cx, &self.owed))?;
+            if n == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            self.owed.drain(..n);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncRead for HeadBodyIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for HeadBodyIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        ready!(this.poll_owed(cx))?;
+        if !this.head_body.armed() {
+            return Pin::new(&mut this.stream).poll_write(cx, buf);
+        }
+        // Write up to the head's end at most, so the body follows it.
+        let mut seen = this.tail.clone();
+        let mut limit = buf.len();
+        for (i, &byte) in buf.iter().enumerate() {
+            seen.push(byte);
+            if seen.ends_with(b"\r\n\r\n") {
+                limit = i + 1;
+                break;
+            }
+        }
+        let n = ready!(Pin::new(&mut this.stream).poll_write(cx, &buf[..limit]))?;
+        this.tail.extend_from_slice(&buf[..n]);
+        if this.tail.ends_with(b"\r\n\r\n") {
+            this.tail.clear();
+            if let Some(body) = this.head_body.take() {
+                this.owed.extend_from_slice(&body);
+            }
+        } else {
+            let keep = this.tail.len().saturating_sub(3);
+            this.tail.drain(..keep);
+        }
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_owed(cx))?;
+        Pin::new(&mut this.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_owed(cx))?;
+        Pin::new(&mut this.stream).poll_shutdown(cx)
+    }
+}
+
 /// Answer one request. An `Err` makes hyper close the connection without an
-/// answer, which is how the drop faults work.
+/// answer, which is how the drop faults work. A HEAD answer's body is also
+/// written to the connection, after its head, as nodeos does.
 async fn handle(
+    shared: Arc<Shared>,
+    local: Option<IpAddr>,
+    head_body: HeadBody,
+    request: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, io::Error> {
+    let head = request.method() == Method::HEAD;
+    let response = answer_request(shared, local, request).await?;
+    if head {
+        let Ok(body) = response.body().clone().collect().await;
+        let body = body.to_bytes();
+        if !body.is_empty() {
+            head_body.set(body);
+        }
+    }
+    Ok(response)
+}
+
+/// Answer one request, as [`handle`] describes.
+async fn answer_request(
     shared: Arc<Shared>,
     local: Option<IpAddr>,
     request: Request<Incoming>,
@@ -1402,13 +1538,14 @@ fn sha256_id(s: &[u8]) -> Option<[u8; 32]> {
 }
 
 /// The text nodeos writes for an echoed parameter, before JSON escaping:
-/// fc's `clean_append`. Control bytes other than TAB, LF and CR, and DEL,
-/// become the text `\u00xx`; invalid UTF-8 is dropped.
+/// fc's `clean_append`. Control bytes other than TAB, LF and CR, DEL, and
+/// the C1 controls U+0080 to U+009F become the text `\u00xx`; invalid UTF-8
+/// is dropped.
 fn echo_text(s: &[u8]) -> String {
     let mut out = String::with_capacity(s.len());
     for chunk in s.utf8_chunks() {
         for c in chunk.valid().chars() {
-            if (c < ' ' && !matches!(c, '\t' | '\n' | '\r')) || c == '\x7f' {
+            if (c < ' ' && !matches!(c, '\t' | '\n' | '\r')) || is_fc_escaped(c) {
                 let _ = write!(out, "\\u{:04x}", u32::from(c));
             } else {
                 out.push(c);
@@ -1416,6 +1553,12 @@ fn echo_text(s: &[u8]) -> String {
         }
     }
     out
+}
+
+/// DEL and the C1 controls, which fc's `escape_string` writes as `\u00xx` in
+/// both of its modes (the C1 controls through `prune_invalid_utf8`).
+fn is_fc_escaped(c: char) -> bool {
+    c == '\x7f' || ('\u{80}'..='\u{9f}').contains(&c)
 }
 
 /// A JSON string as fc's writer escapes it.
@@ -1429,7 +1572,7 @@ fn json_string(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
-            c if c < ' ' || c == '\x7f' => {
+            c if c < ' ' || is_fc_escaped(c) => {
                 let _ = write!(out, "\\u{:04x}", u32::from(c));
             }
             c => out.push(c),
@@ -1500,8 +1643,14 @@ enum Value {
     Object(Vec<(Vec<u8>, Value)>),
 }
 
-/// fc nests at most this deep.
-const MAX_DEPTH: usize = 200;
+/// The nesting level (the top-level object is level 1) at which a container
+/// may no longer hold anything. fc's legacy parser starts with a depth
+/// budget of 200 and spends two units per level: `variant_from_stream`
+/// passes `max_depth - 1` to the container parser, which passes
+/// `max_depth - 1` again to each member or element, so the values inside a
+/// level-100 container are parsed with a budget of 0 and fail. An empty
+/// container at that level parses.
+const FULL_LEVEL: usize = 100;
 
 /// The members of the body's top-level object, read the way fc reads them:
 /// - leading whitespace is skipped and bytes after the object are ignored;
@@ -1510,7 +1659,8 @@ const MAX_DEPTH: usize = 200;
 ///   control bytes are kept, and byte 0x04 fails;
 /// - numbers are integers (`-?[0-9]+`, not followed by a letter, digit or
 ///   `.`): negative ones are i64, others u64, and overflow fails;
-/// - `true`, `false` and `null` must not run into a letter or digit.
+/// - `true`, `false` and `null` must not run into a letter or digit;
+/// - a container at nesting level 100 must be empty ([`FULL_LEVEL`]).
 ///
 /// Fractions, exponents and other tokens fail: a frozen range server
 /// refuses them, and the router never sends them there.
@@ -1608,10 +1758,8 @@ impl Reader<'_> {
         }
     }
 
+    /// An object at nesting level `depth`.
     fn object(&mut self, depth: usize) -> Option<Value> {
-        if depth > MAX_DEPTH {
-            return None;
-        }
         self.pos += 1;
         let mut members = Vec::new();
         loop {
@@ -1626,7 +1774,7 @@ impl Reader<'_> {
                 b'"' => {
                     let key = self.string()?;
                     self.skip_ws();
-                    if self.bump()? != b':' {
+                    if self.bump()? != b':' || depth >= FULL_LEVEL {
                         return None;
                     }
                     let value = self.value(depth)?;
@@ -1637,16 +1785,17 @@ impl Reader<'_> {
         }
     }
 
+    /// An array at nesting level `depth`.
     fn array(&mut self, depth: usize) -> Option<Value> {
-        if depth > MAX_DEPTH {
-            return None;
-        }
         self.pos += 1;
         let mut items = Vec::new();
         self.skip_ws();
         if self.peek()? == b']' {
             self.pos += 1;
             return Some(Value::Array(items));
+        }
+        if depth >= FULL_LEVEL {
+            return None;
         }
         loop {
             items.push(self.value(depth)?);
@@ -1775,6 +1924,40 @@ impl RawConn {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no response in time"))?
     }
 
+    /// Read the status line and headers of one response and nothing more,
+    /// as a client does for a HEAD request; `body` is left empty. Any body
+    /// bytes the peer writes stay unread (see [`Self::pending`]).
+    pub async fn response_head(&mut self, within: Duration) -> io::Result<RawResponse> {
+        timeout(within, async {
+            loop {
+                let (status, headers) = self.read_head().await?;
+                if !(100..200).contains(&status) {
+                    return Ok(RawResponse {
+                        status,
+                        headers,
+                        body: Vec::new(),
+                    });
+                }
+            }
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no response in time"))?
+    }
+
+    /// Bytes the peer has sent that no read has consumed yet, waiting up to
+    /// `within` for at least `at_least` of them.
+    pub async fn pending(&mut self, at_least: usize, within: Duration) -> Vec<u8> {
+        let _ = timeout(within, async {
+            while self.buf.len() < at_least {
+                if self.fill().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+        self.buf.clone()
+    }
+
     /// Whether the peer closes the connection (or resets it) within
     /// `within` without sending anything more.
     pub async fn closed(&mut self, within: Duration) -> bool {
@@ -1820,25 +2003,30 @@ impl RawConn {
         Ok(self.buf.drain(..len).collect())
     }
 
+    /// A status line and its headers.
+    async fn read_head(&mut self) -> io::Result<(u16, Vec<(String, String)>)> {
+        let status_line = self.line().await?;
+        let status: u16 = status_line
+            .split(' ')
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| invalid(&format!("bad status line {status_line:?}")))?;
+        let mut headers = Vec::new();
+        loop {
+            let line = self.line().await?;
+            if line.is_empty() {
+                return Ok((status, headers));
+            }
+            let (name, value) = line
+                .split_once(':')
+                .ok_or_else(|| invalid(&format!("bad header line {line:?}")))?;
+            headers.push((name.to_string(), value.trim().to_string()));
+        }
+    }
+
     async fn read_response(&mut self) -> io::Result<RawResponse> {
         loop {
-            let status_line = self.line().await?;
-            let status: u16 = status_line
-                .split(' ')
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| invalid(&format!("bad status line {status_line:?}")))?;
-            let mut headers = Vec::new();
-            loop {
-                let line = self.line().await?;
-                if line.is_empty() {
-                    break;
-                }
-                let (name, value) = line
-                    .split_once(':')
-                    .ok_or_else(|| invalid(&format!("bad header line {line:?}")))?;
-                headers.push((name.to_string(), value.trim().to_string()));
-            }
+            let (status, headers) = self.read_head().await?;
             if (100..200).contains(&status) {
                 continue;
             }
@@ -2003,6 +2191,17 @@ mod tests {
         assert_eq!(to_uint64(b"-1"), Some(u64::MAX));
         assert_eq!(to_uint64(b"-0"), Some(0));
         assert_eq!(to_uint64(b"18446744073709551615"), Some(u64::MAX));
+        // Leading zeros never overflow, whatever the length.
+        for len in [21, 22, 64, 80] {
+            let padded = format!("{}5", "0".repeat(len - 1));
+            assert_eq!(to_uint64(padded.as_bytes()), Some(5), "{len}");
+        }
+        let max = format!("{}18446744073709551615", "0".repeat(44));
+        assert_eq!(to_uint64(max.as_bytes()), Some(u64::MAX));
+        assert_eq!(
+            to_uint64(format!("-{}1", "0".repeat(30)).as_bytes()),
+            Some(u64::MAX)
+        );
         for bad in [
             "",
             "+",
@@ -2010,12 +2209,50 @@ mod tests {
             " 1",
             "1 ",
             "18446744073709551616",
+            "0018446744073709551616",
             "1e5",
             "0x10",
             "++1",
         ] {
             assert_eq!(to_uint64(bad.as_bytes()), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn zero_padded_digit_strings_resolve_as_numbers() {
+        for len in [21, 22, 64] {
+            let padded = format!("{}5", "0".repeat(len - 1));
+            let body = format!(r#"{{"block_num_or_id":"{padded}"}}"#);
+            assert_eq!(parse(BlockEp::RawBlock, &body), num(5, &padded), "{len}");
+        }
+        // Past 64 characters the length check comes first.
+        let long = format!(r#"{{"block_num_or_id":"{}5"}}"#, "0".repeat(64));
+        assert_eq!(
+            parse(BlockEp::RawBlock, &long),
+            Err(ParamError::BadLength(BlockEp::RawBlock))
+        );
+        // A value above u64::MAX is an id when its length is even.
+        let over = "0018446744073709551616";
+        let mut id = [0u8; 32];
+        id[..11].copy_from_slice(&[
+            0x00, 0x18, 0x44, 0x67, 0x44, 0x07, 0x37, 0x09, 0x55, 0x16, 0x16,
+        ]);
+        assert_eq!(
+            parse(
+                BlockEp::RawBlock,
+                &format!(r#"{{"block_num_or_id":"{over}"}}"#)
+            )
+            .map(|r| r.query),
+            Ok(Query::Id(id))
+        );
+        let padded = format!("{}7", "0".repeat(70));
+        assert_eq!(
+            parse(
+                BlockEp::BlockInfo,
+                &format!(r#"{{"block_num":"{padded}"}}"#)
+            ),
+            num(7, "7")
+        );
     }
 
     #[test]
@@ -2077,16 +2314,31 @@ mod tests {
         ] {
             assert_eq!(members(bad), None, "{bad:?}");
         }
-        // Nesting: 200 containers deep parses, 201 fails.
-        let nested = |depth: usize| {
+        // Nesting: fc spends two units of its budget of 200 per level, so a
+        // container at level 100 (the top-level object is level 1) must be
+        // empty.
+        let nested = |depth: usize, inner: &str| {
             format!(
-                r#"{{"a":{}1{}}}"#,
+                r#"{{"a":{}{inner}{}}}"#,
                 "[".repeat(depth - 1),
                 "]".repeat(depth - 1)
             )
         };
-        assert!(members(&nested(200)).is_some());
-        assert_eq!(members(&nested(201)), None);
+        assert!(members(&nested(99, "1")).is_some());
+        assert!(members(&nested(100, "")).is_some());
+        assert_eq!(members(&nested(100, "1")), None);
+        assert_eq!(members(&nested(100, "[]")), None);
+        assert_eq!(members(&nested(201, "1")), None);
+        let objects = |depth: usize, inner: &str| {
+            format!(
+                r#"{}{inner}{}"#,
+                r#"{"a":"#.repeat(depth - 1) + "{",
+                "}".repeat(depth)
+            )
+        };
+        assert!(members(&objects(99, r#""k":1"#)).is_some());
+        assert!(members(&objects(100, "")).is_some());
+        assert_eq!(members(&objects(100, r#""k":1"#)), None);
     }
 
     #[test]
@@ -2255,6 +2507,17 @@ mod tests {
         );
         assert_eq!(echo_text(b"ok\xffok\xc3"), "okok");
         assert_eq!(echo_text("é".as_bytes()), "é");
+        // C1 controls are written as `\u00xx` too (fc's prune_invalid_utf8);
+        // U+00A0 and above are kept.
+        assert_eq!(
+            echo_text("a\u{80}b\u{9b}c\u{9f}d\u{a0}e".as_bytes()),
+            "a\\u0080b\\u009bc\\u009fd\u{a0}e"
+        );
+        assert_eq!(
+            json_string("\u{85}\u{a0}\u{7f}"),
+            "\"\\u0085\u{a0}\\u007f\""
+        );
+        assert_eq!(json_string(&echo_text("\u{85}".as_bytes())), r#""\\u0085""#);
         assert_eq!(
             json_string(&echo_text(b"q\"b\\\x02\t")),
             r#""q\"b\\\\u0002\t""#
@@ -2979,6 +3242,71 @@ mod tests {
         }
         api.set_fault(Some(push), None);
         assert_eq!(post(&api, push, "{}").await.status, 200);
+    }
+
+    #[tokio::test]
+    async fn head_answers_carry_their_body_as_nodeos_writes_it() {
+        let api = live().await;
+        let mut conn = RawConn::connect(api.addr()).await.unwrap();
+        // nodeos writes the body after the head of a HEAD answer, so a
+        // reader that trusts Content-Length reads it whole.
+        conn.send(&request("HEAD", "/v1/chain/get_info", &api.endpoint(), b""))
+            .await
+            .unwrap();
+        let info = conn.response(WAIT).await.unwrap();
+        assert_eq!(info.status, 200);
+        assert_eq!(
+            info.header("content-length"),
+            Some(info.body.len().to_string().as_str())
+        );
+        assert!(
+            info.text().contains(r#""served_by":"live-1""#),
+            "{}",
+            info.text()
+        );
+        // The connection carries on, and so do error answers.
+        conn.send(&request(
+            "POST",
+            "/v1/chain/get_block_info",
+            &api.endpoint(),
+            br#"{"block_num":150}"#,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            conn.response(WAIT).await.unwrap().body,
+            block_answer("live-1", 150, &block_id(150))
+        );
+        conn.send(&request("HEAD", "/v1/chain/nowhere", &api.endpoint(), b""))
+            .await
+            .unwrap();
+        let missing = conn.response(WAIT).await.unwrap();
+        assert_eq!(
+            (missing.status, missing.text()),
+            (404, NOT_FOUND_BODY.to_string())
+        );
+        // A client that reads only the head finds the body still pending.
+        let mut head_only = RawConn::connect(api.addr()).await.unwrap();
+        head_only
+            .send(&request(
+                "HEAD",
+                "/v1/chain/get_block_info",
+                &api.endpoint(),
+                br#"{"block_num":151}"#,
+            ))
+            .await
+            .unwrap();
+        let head = head_only.response_head(WAIT).await.unwrap();
+        let want = block_answer("live-1", 151, &block_id(151));
+        assert_eq!(head.status, 200);
+        assert!(head.body.is_empty());
+        assert_eq!(
+            head.header("content-length"),
+            Some(want.len().to_string().as_str())
+        );
+        assert_eq!(head_only.pending(want.len(), WAIT).await, want);
+        let methods: Vec<String> = api.requests().into_iter().map(|r| r.method).collect();
+        assert_eq!(methods, ["HEAD", "POST", "HEAD", "HEAD"]);
     }
 
     #[tokio::test]

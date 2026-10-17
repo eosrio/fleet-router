@@ -283,6 +283,8 @@ mod tests {
             idle_timeout_ms: 0,
             max_message_bytes: 1 << 20,
             max_client_message_bytes: 64 * 1024,
+            stall_timeout_ms: 0,
+            connect_timeout_ms: 2_000,
         }
     }
 
@@ -291,6 +293,7 @@ mod tests {
             name: "test-upstream".to_string(),
             endpoint: endpoint.to_string(),
             enabled: true,
+            ..Default::default()
         }
     }
 

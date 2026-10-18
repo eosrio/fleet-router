@@ -152,7 +152,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   times out, and the upstream the session just failed off never takes the
   leg back. When a bounded hold's `gap_wait_ms` runs out while a retry's dial
   that can still serve the cursor is on its way, that dial is the hold's last
-  try: the client is not closed and the dial not replaced while it runs.
+  try, so the client is not closed while it runs; at the deadline, and on any
+  later view, it still gives way to an online upstream that is not excluded
+  and can serve the cursor.
 - A live seam whose first result does not continue the last delivered block
   fails over when another upstream covers the block, with a warning that
   gives both ids and `fleet_router_failovers_total{reason="discontinuity"}`.

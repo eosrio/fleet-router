@@ -3475,6 +3475,12 @@ impl Session {
                             h.last_try = true;
                             h.deadline = None;
                         }
+                        // A freed slot publishes no view, so the Dialing
+                        // arm may not have seen an online upstream that can
+                        // serve instead of an offline target: check once.
+                        if let Some(step) = self.online_instead_of(&st) {
+                            return self.apply_step(step, purpose, self.c.credit).await;
+                        }
                         self.set_phase(Phase::Dialing {
                             purpose,
                             step: Some(st),
@@ -6912,6 +6918,131 @@ mod tests {
             mock_a.sessions_accepted() + mock_b.sessions_accepted(),
             1,
             "the retry's dial was not replaced"
+        );
+    }
+
+    /// Hold the twin Y online at its `max_sessions` while a bounded hold's
+    /// retry dials the hung, offline archive X, then free Y's slot without
+    /// publishing a view. Returns Y's connection counter.
+    async fn hold_on_a_hung_archive_while_a_full_twin_frees_a_slot(
+        harness: &Harness,
+        client: &mut TestClient,
+        x: &str,
+        y: &str,
+        accepted: &AtomicUsize,
+    ) -> Arc<AtomicUsize> {
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(y).unwrap().priority = 5;
+            db.get_mut(x).unwrap().online = false;
+            db.get_mut(y).unwrap().online = false;
+            harness.hub.rebuild(&db);
+        }
+        client.send(blocks_request(10, 30, 100)).await.unwrap();
+        until_accepted(accepted).await;
+        let conns = harness
+            .hub
+            .view()
+            .upstreams
+            .iter()
+            .find(|u| *u.endpoint == *y)
+            .unwrap()
+            .connections
+            .clone();
+        conns.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut db = harness.hub.state.lock().await;
+            let twin = db.get_mut(y).unwrap();
+            twin.online = true;
+            twin.max_sessions = Some(1);
+            harness.hub.rebuild(&db);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Another session on Y ends: a slot frees, and no view is published.
+        conns.fetch_sub(1, Ordering::Relaxed);
+        conns
+    }
+
+    /// Stitched: at a bounded hold's deadline, the retry's dial to a hung,
+    /// offline archive gives way to an online twin whose slot freed without
+    /// a view.
+    #[tokio::test]
+    async fn a_hold_retry_dial_to_a_hung_archive_gives_way_at_the_deadline_to_a_freed_twin() {
+        let (x, accepted, hung) = hung_upstream().await;
+        let (y, mock_y) = start_mock(MockShipConfig::frozen(1, 2001)).await;
+        let harness = start_stitched_tuned(
+            &[(&x, 1, 2001), (&y, 1, 2001)],
+            ProxyLimits {
+                connect_timeout_ms: 8_000,
+                handshake_timeout_ms: 8_000,
+                ..limits(0)
+            },
+            StitchingPolicy {
+                gap_wait_ms: 800,
+                ..StitchingPolicy::default()
+            },
+        )
+        .await;
+        let mut client = connect(&harness.url).await;
+        let started = Instant::now();
+        hold_on_a_hung_archive_while_a_full_twin_frees_a_slot(
+            &harness,
+            &mut client,
+            &x,
+            &y,
+            &accepted,
+        )
+        .await;
+        assert_eq!(
+            read_block_nums(&mut client, 20).await,
+            (10..30).collect::<Vec<_>>()
+        );
+        assert_eq!(mock_y.sessions_accepted(), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the hung dial held the leg past the deadline: {:?}",
+            started.elapsed()
+        );
+        hung.abort();
+    }
+
+    /// Stitched: as above, and the twin's freed slot is taken again after
+    /// the deadline. The leg was already moved to the twin at the deadline,
+    /// so the client is served instead of closed.
+    #[tokio::test]
+    async fn a_hold_retry_dial_that_gave_way_at_the_deadline_survives_the_twin_filling_again() {
+        let (x, accepted, hung) = hung_upstream().await;
+        let (y, _mock_y) = start_mock(MockShipConfig::frozen(1, 2001)).await;
+        let harness = start_stitched_tuned(
+            &[(&x, 1, 2001), (&y, 1, 2001)],
+            ProxyLimits {
+                connect_timeout_ms: 4_000,
+                handshake_timeout_ms: 4_000,
+                ..limits(0)
+            },
+            StitchingPolicy {
+                gap_wait_ms: 800,
+                ..StitchingPolicy::default()
+            },
+        )
+        .await;
+        let mut client = connect(&harness.url).await;
+        let conns = hold_on_a_hung_archive_while_a_full_twin_frees_a_slot(
+            &harness,
+            &mut client,
+            &x,
+            &y,
+            &accepted,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        // Another session takes Y's slot again, and no view is published.
+        conns.fetch_add(1, Ordering::Relaxed);
+        let first = timeout(Duration::from_secs(20), client.next()).await;
+        hung.abort();
+        assert!(
+            matches!(first, Ok(Some(Ok(Message::Binary(_))))),
+            "client not served: {first:?}"
         );
     }
 

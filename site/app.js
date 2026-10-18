@@ -195,7 +195,7 @@
         c: ["stale · deprioritized", "stale"]
       },
       mark: false,
-      caption: "A new indexer asks for blocks from #12,000,000. SHiP B has fewer connections, but its trace history begins at 394,000,000. Nodes whose trace range covers the block rank first, fresh before stale; least-connections only breaks ties inside a rank. The stream is set to SHiP A."
+      caption: "A new indexer asks for blocks from #12,000,000. SHiP B has fewer connections, but its trace history begins at 394,000,000. Nodes whose trace range covers the block rank first, fresh before stale; <code>priority</code>, <code>weight</code> and connection counts only break ties inside a rank. The stream is set to SHiP A."
     },
     drop: {
       tracks: { hyperion: "set", atomic: "set", indexer: "idle", trunk: "set", a: "failed", b: "diverted", c: "stale" },
@@ -206,7 +206,7 @@
         c: ["stale · deprioritized", "stale"]
       },
       mark: true,
-      caption: "SHiP A closed the socket mid-stream. fleet-router re-sent Hyperion's <code>get_blocks</code> from the next block on SHiP B, dropped the one replayed block Hyperion already had, and replayed the frames Hyperion sent during the swap. The client socket never closed."
+      caption: "SHiP A failed mid-stream: it closed the socket, or went silent and missed the 4 s liveness ping. fleet-router re-sent Hyperion's <code>get_blocks</code> from the next block on SHiP B, dropped the one replayed block Hyperion already had, and replayed the frames Hyperion sent during the swap. The client socket never closed."
     },
     corrupt: {
       tracks: { hyperion: "set", atomic: "set", indexer: "idle", trunk: "set", a: "quarantined", b: "diverted", c: "stale" },

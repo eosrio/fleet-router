@@ -290,6 +290,11 @@ html {
   background: repeating-linear-gradient(135deg, var(--warn) 0 2px, transparent 2px 4px);
 }
 
+.key-disabled {
+  border-color: var(--rule-strong);
+  background: transparent;
+}
+
 /* ---------- masthead ---------- */
 
 .masthead {
@@ -1308,6 +1313,56 @@ pre code {
   font-size: 0.9rem;
 }
 
+.after-terminal {
+  margin-top: 1rem;
+  color: var(--ink-2);
+  font-size: 0.9375rem;
+  max-width: 78ch;
+}
+
+/* dashboard screenshot, swapped with the theme */
+
+.shot {
+  margin-bottom: 2rem;
+}
+
+.shot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+}
+
+.shot .shot-light {
+  display: none;
+}
+
+:root[data-theme="light"] .shot .shot-dark {
+  display: none;
+}
+
+:root[data-theme="light"] .shot .shot-light {
+  display: block;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .shot .shot-dark {
+    display: none;
+  }
+
+  :root:not([data-theme="dark"]) .shot .shot-light {
+    display: block;
+  }
+}
+
+.shot figcaption {
+  margin-top: 0.75rem;
+  color: var(--ink-3);
+  font-size: 0.9rem;
+  max-width: 78ch;
+}
+
 /* ---------- footer ---------- */
 
 .footer {
@@ -1366,6 +1421,20 @@ pre code {
     padding: 0.3rem 0.4rem;
     font-size: 0.875rem;
     white-space: nowrap;
+  }
+
+  /* Six links do not fit a small phone; Metrics sits just above Dashboard. */
+  @media (max-width: 439.98px) {
+    .nav a[href="#metrics"] {
+      display: none;
+    }
+  }
+
+  @media (max-width: 359.98px) {
+    .nav a {
+      padding-inline: 0.25rem;
+      font-size: 0.8125rem;
+    }
   }
 
   .tab-long {

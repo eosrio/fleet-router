@@ -435,6 +435,14 @@ async fn an_archive_serves_its_block_log_below_its_ship_range() {
     // Block 1 is in the archive's block log, below its SHiP range.
     let answer = wait_served(port, RAW_BLOCK, &raw(1), "archive-a").await;
     assert_eq!(answer.body, ok("archive-a", 1));
+    // Until the archive is verified, its declared range starts at 2, so the
+    // polls above may reach the live node, whose log starts at 900. From here
+    // on the archive alone answers.
+    live.api.clear_requests();
+    assert_eq!(
+        post(port, RAW_BLOCK, &raw(1)).await.body,
+        ok("archive-a", 1)
+    );
     assert_eq!(
         post(port, BLOCK_INFO, r#"{"block_num":1}"#).await.body,
         ok("archive-a", 1)

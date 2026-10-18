@@ -2588,18 +2588,21 @@ impl Session {
 
     /// The leg an online upstream would serve instead of the dial on its
     /// way to `cur.up`, when the monitor sees that upstream offline. It is
-    /// never an excluded upstream: the soft exclusion (the upstream the
-    /// session just failed off) counts as hard here, since online it would
-    /// outrank the dial and take the leg back there to fail again. It has no
-    /// side effects, unlike [`Session::plan`]: an operator move's exclusion
-    /// stays, so a blip on the move's target keeps its dial.
+    /// never an excluded upstream. While the failover that set the soft
+    /// exclusion is still under way (`moved_from` names it), that upstream
+    /// counts as hard here, since online it would outrank the dial and take
+    /// the leg back there to fail again. An older soft exclusion, from a
+    /// failover whose next link came up, is only a preference, as in
+    /// [`Session::plan`]. It has no side effects, unlike `plan`: an operator
+    /// move's exclusion stays, so a blip on the move's target keeps its dial.
     fn online_instead_of(&self, cur: &ServeStep) -> Option<Step> {
         if self.view.up(cur.up).is_some_and(|u| u.online) {
             return None;
         }
         let shape = self.c.req.as_ref().map(Shape::of)?;
         let mut ex = self.ex.clone();
-        if let Some(failed) = ex.soft.take() {
+        let leaving = self.moved_from.as_ref().map(|(from, _)| from);
+        if let Some(failed) = ex.soft.take_if(|soft| leaving == Some(&*soft)) {
             ex.add_hard(failed, Duration::MAX, std_now());
         }
         let step = self.next_step_for(&shape, self.c.cursor, &ex, false);
@@ -6965,6 +6968,117 @@ mod tests {
             "no return to the failed archive"
         );
         assert_eq!(mock_x.sessions_accepted(), 1);
+    }
+
+    /// Stitched: the session fails off archive Y at block 15 and finishes
+    /// its request on X. Later X goes offline, H comes online, and a new
+    /// request goes to H, whose host hangs; the monitor then marks H
+    /// offline. That failover is over, so Y, online and able to serve, takes
+    /// the leg instead of the hung dial.
+    #[tokio::test]
+    async fn an_old_soft_exclusion_does_not_keep_a_hung_dial_on_a_new_request() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (y, _mock_y) = start_mock(MockShipConfig {
+            corrupt_block: Some(15),
+            corrupt_hits: Some(hits.clone()),
+            ..MockShipConfig::frozen(1, 2001)
+        })
+        .await;
+        let (x, _mock_x) = start_mock(MockShipConfig::frozen(1, 2001)).await;
+        let (h, accepted, hung) = hung_upstream().await;
+        let harness = start_stitched_with(
+            &[(&y, 1, 2001), (&x, 1, 2001), (&h, 1, 2001)],
+            ProxyLimits {
+                connect_timeout_ms: 8_000,
+                handshake_timeout_ms: 8_000,
+                ..limits(0)
+            },
+        )
+        .await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&x).unwrap().priority = 5;
+            db.get_mut(&h).unwrap().priority = 1;
+            db.get_mut(&h).unwrap().online = false;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(10, 30, 100)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 20).await,
+            (10..30).collect::<Vec<_>>()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&x).unwrap().online = false;
+            db.get_mut(&h).unwrap().online = true;
+            harness.hub.rebuild(&db);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client.send(blocks_request(500, 520, 100)).await.unwrap();
+        until_accepted(&accepted).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let marked = Instant::now();
+        mark_online(&harness.hub, &h, false).await;
+        assert_eq!(
+            read_block_nums(&mut client, 20).await,
+            (500..520).collect::<Vec<_>>()
+        );
+        assert!(
+            marked.elapsed() < Duration::from_secs(4),
+            "the hung dial held the leg while Y was online: {:?}",
+            marked.elapsed()
+        );
+        hung.abort();
+    }
+
+    /// Stitched: one request fails off archive Y at block 15 and goes on
+    /// from X, whose range ends at 100. The next leg is pre-dialed to H,
+    /// whose host hangs, and the monitor marks H offline while the handoff
+    /// waits on that dial. The failover at 15 is over, so Y takes the leg.
+    #[tokio::test]
+    async fn an_old_soft_exclusion_does_not_keep_a_hung_handoff_dial() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (y, _mock_y) = start_mock(MockShipConfig {
+            corrupt_block: Some(15),
+            corrupt_hits: Some(hits.clone()),
+            ..MockShipConfig::frozen(1, 2001)
+        })
+        .await;
+        let (x, _mock_x) = start_mock(MockShipConfig::frozen(1, 100)).await;
+        let (h, accepted, hung) = hung_upstream().await;
+        let harness = start_stitched_with(
+            &[(&y, 1, 2001), (&x, 1, 100), (&h, 50, 2001)],
+            ProxyLimits {
+                connect_timeout_ms: 8_000,
+                handshake_timeout_ms: 8_000,
+                ..limits(0)
+            },
+        )
+        .await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&x).unwrap().priority = 5;
+            db.get_mut(&h).unwrap().priority = 1;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(10, 120, 200)).await.unwrap();
+        let mut blocks = read_block_nums(&mut client, 90).await;
+        assert_eq!(blocks, (10..100).collect::<Vec<_>>());
+        until_accepted(&accepted).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let marked = Instant::now();
+        mark_online(&harness.hub, &h, false).await;
+        blocks.extend(read_block_nums(&mut client, 20).await);
+        assert_eq!(blocks, (10..120).collect::<Vec<_>>());
+        assert!(
+            marked.elapsed() < Duration::from_secs(4),
+            "the hung handoff dial held the leg while Y was online: {:?}",
+            marked.elapsed()
+        );
+        hung.abort();
     }
 
     /// Pool: the upstream an operator move dials is disabled before the dial

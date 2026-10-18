@@ -7,23 +7,148 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-18
+
 ### Upgrade notes
+
+This release replaces the per-connection proxy with a session actor and a
+routing planner. A config without frozen servers still runs as a pool
+listener, but pool listeners behave differently in the ways below, so
+upgrading an existing deployment is not a no-op. Read these first.
+
+**Config**
+
+- `max_connections`, at the top level and per listener, must be at most
+  1000000. A larger value fails validation. Apart from that, existing config
+  files stay valid, and a listener without frozen servers stays a pool
+  listener.
+
+**Status replies**
 
 - Pool listeners now answer `get_status_request_v0` and `_v1` themselves,
   with the fleet's head, LIB and block ranges, instead of relaying one
-  upstream's reply. Until the fleet head and LIB are known, the request is
-  still relayed to the session's upstream.
-- Two new checks are on by default: `upstream_stall_timeout_ms` (60 s) fails
-  over an upstream that stops sending blocks it owes, and `live_lag_blocks`
-  (1200) ranks a live node that far behind the fleet head like a stale one
-  for blocks above its own head. Set either to `0` to turn it off.
+  upstream's reply. Only until the fleet head and LIB are first known
+  (normally right after startup) is a request relayed to the session's
+  upstream, when a link is up. After that the router answers itself, even
+  while every upstream is offline, with the last known head and LIB.
+- Each range is the top contiguous part of the listener's coverage, and that
+  coverage is sticky: an upstream that goes offline, or is disabled from the
+  control API, still counts. Its begin stays in status replies, and a live
+  node's range still runs to the fleet head, so status can advertise history
+  that no online upstream holds, such as the begin of a full-history node
+  that is down. When the coverage has a hole, only the part above the hole
+  is reported.
+- `chain_id` in these replies is the configured one, else one an online
+  upstream reported. With neither, a v1 reply carries zeros and a v0 reply
+  omits the field. With `chain_id` configured, v0 replies always include it.
+  Set `chain_id` on pool listeners whose clients check it.
+- A status request that is neither answered nor relayed within
+  `handshake_timeout_ms` (10 s when `0`) closes the client with 1011
+  `fleet status unavailable`. A client that sends a status request while
+  1024 are already waiting or in flight is closed with 1008
+  `too many queued status requests`.
+
+**Block results**
+
+- Pool listeners rewrite head and LIB in block results and relayed status
+  replies, so they never go below what the session was already sent (LIB is
+  capped at head). After a status reply, or after a failover to a node that
+  is behind, results carry that higher head and LIB, not the serving node's
+  own. This cannot be turned off for a pool listener.
+  `fleet_router_patched_results_total` counts the rewritten frames.
+- After a failover, the resume request lists the reversible blocks the
+  client already received as `have_positions`. An upstream on another fork
+  then rewinds, and the client can receive a block number it already had,
+  with a new id, as it would from a single node. 0.6.0 dropped those blocks.
+- WebSocket ping and pong are no longer relayed between client and upstream.
+  The router answers a client's pings itself, so a reply no longer shows
+  that the upstream is alive. Upstream Text and Ping frames are not forwarded
+  to the client.
+
+**Failover and client closes**
+
+- Two new checks are on by default. `upstream_stall_timeout_ms` (60 s) fails
+  over an upstream that sends nothing for that long while it owes blocks;
+  replies to the router's pings do not count. `live_lag_blocks` (1200) makes
+  a live node more than that many blocks behind the fleet head rank like a
+  stale one when a session picks an upstream for a block above that node's
+  head; a session already on it is not moved by this rule. Set either to `0`
+  to turn it off.
+- A third check has no setting: when the monitor has marked a session's
+  upstream offline, the session fails over after 5 s without a data byte
+  while it owes blocks, even with `upstream_liveness_timeout_ms` at `0` and
+  even if the upstream still answers pings. It is counted as
+  `fleet_router_failovers_total{reason="offline"}` and strikes no upstream.
+- Some failures now close the client instead of failing over. An upstream
+  message above `max_message_bytes` closes it with 1011
+  `block K exceeds max_message_bytes`, where K is the client's next block,
+  and strikes no upstream. Before, it was a failover with a strike, and five
+  of them at the same block closed the client with 1011
+  `block K unavailable on all upstreams`. A malformed client request closes
+  the client with 1007 `invalid request` instead of being forwarded. In a
+  pool listener an unknown request variant is still forwarded, but if the
+  upstream then drops the connection within 5 s, the client is closed with
+  1003 `unsupported request` instead of failing over.
+- The opposite also changed: an upstream Close frame is no longer forwarded
+  to the client, which used to end the client's connection. The session now
+  fails over and the client stays connected.
+- If an upstream resumed after a failover starts past the client's next
+  block and another upstream has that block, the session moves to it and
+  avoids the first one for 30 s. A jump that no other upstream can fill is
+  forwarded as before, now with a warning, and counted in
+  `fleet_router_upstream_sequence_jumps_total`.
+- `idle_timeout_ms` fails over an upstream only while it owes blocks, so a
+  client waiting at the tip no longer causes reconnects. An HTTP 503 at the
+  WebSocket upgrade makes the session avoid that upstream for 2 s without
+  marking it offline.
 - The upstream liveness check now counts bytes as they arrive, so the 0.6.0
   advice to raise `upstream_liveness_timeout_ms` for large blocks on a slow
   link no longer applies.
-- `max_connections`, at the top level and per listener, must be at most
-  1000000. A larger value fails validation.
-- Existing config files stay valid, and a listener without frozen servers
-  stays a pool listener.
+
+**Requests and upstream connections**
+
+- Any `get_blocks`, including one sent mid-session, is checked before it is
+  forwarded. It is moved to another upstream when the session's upstream
+  lacks the start block in a log the request asks for (or is quarantined at
+  it, or disabled from the control API), or lags more than `live_lag_blocks`
+  behind the fleet head for it, and another upstream does not. Priority and
+  load alone never move a request. Before, only a request for finality data
+  the upstream lacked, or at a block it was quarantined for, was moved.
+- A `get_blocks` sent while the previous request still has results in flight
+  opens a new upstream connection (connect, upgrade and ABI read) instead of
+  reusing the socket. A request sent after the previous one has finished
+  reuses it.
+- `handshake_timeout_ms` (10 s when `0`) now also bounds each session's
+  upstream connect, upgrade and ABI read, and each request write to an
+  upstream. A dial that runs out marks a live upstream offline; an HTTP 503
+  does not.
+
+**Metrics, dashboard and logs**
+
+- `fleet_router_active_connections` counts an upstream's connection slots:
+  links held, dials in progress, and a failed link's slot until its
+  replacement is up, so a session in failover is counted on two upstreams.
+  For pool listeners this matches 0.6.0. A stitched listener also counts
+  pre-dialed standby links, and a stitched client that only asks for status
+  holds none.
+- In the dashboard and `/api/v1/status`, a listener's `sessions` now counts
+  client sessions (before, it was the sum of its upstreams' slots), and an
+  upstream's `sessions` is the same slot count as the gauge. An upstream's
+  `failovers_total` there includes reroutes, while the Prometheus
+  `fleet_router_failovers_total` leaves them out
+  (`fleet_router_reroutes_total` counts them).
+- Dashboard `session_failover` events give the reason as the metric label
+  (`unclean`, `clean`, `idle`, `silent`, `operator`, `stall`, `offline`,
+  `uncovered`, `send`) instead of 0.6.0's phrases, so anything that parses
+  that text needs updating. Client closes for 1003, 1007, oversized messages
+  and an unavailable status emit no event. A session is listed as soon as
+  the client connects.
+- Logs: operator moves and drains log one WARN
+  `upstream stream ended; attempting failover` per moved session, and every
+  session ends with an INFO `session closed` line. New WARN lines cover ABI
+  differences within a pool, stalls, offline-and-silent failovers, sequence
+  jumps and a missing `chain_id`, and a new ERROR line covers a result that
+  does not continue the last delivered block at a failover.
 
 ### Added
 
@@ -155,8 +280,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upstream.
 - Session upstream dials now time out: the TCP connect with the WebSocket
   upgrade, and then the wait for the upstream's ABI, are each bounded by
-  `handshake_timeout_ms` (10 s when `0`). Before, a session waited for the
-  ABI with no bound when `handshake_timeout_ms` was `0`.
+  `handshake_timeout_ms` (10 s when `0`). Before, the TCP connect and the
+  upgrade had no bound at all, and the wait for the ABI had none when
+  `handshake_timeout_ms` was `0`.
 
 ## [0.6.0] - 2026-10-17
 
@@ -469,7 +595,8 @@ First public release on crates.io and GitHub.
 - Upstream handshake now skips leading control frames and retries against
   another upstream instead of dropping the client on an unexpected first frame.
 
-[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/eosrio/fleet-router/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/eosrio/fleet-router/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/eosrio/fleet-router/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/eosrio/fleet-router/compare/v0.3.1...v0.4.0

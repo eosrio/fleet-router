@@ -108,7 +108,7 @@ A state call, and a block request whose body gives no block number, goes to an u
 Both classes are off by default (see [Security](operations.md#security)).
 
 - **Exec** (`compute_transaction`, `send_read_only_transaction`) goes to a live node chosen as for a state call. Only a connection that could not be made moves on to the next node. Once the request may have been written, any answer is final, and a connection lost or a timeout gets `503 Upstream connection lost after the request was sent`: the request is never sent twice.
-- **Push** goes to the first up server in [`push_servers`](configuration.md#chain-api), in the configured order, or to the `get_info` primary when the list is empty. It is written once. A connection that cannot be made, or a target whose slots stay full for `upstream_queue_ms`, moves on to the next target. A failure after the push may have been written gets `503 Upstream connection lost after the request was sent`, and the push is never resent. A push never goes to a frozen range server. With no target up, the client gets `503 No live chain API upstream available`.
+- **Push** goes to the first up server in [`push_servers`](configuration.md#chain-api), in the configured order, or to the `get_info` primary when the list is empty. It is written once. A connection that cannot be made, or a target whose slots stay full for `upstream_queue_ms`, moves on to the next target. A failure after the push may have been written gets `503 Upstream connection lost after the request was sent`, and the push is never resent. The node's answer to a push is relayed whole, whatever [`max_response_bytes`](configuration.md#chain-api) says: it reports a push the node may have applied. A push never goes to a frozen range server. With no target up, the client gets `503 No live chain API upstream available`.
 
 ## get_supported_apis, OPTIONS and CORS
 
@@ -121,7 +121,7 @@ With [`cors`](configuration.md#chain-api), the router removes every `Access-Cont
 ## How requests are forwarded
 
 - **Request.** The same method and target, and the body byte for byte. Only the client's `Content-Type`, `Accept` and `User-Agent` headers are forwarded. `Host` is the server's `api_endpoint` as configured (nodeos checks `Host` by default), and `Content-Length` is the body's. A `HEAD` request is forwarded as `HEAD` with `Connection: close`.
-- **Answer.** The upstream's status and headers, without hop-by-hop headers and `Date`. The `Server` header passes through. Bodies are streamed as they arrive and never changed. The router's own answers are JSON, with no `Server` and no `Date` header.
+- **Answer.** The upstream's status and headers, without hop-by-hop headers and `Date`. The `Server` header passes through. Bodies are streamed as they arrive and never changed, whatever their size unless [`max_response_bytes`](configuration.md#chain-api) is set. The router's own answers are JSON, with no `Server` and no `Date` header.
 - **Connections.** HTTP/1.1 only, with keep-alive on both sides. Up to 32 idle connections are kept to each upstream API, for 5 s each.
 
 ## Upstream APIs
@@ -171,7 +171,8 @@ The router sends a frozen range server only block requests for blocks in its `bl
 | Requests to one upstream API | `max_in_flight_per_upstream` | That candidate is skipped; when every candidate is full, the request waits `upstream_queue_ms` for a slot. |
 | Upstream connect | `handshake_timeout_ms` (10 s when `0`) | Next candidate. |
 | Upstream response head | `upstream_timeout_ms` per attempt | Next candidate; for an exec or push that may have been written, `503`. |
-| Gap inside an upstream's answer body | `upstream_timeout_ms` | The answer is cut off. |
+| Gap inside an upstream's answer body | `upstream_timeout_ms` | The answer is cut off and the connection is closed. An upstream that keeps sending within this gap is never cut off for its pace. |
+| Size of an upstream's answer body | `max_response_bytes` (no limit when `0`, the default) | A larger `Content-Length`: `502`, and nothing of the answer is sent. No `Content-Length`: cut off once past the limit, and the connection is closed. A push's answer is never limited. |
 | Whole request | `request_deadline_ms` | No further attempt. |
 
 ## Errors the router writes
@@ -183,6 +184,7 @@ The router's own answers are JSON in nodeos's error shape, with `Content-Type: a
 | `400` | `{"code":400,"message":"Illegal request-target","error":{"code":0,"name":"","what":"","details":[]}}` |
 | `404` | `{"code":404,"message":"Not Found","error":{"code":0,"name":"exception","what":"unspecified","details":[{"message":"Unknown Endpoint","file":"beast_http_session.hpp","line_number":186,"method":"handle_request"}]}}` |
 | `413` | `{"code":413,"message":"Payload Too Large","error":{"code":413,"name":"Payload Too Large","what":"Request body exceeds <max_body_bytes> bytes","details":[]}}` |
+| `502` | `{"code":502,"message":"Bad Gateway","error":{"code":502,"name":"Bad Gateway","what":"Upstream answer exceeds <max_response_bytes> bytes","details":[]}}` |
 | `503` | `{"code":503,"message":"Busy","error":{"code":503,"name":"Busy","what":"<reason>","details":[]}}` |
 
 The `503` reasons:
@@ -196,6 +198,7 @@ The `503` reasons:
 
 - Any `Host` header is accepted, as with nodeos's `http-validate-host = false`.
 - A body over `max_body_bytes` gets `413` with the body above; nodeos sends no such answer.
+- With `max_response_bytes` set, an upstream answer longer than it, other than a push's, gets `502` (or is cut off, when it has no `Content-Length`); nodeos limits no answer's size.
 - `OPTIONS` is always answered by the router, and there are no CORS headers unless `cors` is set.
 - The `Server` header comes from whichever upstream answered; the router's own answers have none.
 - With no live node up, the router answers `503` where a stopped nodeos would refuse the connection.
@@ -208,4 +211,4 @@ The `503` reasons:
 - **Readiness.** `/ready?scope=api` is `200` when every listener with a chain API accepts connections and has a live node API up on its chain (for a listener without a live server API, a verified frozen range server API that is up). Plain `/ready` never includes the chain API. See [Readiness and coverage](observability.md#readiness-and-coverage).
 - **Coverage.** `GET /coverage` has a `chain_api` entry per listener with what the probes last learned about each upstream API.
 - **Metrics.** `fleet_router_api_*` per listener and `fleet_router_upstream_api_*` per upstream API; see [Chain API series](observability.md#chain-api-series).
-- **Logs.** `chain API listening` at startup; `chain API up` and `chain API down` on each change, and warnings for a wrong `chain_id` or a lost verification. Each request is logged at debug with its class, status, upstream, attempts and time. Request bodies are never logged.
+- **Logs.** `chain API listening` at startup; `chain API up` and `chain API down` on each change, and warnings for a wrong `chain_id` or a lost verification. An answer refused or cut off for `max_response_bytes` is a warning that names the listener, server, API and path; an answer cut off because its upstream stopped sending is logged at debug the same way. Each request is logged at debug with its class, status, upstream, attempts and time. Request bodies are never logged.

@@ -74,8 +74,8 @@ use route::{BlockEndpoint, Route};
 use socket::Socket;
 use stats::{AnswerRole, ApiStats, BlockRegion, PushResult, Rejection, UpstreamResult};
 use upstream::{
-    full, peek, streamed, ApiBody, Attempt, Buffered, Call, Hold, Peeked, Replay, StallGuard,
-    UpstreamClient,
+    full, peek, streamed, ApiBody, Attempt, Buffered, Call, Hold, Peeked, Relay, Replay,
+    StallGuard, UpstreamClient,
 };
 
 /// Largest request head and buffered body chunk read from a client.
@@ -877,7 +877,11 @@ impl ChainApiCtx {
             if policy == Policy::Exec {
                 slot.results.inc(result_of(status, None));
                 return self.answered(
-                    streamed(response, self.hold(permit, Some(guard)), head_timeout),
+                    self.relayed(
+                        response,
+                        self.hold(permit, Some(guard)),
+                        self.relay_for(&slot, call, head_timeout),
+                    ),
                     &slot,
                     tried.len(),
                 );
@@ -888,7 +892,11 @@ impl ChainApiCtx {
                     Outcome::Final => {
                         slot.results.inc(result_of(status, None));
                         return self.answered(
-                            streamed(response, self.hold(permit, Some(guard)), head_timeout),
+                            self.relayed(
+                                response,
+                                self.hold(permit, Some(guard)),
+                                self.relay_for(&slot, call, head_timeout),
+                            ),
                             &slot,
                             tried.len(),
                         );
@@ -908,8 +916,13 @@ impl ChainApiCtx {
                 Ok(Ok(Peeked::Partial { prefix, rest })) => {
                     // Larger than anything worth classifying: final.
                     slot.results.inc(result_of(status, None));
+                    // Of unknown length (a known one would not need the
+                    // peek): `max_response_bytes` can only cut it off.
                     let mut out = Response::new(upstream::Held::body(
-                        StallGuard::body(Replay::body(prefix, rest), head_timeout),
+                        StallGuard::body(
+                            Replay::body(prefix, rest),
+                            self.relay_for(&slot, call, head_timeout),
+                        ),
                         self.hold(permit, Some(guard)),
                     ));
                     *out.status_mut() = parts.status;
@@ -992,6 +1005,51 @@ impl ChainApiCtx {
 
     fn hold(&self, permit: &mut Option<RequestPermit>, slot: Option<directory::SlotGuard>) -> Hold {
         Hold::new(permit.take(), slot)
+    }
+
+    /// How an answer from `slot` to `call` is relayed: `stall` is the
+    /// longest wait for its next frame.
+    fn relay_for(&self, slot: &ApiSlot, call: &Call, stall: Duration) -> Relay {
+        let max = self.cfg.max_response_bytes;
+        Relay {
+            stall,
+            max_bytes: (max > 0).then_some(max),
+            listener: self
+                .listener
+                .clone()
+                .unwrap_or_else(|| Arc::from("default")),
+            server: slot.name.clone(),
+            api: slot.base.clone(),
+            path: call
+                .target
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+        }
+    }
+
+    /// An upstream answer, streamed to the client. One whose `Content-Length`
+    /// is above `max_response_bytes` is not relayed at all: the client gets
+    /// `502` before any of it, rather than a head and a body cut short.
+    fn relayed(&self, response: Response<Incoming>, hold: Hold, relay: Relay) -> Response<ApiBody> {
+        let length = response.body().size_hint().exact();
+        if let (Some(length), Some(max)) = (length, relay.max_bytes) {
+            if length > max {
+                tracing::warn!(
+                    listener = %relay.listener,
+                    server = %relay.server,
+                    api = %relay.api,
+                    path = %relay.path,
+                    length,
+                    max_bytes = max,
+                    "chain API upstream answer is longer than max_response_bytes; answering 502"
+                );
+                drop(hold);
+                return router_error(RouterError::AnswerTooLarge(max));
+            }
+        }
+        streamed(response, hold, relay)
     }
 
     fn answered(&self, response: Response<ApiBody>, slot: &Arc<ApiSlot>, tries: usize) -> Answered {
@@ -1080,7 +1138,11 @@ impl ChainApiCtx {
                         PushResult::Error
                     });
                     return self.answered(
-                        streamed(response, self.hold(permit, Some(guard)), head_timeout),
+                        self.relayed(
+                            response,
+                            self.hold(permit, Some(guard)),
+                            self.relay_for(slot, call, head_timeout),
+                        ),
                         slot,
                         tries,
                     );

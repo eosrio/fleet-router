@@ -1,6 +1,6 @@
 //! Bodies the router writes itself, in nodeos's error shape
 //! (`{"code":H,"message":M,"error":{...}}`), so a client parses them like any
-//! node answer. The router writes only these four kinds; every parameter
+//! node answer. The router writes only these five kinds; every parameter
 //! error and every Unknown Block comes from an upstream.
 
 /// `error.code` of nodeos's `unknown_block_exception`.
@@ -55,6 +55,9 @@ pub enum RouterError {
     /// The request body exceeds the limit (bytes); the connection is closed
     /// after the answer.
     TooLarge(usize),
+    /// The upstream's answer is longer than `max_response_bytes` (the limit).
+    /// Not a 503: another attempt would get the same answer.
+    AnswerTooLarge(u64),
     Busy(Busy),
 }
 
@@ -64,6 +67,7 @@ impl RouterError {
             RouterError::IllegalTarget => 400,
             RouterError::NotFound => 404,
             RouterError::TooLarge(_) => 413,
+            RouterError::AnswerTooLarge(_) => 502,
             RouterError::Busy(_) => 503,
         }
     }
@@ -77,6 +81,11 @@ impl RouterError {
                 413,
                 "Payload Too Large",
                 &format!("Request body exceeds {limit} bytes"),
+            ),
+            RouterError::AnswerTooLarge(limit) => short_error(
+                502,
+                "Bad Gateway",
+                &format!("Upstream answer exceeds {limit} bytes"),
             ),
             RouterError::Busy(why) => short_error(503, "Busy", &why.what()),
         }
@@ -121,6 +130,11 @@ mod tests {
         assert_eq!(
             text(RouterError::TooLarge(2_097_152)),
             r#"{"code":413,"message":"Payload Too Large","error":{"code":413,"name":"Payload Too Large","what":"Request body exceeds 2097152 bytes","details":[]}}"#
+        );
+        assert_eq!(RouterError::AnswerTooLarge(1_048_576).status(), 502);
+        assert_eq!(
+            text(RouterError::AnswerTooLarge(1_048_576)),
+            r#"{"code":502,"message":"Bad Gateway","error":{"code":502,"name":"Bad Gateway","what":"Upstream answer exceeds 1048576 bytes","details":[]}}"#
         );
         assert_eq!(OPTIONS_BODY, b"{}");
     }

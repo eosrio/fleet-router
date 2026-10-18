@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
@@ -205,20 +206,35 @@ pub fn relay_headers(upstream: &HeaderMap) -> HeaderMap {
 
 /// An upstream answer streamed to the client. It ends with an error, which
 /// closes the client connection, when the upstream sends nothing for
-/// `stall` while the client waits for more ([`StallGuard`]).
-pub fn streamed(response: Response<Incoming>, hold: Hold, stall: Duration) -> Response<ApiBody> {
+/// `relay.stall` while the client waits for more, or passes
+/// `relay.max_bytes` ([`StallGuard`]).
+pub fn streamed(response: Response<Incoming>, hold: Hold, relay: Relay) -> Response<ApiBody> {
     let (parts, body) = response.into_parts();
-    let body = StallGuard::body(body.map_err(BoxError::from).boxed_unsync(), stall);
+    let body = StallGuard::body(body.map_err(BoxError::from).boxed_unsync(), relay);
     let mut out = Response::new(Held::body(body, hold));
     *out.status_mut() = parts.status;
     *out.headers_mut() = relay_headers(&parts.headers);
     out
 }
 
-/// Upper bound on the bytes streamed from one upstream response (64 MiB), so a
-/// trickle-streaming upstream cannot hold an in-flight permit and upstream slot
-/// forever.
-pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// How an upstream answer body is relayed, and what an answer that is cut
+/// off is logged as.
+#[derive(Clone, Debug)]
+pub struct Relay {
+    /// The longest wait for the upstream's next frame
+    /// (`upstream_timeout_ms`).
+    pub stall: Duration,
+    /// `max_response_bytes`: the most body bytes relayed. `None` relays any
+    /// length.
+    pub max_bytes: Option<u64>,
+    pub listener: Arc<str>,
+    /// The upstream server's name.
+    pub server: Arc<str>,
+    /// The upstream API's base URL.
+    pub api: String,
+    /// The request path, without its query.
+    pub path: String,
+}
 
 /// Why an upstream answer was cut off: the upstream sent its head and then
 /// stopped sending.
@@ -233,44 +249,45 @@ impl std::fmt::Display for UpstreamStalled {
 
 impl std::error::Error for UpstreamStalled {}
 
-/// Why an upstream answer was cut off: its body exceeded [`MAX_RESPONSE_BYTES`].
+/// Why an upstream answer was cut off: its body passed `max_response_bytes`.
 #[derive(Debug)]
 pub struct ResponseTooLarge;
 
 impl std::fmt::Display for ResponseTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the upstream answer exceeded the response size limit")
+        f.write_str("the upstream answer exceeded max_response_bytes")
     }
 }
 
 impl std::error::Error for ResponseTooLarge {}
 
 /// A body that fails with [`UpstreamStalled`] once a poll has waited
-/// `stall` for its next frame, or with [`ResponseTooLarge`] once the
-/// streamed bytes exceed `remaining`. The timer runs only while the listener
-/// waits for the upstream: a client that reads slowly keeps hyper from asking
-/// for more, which never counts against the upstream.
+/// `relay.stall` for its next frame, or with [`ResponseTooLarge`] once the
+/// streamed bytes pass `relay.max_bytes`. The timer runs only while the
+/// listener waits for the upstream: a client that reads slowly keeps hyper
+/// from asking for more, which never counts against the upstream.
+///
+/// Every frame within the stall time keeps the answer going, so an upstream
+/// that trickles bytes holds its permit and slot until it is done or the
+/// client leaves; only `max_bytes` bounds how much it sends.
 pub struct StallGuard {
     inner: ApiBody,
-    stall: Duration,
+    relay: Relay,
     timer: Option<Pin<Box<Sleep>>>,
     /// A poll found no frame and `timer` runs.
     waiting: bool,
-    remaining: usize,
+    /// Body bytes relayed so far.
+    streamed: u64,
 }
 
 impl StallGuard {
-    pub fn body(inner: ApiBody, stall: Duration) -> ApiBody {
-        Self::with_limit(inner, stall, MAX_RESPONSE_BYTES)
-    }
-
-    pub fn with_limit(inner: ApiBody, stall: Duration, limit: usize) -> ApiBody {
+    pub fn body(inner: ApiBody, relay: Relay) -> ApiBody {
         StallGuard {
             inner,
-            stall,
+            relay,
             timer: None,
             waiting: false,
-            remaining: limit,
+            streamed: 0,
         }
         .boxed_unsync()
     }
@@ -288,30 +305,38 @@ impl Body for StallGuard {
         let polled = Pin::new(&mut this.inner).poll_frame(cx);
         if let Poll::Ready(item) = polled {
             this.waiting = false;
-            if let Some(Ok(frame)) = &item {
+            if let (Some(Ok(frame)), Some(max)) = (&item, this.relay.max_bytes) {
                 if let Some(data) = frame.data_ref() {
-                    match this.remaining.checked_sub(data.len()) {
-                        Some(left) => this.remaining = left,
-                        None => {
-                            tracing::warn!(
-                                max_bytes = MAX_RESPONSE_BYTES,
-                                "chain API upstream response exceeded the byte limit; closing the client connection"
-                            );
-                            return Poll::Ready(Some(Err(ResponseTooLarge.into())));
-                        }
+                    this.streamed = this.streamed.saturating_add(data.len() as u64);
+                    if this.streamed > max {
+                        let r = &this.relay;
+                        tracing::warn!(
+                            listener = %r.listener,
+                            server = %r.server,
+                            api = %r.api,
+                            path = %r.path,
+                            max_bytes = max,
+                            "chain API upstream answer passed max_response_bytes; closing the client connection"
+                        );
+                        return Poll::Ready(Some(Err(ResponseTooLarge.into())));
                     }
                 }
             }
             return Poll::Ready(item);
         }
-        let stall = this.stall;
+        let stall = this.relay.stall;
         let timer = this.timer.get_or_insert_with(|| Box::pin(sleep(stall)));
         if !this.waiting {
             this.waiting = true;
             timer.as_mut().reset(tokio::time::Instant::now() + stall);
         }
         ready!(timer.as_mut().poll(cx));
+        let r = &this.relay;
         tracing::debug!(
+            listener = %r.listener,
+            server = %r.server,
+            api = %r.api,
+            path = %r.path,
             stall_ms = u64::try_from(stall.as_millis()).unwrap_or(u64::MAX),
             "chain API upstream stopped sending its answer; closing the client connection"
         );
@@ -478,6 +503,17 @@ mod tests {
         Ok(frame.into_data().expect("data"))
     }
 
+    fn relay(stall: Duration, max_bytes: Option<u64>) -> Relay {
+        Relay {
+            stall,
+            max_bytes,
+            listener: Arc::from("default"),
+            server: Arc::from("live-1"),
+            api: "http://127.0.0.1:1".to_string(),
+            path: "/v1/chain/get_table_rows".to_string(),
+        }
+    }
+
     // Only the upstream's own silence ends an answer: time the listener
     // spends not asking (a slow client) never counts, nor does a frame that
     // waits to be read.
@@ -485,7 +521,7 @@ mod tests {
     async fn an_upstream_body_that_stops_sending_fails_after_the_stall_time() {
         let stall = Duration::from_millis(200);
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let mut body = StallGuard::body(Fed(rx).boxed_unsync(), stall);
+        let mut body = StallGuard::body(Fed(rx).boxed_unsync(), relay(stall, None));
         tx.send(Bytes::from_static(b"a")).await.unwrap();
         tokio::time::sleep(stall * 2).await;
         assert_eq!(next(&mut body).await.unwrap(), "a");
@@ -515,10 +551,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_upstream_body_exceeding_the_byte_limit_fails_with_response_too_large() {
+    async fn an_upstream_body_past_max_bytes_fails_with_response_too_large() {
         let stall = Duration::from_secs(5);
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let mut body = StallGuard::with_limit(Fed(rx).boxed_unsync(), stall, 5);
+        let mut body = StallGuard::body(Fed(rx).boxed_unsync(), relay(stall, Some(5)));
         tx.send(Bytes::from_static(b"abc")).await.unwrap();
         tx.send(Bytes::from_static(b"de")).await.unwrap();
         tx.send(Bytes::from_static(b"f")).await.unwrap();
@@ -526,6 +562,15 @@ mod tests {
         assert_eq!(next(&mut body).await.unwrap(), "de");
         let err = next(&mut body).await.unwrap_err();
         assert!(err.is::<ResponseTooLarge>(), "{err}");
+
+        // Without a limit, any length goes through.
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut body = StallGuard::body(Fed(rx).boxed_unsync(), relay(stall, None));
+        let chunk = Bytes::from(vec![b'x'; 1 << 20]);
+        for _ in 0..3 {
+            tx.send(chunk.clone()).await.unwrap();
+            assert_eq!(next(&mut body).await.unwrap().len(), 1 << 20);
+        }
     }
 
     #[test]

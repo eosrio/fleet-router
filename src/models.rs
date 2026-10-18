@@ -1043,6 +1043,12 @@ pub struct ChainApiConfig {
     /// `max-body-size`), `1024..=67108864`.
     #[serde(default = "default_api_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// Largest upstream answer body relayed, in bytes. `0`, the default,
+    /// relays answers of any size, as one nodeos sends them. An answer whose
+    /// `Content-Length` is larger gets `502` instead; one without a length
+    /// is cut off once it passes this.
+    #[serde(default)]
+    pub max_response_bytes: u64,
     /// Client connections open at once; excess sockets are closed at accept.
     /// Default 1024.
     #[serde(default = "default_api_max_connections")]
@@ -3992,6 +3998,7 @@ mod tests {
         assert_eq!(api.block_source, BlockSource::FrozenFirst);
         assert!(api.push_servers.is_empty());
         assert_eq!(api.max_body_bytes, 2_097_152);
+        assert_eq!(api.max_response_bytes, 0, "answers of any size");
         assert_eq!(api.max_connections, 1024);
         assert_eq!(api.max_in_flight, 256);
         assert_eq!(api.max_in_flight_per_upstream, 64);
@@ -4164,6 +4171,7 @@ mod tests {
             "block_source": "live_first",
             "push_servers": ["live-1"],
             "max_body_bytes": 1024,
+            "max_response_bytes": 4_194_304,
             "max_connections": 10,
             "max_in_flight": 20,
             "max_in_flight_per_upstream": 5,

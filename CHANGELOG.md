@@ -94,6 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is never resent. The router answers with nodeos-shaped errors, nodeos's
   404 for unknown endpoints, and its own `get_supported_apis`, and never
   invents a parameter error or an Unknown Block. See `docs/chain-api.md`.
+- `chain_api.max_response_bytes` (off by default) bounds the upstream answers
+  a chain API relays: a longer `Content-Length` gets `502`, and an answer
+  without one is cut off once it passes the limit.
 - New metrics `fleet_router_api_*` and `fleet_router_upstream_api_*`; new
   readiness scope `/ready?scope=api`; a `chain_api` block per listener in
   `/coverage`.

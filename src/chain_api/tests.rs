@@ -604,6 +604,148 @@ async fn an_answer_left_unread_is_cut_off_and_gives_its_slots_back() {
     let _ = served.shutdown.send(());
 }
 
+// Without max_response_bytes an answer of any size is relayed whole, as one
+// nodeos sends it: 65 MiB of get_table_rows, with its Content-Length.
+#[tokio::test]
+async fn an_answer_of_any_size_is_relayed_whole_by_default() {
+    let api = live_api().await;
+    let table_rows = "/v1/chain/get_table_rows";
+    let size = 65 * 1024 * 1024;
+    api.set_fault(
+        Some(table_rows),
+        Some(Fault::Respond {
+            status: 200,
+            body: vec![b'x'; size].into(),
+        }),
+    );
+    let served = serve(&api, json!({ "listen_port": 1, "probe_ms": 100 })).await;
+    let answer = mock_ship::chain_api::exchange(
+        served.addr,
+        &request("POST", table_rows, "127.0.0.1", b"{}"),
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.header("content-length"), Some(&*size.to_string()));
+    assert_eq!(answer.body.len(), size);
+    let _ = served.shutdown.send(());
+}
+
+/// A live chain API that answers its probes, and answers `get_account`
+/// with a body of `chunks` chunks of 64 KiB and no `Content-Length`.
+async fn unframed_api(chunks: usize) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let service = service_fn(move |request: Request<Incoming>| async move {
+                let mut response = match request.uri().path() {
+                    "/v1/chain/get_info" => Response::new(full(format!(
+                        r#"{{"chain_id":"{}","head_block_num":1000,"last_irreversible_block_num":990,"earliest_available_block_num":1}}"#,
+                        "5a".repeat(32)
+                    ))),
+                    "/v1/chain/get_account" => {
+                        let chunk = Bytes::from(vec![b'x'; 64 * 1024]);
+                        let body =
+                            stream::iter((0..chunks).map(move |_| {
+                                Ok::<_, upstream::BoxError>(Frame::data(chunk.clone()))
+                            }));
+                        Response::new(StreamBody::new(body).boxed_unsync())
+                    }
+                    _ => router_error(RouterError::NotFound),
+                };
+                response
+                    .headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                Ok::<_, Infallible>(response)
+            });
+            tokio::spawn(async move {
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    url
+}
+
+// With max_response_bytes, an answer whose Content-Length is above it gets
+// 502 before anything of it is sent, and one without a length is cut off
+// once it passes it, closing the connection. Either way the request's
+// permit and the upstream's slot come back; a shorter answer goes through.
+#[tokio::test]
+async fn max_response_bytes_refuses_a_longer_answer_and_cuts_one_without_a_length() {
+    let (logs, _guard) = crate::test_log::capture();
+    let limit = 1024 * 1024;
+    let api = live_api().await;
+    let table_rows = "/v1/chain/get_table_rows";
+    let config = json!({ "listen_port": 1, "probe_ms": 100, "max_response_bytes": limit });
+    let served = serve(&api, config.clone()).await;
+    let slot = served.ctx.directory.slots()[0].clone();
+    let slots_back = || served.ctx.stats.in_flight() == 0 && slot.in_flight() == 0;
+
+    api.set_fault(
+        Some(table_rows),
+        Some(Fault::Respond {
+            status: 200,
+            body: vec![b'x'; limit].into(),
+        }),
+    );
+    let answer = post(served.addr, table_rows, b"{}").await;
+    assert_eq!((answer.status, answer.body.len()), (200, limit));
+
+    api.set_fault(
+        Some(table_rows),
+        Some(Fault::Respond {
+            status: 200,
+            body: vec![b'x'; limit + 1].into(),
+        }),
+    );
+    let answer = post(served.addr, table_rows, b"{}").await;
+    assert_eq!(answer.status, 502);
+    assert_eq!(
+        answer.text(),
+        r#"{"code":502,"message":"Bad Gateway","error":{"code":502,"name":"Bad Gateway","what":"Upstream answer exceeds 1048576 bytes","details":[]}}"#
+    );
+    wait_for(WAIT, "the refused answer kept its slots", slots_back).await;
+    let refused = logs.lines_with("longer than max_response_bytes");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    for field in [
+        "listener=default",
+        "server=live-1",
+        "path=/v1/chain/get_table_rows",
+    ] {
+        assert!(refused[0].contains(field), "{field} in {}", refused[0]);
+    }
+    let _ = served.shutdown.send(());
+
+    // 32 chunks of 64 KiB: 2 MiB with no Content-Length.
+    let url = unframed_api(32).await;
+    let served = serve_servers(json!([server("live-1", 9, &url)]), config).await;
+    wait_up(&served, 0).await;
+    let slot = served.ctx.directory.slots()[0].clone();
+    let mut conn = RawConn::connect(served.addr).await.unwrap();
+    conn.send(&request(
+        "POST",
+        "/v1/chain/get_account",
+        "127.0.0.1",
+        br#"{"account_name":"eosio"}"#,
+    ))
+    .await
+    .unwrap();
+    let head = conn.response_head(WAIT).await.unwrap();
+    assert_eq!(head.status, 200);
+    let sent = conn.pending(2 * limit, Duration::from_secs(2)).await;
+    assert!(sent.len() < 2 * limit, "cut off: {} bytes", sent.len());
+    wait_for(WAIT, "the cut answer kept its slots", || {
+        served.ctx.stats.in_flight() == 0 && slot.in_flight() == 0
+    })
+    .await;
+    assert_eq!(logs.lines_with("passed max_response_bytes").len(), 1);
+    let _ = served.shutdown.send(());
+}
+
 /// A live chain API that answers its probes, and answers `get_account`
 /// with a head and the first bytes of a body, then sends nothing more.
 async fn stalling_api() -> String {

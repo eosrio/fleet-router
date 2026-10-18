@@ -82,7 +82,7 @@ A common way to split a node's history is to archive its logs, then start a live
 
 - **Handoff.** When the client's cursor reaches the end of a leg, the router sends the next leg to the next upstream with the client's outstanding credit and the same request version and flags. When the next leg is on the same upstream (the fleet head moved on while a frozen leg was clamped to it, say), the stream goes on over the same link with a new request; that is no handoff, even when the session first waited for the fleet head to move. A frozen link at the end of its leg is also reused for a following client request to the same archive. A handoff is never a failure: no strike, no backoff, no exclusion. `fleet_router_handoffs_total` counts them when the next leg is sent to another upstream, and `fleet_router_handoff_latency_seconds` times the gap from the last frame of the old link to the first frame of the new one (from the end of the wait or hold, when the next leg first waited for the fleet or held).
 - **Pre-dial.** When [`predial_blocks`](configuration.md#topology-and-stitching) or fewer blocks remain in a leg, the next leg's upstream is connected ahead of time (WebSocket and ABI). A standby link unused for 60 s, or no longer part of the plan, is dropped. `fleet_router_predials_total{result}` counts them.
-- **Continuity.** The first result after a seam must continue the last block the client got: its `prev_block` id must be that block's id. A frozen upstream that breaks this is a `discontinuity` contract violation (struck and failed over); a live one is forwarded and logged as an error. The first result of any leg on an archive that follows the last irreversible block the client got is checked the same way, including a new client request that goes on where the last one ended, so an archive of another chain is not served across a seam.
+- **Continuity.** The first result after a seam must continue the last block the client got: its `prev_block` id must be that block's id. A frozen upstream that breaks this is a `discontinuity` contract violation (struck and failed over); a live one fails over when another upstream covers the block, and otherwise is forwarded and logged as an error. The first result of any leg on an archive that follows the last irreversible block the client got is checked the same way, including a new client request that goes on where the last one ended, so an archive of another chain is not served across a seam.
 - **Missing `prev_block`.** An archive leaves `prev_block` out for the first block of its range when no log it has holds the block before. When a frozen result for block `n` has no `prev_block` and the session has just delivered block `n - 1`, which was irreversible when it was delivered, the router fills `prev_block` in from that block. `fleet_router_upstream_prev_blocks_filled_total` counts it.
 - **Below the fleet's first block.** A request that starts below the first block any upstream holds goes to the upstream that holds that first block. It answers results without ids until its own range begins, as Spring does.
 
@@ -104,12 +104,12 @@ This table applies to pool and stitched listeners alike. A **strike** counts aga
 | Unclean drop: the stream ended with no Close frame | yes | 100 ms, doubling to 3.2 s at the same block | prefers another upstream |
 | Close frame | no | 100 ms | |
 | `idle_timeout_ms` of silence while owed | no | 100 ms | |
-| `upstream_stall_timeout_ms` of silence while owed, live upstream | no | 100 ms | prefers another upstream |
+| `upstream_stall_timeout_ms` of silence while owed, live upstream (when another upstream can serve) | no | 100 ms | prefers another upstream |
 | The same, frozen upstream | yes | as for an unclean drop | prefers another upstream |
 | No byte within `upstream_liveness_timeout_ms` (1 s after the monitor lost it) | no | 100 ms | prefers another upstream; a live one is marked offline |
 | The monitor marked it offline and it sent nothing for 5 s while owed | no | 100 ms | prefers another upstream |
 | Frozen contract violation | yes | as for an unclean drop | prefers another upstream |
-| A live resume jumped past the cursor while another upstream covers it | no | none | avoids it for 30 s |
+| A live resume jumped past the cursor, or broke `prev_block` continuity, while another upstream covers it | no | none | avoids it for 30 s |
 | The request could not be written to a new link | no | 100 ms | avoids it for 2 s |
 | Moved by an operator | no | 100 ms | avoids it until the next link is up, and returns there if no other upstream can take the session |
 | Moved off an archive without a block log | no | none | see [fetch_block and block logs](#fetch_block-and-block-logs) |

@@ -171,7 +171,7 @@ The router sends a frozen range server only block requests for blocks in its `bl
 | Requests to one upstream API | `max_in_flight_per_upstream` | That candidate is skipped; when every candidate is full, the request waits `upstream_queue_ms` for a slot. |
 | Upstream connect | `handshake_timeout_ms` (10 s when `0`) | Next candidate. |
 | Upstream response head | `upstream_timeout_ms` per attempt | Next candidate; for an exec or push that may have been written, `503`. |
-| Gap inside an upstream's answer body | `upstream_timeout_ms` | The answer is cut off. |
+| Gap inside an upstream's answer body | `upstream_timeout_ms` (or 64 MiB total streamed body) | The answer is cut off. |
 | Whole request | `request_deadline_ms` | No further attempt. |
 
 ## Errors the router writes

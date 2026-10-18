@@ -161,10 +161,11 @@ pub(super) struct ClientSide {
 }
 
 impl ClientSide {
-    /// A client ack: `C += n`, wrapping like Spring's `uint32_t` add. It is
-    /// folded in whether or not a link is up.
+    /// A client ack: `C = C.saturating_add(n)`, so acking an open (`u32::MAX`)
+    /// window never wraps the credit back to zero. It is folded in whether or
+    /// not a link is up.
     pub fn ack(&mut self, n: u32) {
-        self.credit = self.credit.wrapping_add(n);
+        self.credit = self.credit.saturating_add(n);
     }
 
     /// A new `get_blocks` replaces the request, the credit and the cursor.
@@ -392,7 +393,7 @@ pub(super) fn judge(
     lr: &LinkReq,
     h: &ResultHead,
     lacks: impl FnOnce(u32) -> Lacks,
-    alternative: impl FnOnce(u32) -> bool,
+    alternative: impl Fn(u32) -> bool,
 ) -> Judgement {
     let cls = classify_result(h, st.up_cursor, lr);
     let frozen = st.role == Role::Frozen;
@@ -465,6 +466,11 @@ pub(super) fn judge(
             if last.num.checked_add(1) == Some(this.num) && prev.id != last.id {
                 if frozen {
                     return violation(ViolationKind::Discontinuity);
+                }
+                if (c.delivered_for_request > 0 || c.last_irreversible().is_some())
+                    && alternative(k)
+                {
+                    return Judgement::End(UpEnd::Uncovered);
                 }
                 fw.discontinuity = true;
             }
@@ -862,7 +868,7 @@ mod tests {
         assert_eq!(pre, 5);
         assert_eq!(c.credit, 3, "a request replaces C");
         c.ack(u32::MAX);
-        assert_eq!(c.credit, 2, "an ack wraps like Spring's uint32_t add");
+        assert_eq!(c.credit, u32::MAX, "an ack saturates at u32::MAX");
 
         // Every forwarded kind costs one.
         let mut st = state(Role::Live, 100, 200, Purpose::Initial);
@@ -945,6 +951,42 @@ mod tests {
             judge(&c, &st, &creq, &lr, &h, |_| Lacks::Nothing, |k| k == 100),
             Judgement::End(UpEnd::Uncovered)
         );
+
+        // A live seam whose prev_block disagrees with the delivered block
+        // fails over when an alternative covers the cursor, and otherwise
+        // forwards with `discontinuity` flagged.
+        let mut c_seam = client_at(100, 100, false);
+        c_seam.last = Some(pos(99));
+        c_seam.delivered_for_request = 1;
+        let mut broken_live = head(false, 1000, 990, Some(pos(100)));
+        broken_live.prev_block = Some(forked(99));
+        assert_eq!(
+            judge(
+                &c_seam,
+                &st,
+                &creq,
+                &lr,
+                &broken_live,
+                |_| Lacks::Nothing,
+                |k| k == 100
+            ),
+            Judgement::End(UpEnd::Uncovered)
+        );
+        assert!(matches!(
+            judge(
+                &c_seam,
+                &st,
+                &creq,
+                &lr,
+                &broken_live,
+                |_| Lacks::Nothing,
+                |_| false
+            ),
+            Judgement::Forward(Forward {
+                discontinuity: true,
+                ..
+            })
+        ));
 
         // A fresh request moved to another upstream may jump too.
         let c = client_at(100, 100, false);

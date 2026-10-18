@@ -316,12 +316,13 @@ pub(super) fn settled(st: &LinkState, legacy_status: bool) -> bool {
 
 /// Whether the link owes the client blocks: a request, credit, and an
 /// upstream cursor below its end and (live) at or below the gate a Spring
-/// node would send up to. The gate is the link's own last head (LIB for
-/// `irreversible_only`) or, failing that, the fleet's (`fleet_gate`).
+/// node would send up to. Either the link's own last head (LIB for
+/// `irreversible_only`) or the fleet's (`fleet_gate`) counts, so a link that
+/// sits silent at its own tip owes blocks once the fleet moves ahead of it.
 ///
 /// An uncertain cursor is judged at its upper bound, where every position
 /// matched and the upstream owes the least. A resume whose start is already
-/// at its end, or past the gate, may rightly get nothing, so its silence is
+/// at its end, or past both gates, may rightly get nothing, so its silence is
 /// never a stall.
 pub(super) fn owed(
     st: &LinkState,

@@ -14,12 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upstream's reply. Until the fleet head and LIB are known, the request is
   still relayed to the session's upstream.
 - Two new checks are on by default: `upstream_stall_timeout_ms` (60 s) fails
-  over an upstream that stops sending blocks it owes, and `live_lag_blocks`
-  (1200) ranks a live node that far behind the fleet head like a stale one
-  for blocks above its own head. Set either to `0` to turn it off.
+  over an upstream that stops sending blocks it owes (on a live upstream only
+  when another online upstream can serve the next block, so a sole live
+  upstream is never dropped while it still answers liveness pings), and
+  `live_lag_blocks` (1200) ranks a live node that far behind the fleet head
+  like a stale one for blocks above its own head. Set either to `0` to turn it
+  off.
 - The upstream liveness check now counts bytes as they arrive, so the 0.6.0
-  advice to raise `upstream_liveness_timeout_ms` for large blocks on a slow
-  link no longer applies.
+  advice to raise `upstream_liveness_timeout_ms` for large blocks whose bytes
+  are already flowing on a slow link no longer applies. A block that spends
+  longer than `upstream_stall_timeout_ms` before its first byte is written
+  will still trigger a stall failover when another upstream is available.
 - `max_connections`, at the top level and per listener, must be at most
   1000000. A larger value fails validation.
 - Existing config files stay valid, and a listener without frozen servers
@@ -53,8 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A frozen range server without a block log is supported. Requests with
   `fetch_block` prefer an upstream that holds blocks and move to it with no
   strike; otherwise results are forwarded without `block`. A frozen result
-  without `prev_block`, right after a block the session delivered, gets it
-  filled in from that block.
+  without `prev_block`, right after an irreversible block the session
+  delivered (at or below the LIB already sent to the client), gets it filled
+  in from that block.
 - `example.stitched.config.json`, a stitched listener with two archived
   ranges, two live nodes and a chain API.
 - `config test --strict`: exits 1 when the config is invalid, a stitched

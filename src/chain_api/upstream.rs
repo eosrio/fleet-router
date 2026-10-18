@@ -215,6 +215,11 @@ pub fn streamed(response: Response<Incoming>, hold: Hold, stall: Duration) -> Re
     out
 }
 
+/// Upper bound on the bytes streamed from one upstream response (64 MiB), so a
+/// trickle-streaming upstream cannot hold an in-flight permit and upstream slot
+/// forever.
+pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Why an upstream answer was cut off: the upstream sent its head and then
 /// stopped sending.
 #[derive(Debug)]
@@ -228,25 +233,44 @@ impl std::fmt::Display for UpstreamStalled {
 
 impl std::error::Error for UpstreamStalled {}
 
+/// Why an upstream answer was cut off: its body exceeded [`MAX_RESPONSE_BYTES`].
+#[derive(Debug)]
+pub struct ResponseTooLarge;
+
+impl std::fmt::Display for ResponseTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the upstream answer exceeded the response size limit")
+    }
+}
+
+impl std::error::Error for ResponseTooLarge {}
+
 /// A body that fails with [`UpstreamStalled`] once a poll has waited
-/// `stall` for its next frame. The timer runs only while the listener waits
-/// for the upstream: a client that reads slowly keeps hyper from asking for
-/// more, which never counts against the upstream.
+/// `stall` for its next frame, or with [`ResponseTooLarge`] once the
+/// streamed bytes exceed `remaining`. The timer runs only while the listener
+/// waits for the upstream: a client that reads slowly keeps hyper from asking
+/// for more, which never counts against the upstream.
 pub struct StallGuard {
     inner: ApiBody,
     stall: Duration,
     timer: Option<Pin<Box<Sleep>>>,
     /// A poll found no frame and `timer` runs.
     waiting: bool,
+    remaining: usize,
 }
 
 impl StallGuard {
     pub fn body(inner: ApiBody, stall: Duration) -> ApiBody {
+        Self::with_limit(inner, stall, MAX_RESPONSE_BYTES)
+    }
+
+    pub fn with_limit(inner: ApiBody, stall: Duration, limit: usize) -> ApiBody {
         StallGuard {
             inner,
             stall,
             timer: None,
             waiting: false,
+            remaining: limit,
         }
         .boxed_unsync()
     }
@@ -262,9 +286,23 @@ impl Body for StallGuard {
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let this = self.get_mut();
         let polled = Pin::new(&mut this.inner).poll_frame(cx);
-        if polled.is_ready() {
+        if let Poll::Ready(item) = polled {
             this.waiting = false;
-            return polled;
+            if let Some(Ok(frame)) = &item {
+                if let Some(data) = frame.data_ref() {
+                    match this.remaining.checked_sub(data.len()) {
+                        Some(left) => this.remaining = left,
+                        None => {
+                            tracing::warn!(
+                                max_bytes = MAX_RESPONSE_BYTES,
+                                "chain API upstream response exceeded the byte limit; closing the client connection"
+                            );
+                            return Poll::Ready(Some(Err(ResponseTooLarge.into())));
+                        }
+                    }
+                }
+            }
+            return Poll::Ready(item);
         }
         let stall = this.stall;
         let timer = this.timer.get_or_insert_with(|| Box::pin(sleep(stall)));
@@ -474,6 +512,20 @@ mod tests {
         let err = next(&mut body).await.unwrap_err();
         assert!(err.is::<UpstreamStalled>(), "{err}");
         assert!(started.elapsed() >= stall - Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn an_upstream_body_exceeding_the_byte_limit_fails_with_response_too_large() {
+        let stall = Duration::from_secs(5);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut body = StallGuard::with_limit(Fed(rx).boxed_unsync(), stall, 5);
+        tx.send(Bytes::from_static(b"abc")).await.unwrap();
+        tx.send(Bytes::from_static(b"de")).await.unwrap();
+        tx.send(Bytes::from_static(b"f")).await.unwrap();
+        assert_eq!(next(&mut body).await.unwrap(), "abc");
+        assert_eq!(next(&mut body).await.unwrap(), "de");
+        let err = next(&mut body).await.unwrap_err();
+        assert!(err.is::<ResponseTooLarge>(), "{err}");
     }
 
     #[test]

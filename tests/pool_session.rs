@@ -903,3 +903,51 @@ async fn p16_an_oversized_message_closes_the_client_without_a_strike() {
         1.0
     );
 }
+
+/// P17: a pre-extension v0-only upstream (rejects `get_status_request_v1` and
+/// omits `chain_id` from `get_status_result_v0`) comes online via the monitor's
+/// v0 fallback, and the router answers both v0 (89 bytes, no `chain_id`) and
+/// v1 (32 zero bytes) status requests itself.
+#[tokio::test]
+async fn p17_a_v0_only_upstream_without_chain_id_serves_router_answered_status() {
+    let (ep_a, a) = mock(MockShipConfig {
+        fidelity: Fidelity::Eosio2,
+        omit_chain_id: true,
+        head_block: 1000,
+        lib_block: 990,
+        trace_begin_block: 10,
+        trace_end_block: 0,
+        blocks_to_stream: 0,
+        ..MockShipConfig::default()
+    })
+    .await;
+    let _a = a.start();
+    let router = RouterProcess::start(config(&[&ep_a])).await;
+    wait_up(&router, &ep_a, "a").await;
+
+    let (mut w, mut r) = client(&router).await;
+    send(&mut w, status_v0()).await;
+    let Message::Binary(raw_v0) = read_msg(&mut r, WAIT).await else {
+        panic!("expected a binary status v0 reply");
+    };
+    let v0 = StatusView::parse(&raw_v0).expect("valid status v0");
+    assert_eq!(v0.variant, 0);
+    assert_eq!(v0.len, 89, "v0 without chain_id is 89 bytes");
+    assert_eq!(v0.chain_id, None);
+    assert_eq!((v0.head.0, v0.lib.0), (1000, 990));
+    assert_eq!(v0.trace, (10, 1001));
+
+    send(&mut w, status_v1()).await;
+    let Message::Binary(raw_v1) = read_msg(&mut r, WAIT).await else {
+        panic!("expected a binary status v1 reply");
+    };
+    let v1 = StatusView::parse(&raw_v1).expect("valid status v1");
+    assert_eq!(v1.variant, 3);
+    assert_eq!(v1.chain_id, Some([0u8; 32]));
+    assert_eq!((v1.head.0, v1.lib.0), (1000, 990));
+    for version in ["v0", "v1"] {
+        let series =
+            format!("fleet_router_status_replies_total{{version=\"{version}\",source=\"router\"}}");
+        assert_eq!(metric(&router, &series).await, 1.0);
+    }
+}

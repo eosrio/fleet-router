@@ -186,6 +186,9 @@ pub struct MockShipConfig {
     /// even when requested, and the first block whose id the server knows
     /// has no `prev_block` (only a block log holds the id before it).
     pub no_block_log: bool,
+    /// Omit the 32-byte `chain_id` binary extension from `get_status_result_v0`
+    /// replies (models pre-extension EOSIO 2.0 / FIO SHiP nodes).
+    pub omit_chain_id: bool,
 }
 
 /// How the mock treats `get_status` requests. Used to exercise monitor limits.
@@ -239,6 +242,7 @@ impl Default for MockShipConfig {
             fork: None,
             throttle_bytes_per_sec: None,
             no_block_log: false,
+            omit_chain_id: false,
         }
     }
 }
@@ -783,8 +787,11 @@ async fn legacy_session<S>(
                             continue;
                         }
 
-                        let result =
+                        let mut result =
                             encode_status(config.emit_status_v1, &shared.status_fields(false));
+                        if !config.emit_status_v1 && config.omit_chain_id {
+                            result.truncate(result.len() - 32);
+                        }
                         if writer.send(Message::Binary(result.into())).await.is_err() {
                             return;
                         }
@@ -1144,7 +1151,10 @@ impl<'a> SpringSession<'a> {
         if matches!(config.status_fault, Some(StatusFault::Ignore)) {
             return true;
         }
-        let reply = encode_status(v1, &self.shared.status_fields(true));
+        let mut reply = encode_status(v1, &self.shared.status_fields(true));
+        if !v1 && config.omit_chain_id {
+            reply.truncate(reply.len() - 32);
+        }
         if writer.send(Message::Binary(reply.into())).await.is_err() {
             return false;
         }

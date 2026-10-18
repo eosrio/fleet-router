@@ -144,8 +144,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - In a stitched listener, a leg's dial in progress is replaced as soon as a
   view shows its upstream can no longer serve the cursor (disabled,
   quarantined, or its range shrunk below it), and its request end follows the
-  view. It is kept when another upstream only ranks higher by then, or the
-  monitor misses a status of it.
+  view. It is kept when another upstream only ranks higher by then. When the
+  monitor marks its upstream offline, it is kept only while no online
+  upstream can serve the cursor, so a dead host no longer holds the leg until
+  the dial times out. A bounded hold whose `gap_wait_ms` runs out while a
+  retry's dial is on its way makes its last try then, instead of closing the
+  client.
 - A live seam whose first result does not continue the last delivered block
   fails over when another upstream covers the block, with a warning that
   gives both ids and `fleet_router_failovers_total{reason="discontinuity"}`.

@@ -155,6 +155,12 @@ pub(super) struct LinkState {
     /// When the link last started to owe blocks, or last made progress.
     pub became_owed_at: Instant,
     pub was_owed: bool,
+    /// A live stall found no other upstream to move to: it is checked again
+    /// at this instant, or at the next fleet view, whichever comes first.
+    pub stall_recheck: Option<Instant>,
+    /// The start of the silence whose stall was kept and logged, so it is
+    /// logged once.
+    pub stall_kept: Option<Instant>,
     pub frames: u64,
     /// Stitched: a link kept open with nothing to send (its leg is done) is
     /// closed at this instant unless a new request reuses it first.
@@ -222,6 +228,8 @@ impl LinkState {
             unknown_forwarded_at: None,
             became_owed_at: now,
             was_owed: false,
+            stall_recheck: None,
+            stall_kept: None,
             frames: 0,
             linger_until: None,
             ping_at: None,
@@ -316,12 +324,13 @@ pub(super) fn settled(st: &LinkState, legacy_status: bool) -> bool {
 
 /// Whether the link owes the client blocks: a request, credit, and an
 /// upstream cursor below its end and (live) at or below the gate a Spring
-/// node would send up to. The gate is the link's own last head (LIB for
-/// `irreversible_only`) or, failing that, the fleet's (`fleet_gate`).
+/// node would send up to. Either the link's own last head (LIB for
+/// `irreversible_only`) or the fleet's (`fleet_gate`) counts, so a link that
+/// sits silent at its own tip owes blocks once the fleet moves ahead of it.
 ///
 /// An uncertain cursor is judged at its upper bound, where every position
 /// matched and the upstream owes the least. A resume whose start is already
-/// at its end, or past the gate, may rightly get nothing, so its silence is
+/// at its end, or past both gates, may rightly get nothing, so its silence is
 /// never a stall.
 pub(super) fn owed(
     st: &LinkState,

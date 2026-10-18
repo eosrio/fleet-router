@@ -143,7 +143,8 @@ pub(super) struct ClientSide {
     /// The current client request, as decoded.
     pub req: Option<BlocksRequest>,
     /// `send_credits` mirror (C): replaced by a request, raised by acks
-    /// (wrapping), lowered by every forwarded result.
+    /// (saturating at `u32::MAX`, see [`ClientSide::ack`]), lowered by every
+    /// forwarded result.
     pub credit: u32,
     /// The next block the client expects.
     pub cursor: u32,
@@ -161,10 +162,18 @@ pub(super) struct ClientSide {
 }
 
 impl ClientSide {
-    /// A client ack: `C += n`, wrapping like Spring's `uint32_t` add. It is
-    /// folded in whether or not a link is up.
-    pub fn ack(&mut self, n: u32) {
-        self.credit = self.credit.wrapping_add(n);
+    /// A client ack: `C = C.saturating_add(n)`, folded in whether or not a
+    /// link is up. Returns how much C rose: what the link's upstream is to be
+    /// acked. Its own counter is C less the results in flight, so it stays
+    /// that, and never passes `u32::MAX` or wraps.
+    ///
+    /// One Spring node adds the ack to its `uint32_t` with a wrap, which past
+    /// `u32::MAX` leaves a window the client cannot know (it depends on the
+    /// results in flight). The router keeps the window open instead.
+    pub fn ack(&mut self, n: u32) -> u32 {
+        let before = self.credit;
+        self.credit = before.saturating_add(n);
+        self.credit - before
     }
 
     /// A new `get_blocks` replaces the request, the credit and the cursor.
@@ -374,8 +383,9 @@ pub(super) enum Judgement {
     Duplicate {
         advance_to: Option<u32>,
     },
-    /// End the link (contract violation, or a live resume jump while another
-    /// upstream covers the cursor).
+    /// End the link (a contract violation, or a live resume that jumps past
+    /// the cursor or does not continue the last delivered block, while
+    /// another upstream covers the cursor).
     End(UpEnd),
 }
 
@@ -392,7 +402,7 @@ pub(super) fn judge(
     lr: &LinkReq,
     h: &ResultHead,
     lacks: impl FnOnce(u32) -> Lacks,
-    alternative: impl FnOnce(u32) -> bool,
+    alternative: impl Fn(u32) -> bool,
 ) -> Judgement {
     let cls = classify_result(h, st.up_cursor, lr);
     let frozen = st.role == Role::Frozen;
@@ -465,6 +475,11 @@ pub(super) fn judge(
             if last.num.checked_add(1) == Some(this.num) && prev.id != last.id {
                 if frozen {
                     return violation(ViolationKind::Discontinuity);
+                }
+                if (c.delivered_for_request > 0 || c.last_irreversible().is_some())
+                    && alternative(k)
+                {
+                    return Judgement::End(UpEnd::Discontinuity);
                 }
                 fw.discontinuity = true;
             }
@@ -849,9 +864,9 @@ mod tests {
 
     /// L1: the credit ledger.
     #[test]
-    fn credit_ledger_replaces_wraps_charges_and_refunds() {
+    fn credit_ledger_replaces_saturates_charges_and_refunds() {
         let mut c = ClientSide::default();
-        c.ack(5);
+        assert_eq!(c.ack(5), 5);
         assert_eq!(c.credit, 5, "acks before any request are folded in");
         let pre = c.new_request(BlocksRequest {
             start: 100,
@@ -861,8 +876,12 @@ mod tests {
         });
         assert_eq!(pre, 5);
         assert_eq!(c.credit, 3, "a request replaces C");
-        c.ack(u32::MAX);
-        assert_eq!(c.credit, 2, "an ack wraps like Spring's uint32_t add");
+        // An ack past u32::MAX saturates, and only what C rose by is left
+        // to forward, so the upstream's counter (at most C) never wraps.
+        assert_eq!(c.ack(u32::MAX), u32::MAX - 3);
+        assert_eq!(c.credit, u32::MAX, "an ack saturates at u32::MAX");
+        assert_eq!(c.ack(7), 0, "an open window rises no further");
+        assert_eq!(c.credit, u32::MAX);
 
         // Every forwarded kind costs one.
         let mut st = state(Role::Live, 100, 200, Purpose::Initial);
@@ -945,6 +964,42 @@ mod tests {
             judge(&c, &st, &creq, &lr, &h, |_| Lacks::Nothing, |k| k == 100),
             Judgement::End(UpEnd::Uncovered)
         );
+
+        // A live seam whose prev_block disagrees with the delivered block
+        // fails over when an alternative covers the cursor, and otherwise
+        // forwards with `discontinuity` flagged.
+        let mut c_seam = client_at(100, 100, false);
+        c_seam.last = Some(pos(99));
+        c_seam.delivered_for_request = 1;
+        let mut broken_live = head(false, 1000, 990, Some(pos(100)));
+        broken_live.prev_block = Some(forked(99));
+        assert_eq!(
+            judge(
+                &c_seam,
+                &st,
+                &creq,
+                &lr,
+                &broken_live,
+                |_| Lacks::Nothing,
+                |k| k == 100
+            ),
+            Judgement::End(UpEnd::Discontinuity)
+        );
+        assert!(matches!(
+            judge(
+                &c_seam,
+                &st,
+                &creq,
+                &lr,
+                &broken_live,
+                |_| Lacks::Nothing,
+                |_| false
+            ),
+            Judgement::Forward(Forward {
+                discontinuity: true,
+                ..
+            })
+        ));
 
         // A fresh request moved to another upstream may jump too.
         let c = client_at(100, 100, false);

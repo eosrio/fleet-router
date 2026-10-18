@@ -73,7 +73,12 @@ upgrading an existing deployment is not a no-op. Read these first.
   a live node more than that many blocks behind the fleet head rank like a
   stale one when a session picks an upstream for a block above that node's
   head; a session already on it is not moved by this rule. Set either to `0`
-  to turn it off.
+  to turn it off. The stall check fails a live upstream over only when
+  another online upstream can serve the next block. A live upstream that
+  none could replace is kept, with one warning, until it has been silent
+  for three times the timeout, and is then redialed; `idle_timeout_ms` and
+  the 5 s rule below still fail it over sooner. A frozen upstream is failed
+  over at the first stall, with a strike.
 - A third check has no setting: when the monitor has marked a session's
   upstream offline, the session fails over after 5 s without a data byte
   while it owes blocks, even with `upstream_liveness_timeout_ms` at `0` and
@@ -102,8 +107,15 @@ upgrading an existing deployment is not a no-op. Read these first.
   WebSocket upgrade makes the session avoid that upstream for 2 s without
   marking it offline.
 - The upstream liveness check now counts bytes as they arrive, so the 0.6.0
-  advice to raise `upstream_liveness_timeout_ms` for large blocks on a slow
-  link no longer applies.
+  advice to raise `upstream_liveness_timeout_ms` for large blocks whose
+  bytes are already flowing on a slow link no longer applies. A block whose
+  first byte takes longer than `upstream_stall_timeout_ms` still triggers
+  the stall check above.
+- A live result whose `prev_block` does not continue the last block the
+  client got now fails over when another upstream covers the block,
+  counted as `fleet_router_failovers_total{reason="discontinuity"}` with a
+  warning that gives both ids. When no other upstream can serve it, it is
+  forwarded and logged as an error. 0.6.0 forwarded it unchecked.
 
 **Requests and upstream connections**
 
@@ -118,6 +130,9 @@ upgrading an existing deployment is not a no-op. Read these first.
   opens a new upstream connection (connect, upgrade and ABI read) instead of
   reusing the socket. A request sent after the previous one has finished
   reuses it.
+- A client ack that would take the session's credit past `u32::MAX` leaves
+  it at `u32::MAX`, and the upstream is acked only by what the credit rose.
+  One Spring node wraps the sum instead.
 - `handshake_timeout_ms` (10 s when `0`) now also bounds each session's
   upstream connect, upgrade and ABI read, and each request write to an
   upstream. A dial that runs out marks a live upstream offline; an HTTP 503
@@ -139,16 +154,18 @@ upgrading an existing deployment is not a no-op. Read these first.
   (`fleet_router_reroutes_total` counts them).
 - Dashboard `session_failover` events give the reason as the metric label
   (`unclean`, `clean`, `idle`, `silent`, `operator`, `stall`, `offline`,
-  `uncovered`, `send`) instead of 0.6.0's phrases, so anything that parses
+  `uncovered`, `discontinuity`, `send`) instead of 0.6.0's phrases, so anything that parses
   that text needs updating. Client closes for 1003, 1007, oversized messages
   and an unavailable status emit no event. A session is listed as soon as
   the client connects.
 - Logs: operator moves and drains log one WARN
   `upstream stream ended; attempting failover` per moved session, and every
   session ends with an INFO `session closed` line. New WARN lines cover ABI
-  differences within a pool, stalls, offline-and-silent failovers, sequence
-  jumps and a missing `chain_id`, and a new ERROR line covers a result that
-  does not continue the last delivered block at a failover.
+  differences within a pool, stalls (and a stalled live upstream kept
+  because nothing can replace it), offline-and-silent failovers, sequence
+  jumps, discontinuities that fail over and a missing `chain_id`, and a new
+  ERROR line covers a result that does not continue the last delivered
+  block when no other upstream can serve it.
 
 ### Added
 
@@ -178,8 +195,9 @@ upgrading an existing deployment is not a no-op. Read these first.
 - A frozen range server without a block log is supported. Requests with
   `fetch_block` prefer an upstream that holds blocks and move to it with no
   strike; otherwise results are forwarded without `block`. A frozen result
-  without `prev_block`, right after a block the session delivered, gets it
-  filled in from that block.
+  without `prev_block`, right after an irreversible block the session
+  delivered (at or below the LIB already sent to the client), gets it filled
+  in from that block.
 - `example.stitched.config.json`, a stitched listener with two archived
   ranges, two live nodes and a chain API.
 - `config test --strict`: exits 1 when the config is invalid, a stitched
@@ -213,6 +231,10 @@ upgrading an existing deployment is not a no-op. Read these first.
   is never resent. The router answers with nodeos-shaped errors, nodeos's
   404 for unknown endpoints, and its own `get_supported_apis`, and never
   invents a parameter error or an Unknown Block. See `docs/chain-api.md`.
+- `chain_api.max_response_bytes` (off by default, otherwise at least 65536)
+  bounds the upstream answers a chain API relays: a longer `Content-Length`
+  gets `502`, and an answer without one is cut off once it passes the limit.
+  A push's answer is relayed whole, since the node may have applied the push.
 - New metrics `fleet_router_api_*` and `fleet_router_upstream_api_*`; new
   readiness scope `/ready?scope=api`; a `chain_api` block per listener in
   `/coverage`.
@@ -253,6 +275,24 @@ upgrading an existing deployment is not a no-op. Read these first.
   and a dial that lands on an upstream disabled meanwhile goes to another
   upstream when one can take the session. Disable, drain, priority and weight
   also apply to the chain API.
+- In a stitched listener, a leg's dial in progress is replaced as soon as a
+  view shows its upstream can no longer serve the cursor: disabled while
+  another upstream can serve it, quarantined at it, or its range shrunk below
+  it. Otherwise its request end follows the view, and it is kept when another
+  upstream only ranks higher by then. When the monitor marks its upstream
+  offline, it is kept unless another online upstream that is not excluded
+  can serve the cursor, so a dead host no longer holds the leg until the dial
+  times out, and the upstream the session just failed off never takes the
+  leg back. When a bounded hold's `gap_wait_ms` runs out while a retry's dial
+  that can still serve the cursor is on its way, that dial is the hold's last
+  try, so the client is not closed while it runs; at the deadline, and on any
+  later view, it still gives way to an online upstream that is not excluded
+  and can serve the cursor.
+- A live seam whose first result does not continue the last delivered block
+  fails over when another upstream covers the block, with a warning that
+  gives both ids and `fleet_router_failovers_total{reason="discontinuity"}`.
+  When none does, the result is forwarded and logged as an error as before,
+  and the upstreams left at that seam are no longer avoided.
 - Dashboard and `/api/v1/status`: a listener's `ready` is what
   `/ready/<listener>` answers; a listener's `sessions` (and the total) count
   client sessions, while an upstream's `sessions` count the connections held
@@ -260,6 +300,13 @@ upgrading an existing deployment is not a no-op. Read these first.
 
 ### Fixed
 
+- A client ack that takes the session's credit past `u32::MAX` leaves it at
+  `u32::MAX`, and the upstream is acked only what the credit rose by, so its
+  own counter can no longer wrap and part from the session's. Such an ack
+  made the session wait for blocks the upstream would never send (a false
+  stall, and a strike on an archive) or forward results counted as overruns.
+  One Spring node wraps the sum, which leaves a window that depends on the
+  results still in flight.
 - Failover now resumes with the client's outstanding credit instead of its
   original `max_messages_in_flight`, and acks sent during the swap are no
   longer replayed on top of it.
@@ -274,7 +321,9 @@ upgrading an existing deployment is not a no-op. Read these first.
   a failover.
 - Head and LIB in results never move backwards within a session.
 - An upstream that stays connected and answers pings but stops sending the
-  blocks it owes is failed over after `upstream_stall_timeout_ms`.
+  blocks it owes is failed over after `upstream_stall_timeout_ms` (a live
+  upstream that no other online upstream could replace, after three times
+  that).
 - A message larger than `max_message_bytes` closes the client with 1011 and
   the reason `block K exceeds max_message_bytes` instead of striking the
   upstream.

@@ -86,6 +86,9 @@ metric_label! {
         Offline => "offline",
         Violation => "violation",
         Uncovered => "uncovered",
+        /// A live seam's first result did not continue the last delivered
+        /// block, while another upstream covers it.
+        Discontinuity => "discontinuity",
         Send => "send",
         /// No frame at all, not even a reply to a liveness ping.
         Silent => "silent",

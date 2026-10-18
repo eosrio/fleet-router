@@ -932,6 +932,10 @@ const API_MAX_BODY_BYTES: std::ops::RangeInclusive<usize> = 1024..=64 * 1024 * 1
 const API_MAX_ATTEMPTS: std::ops::RangeInclusive<u32> = 1..=8;
 const API_PROBE_MS: std::ops::RangeInclusive<u64> = 100..=60_000;
 const API_MIN_UPSTREAM_TIMEOUT_MS: u64 = 100;
+/// The smallest non-zero `max_response_bytes`. An answer the chain API
+/// buffers to classify it is at most this long (`PEEK_LIMIT`), so the limit
+/// holds for it too.
+pub(crate) const API_MIN_RESPONSE_BYTES: u64 = 64 * 1024;
 
 fn default_api_allow() -> Vec<ApiClass> {
     vec![ApiClass::Block, ApiClass::Info, ApiClass::State]
@@ -1043,6 +1047,13 @@ pub struct ChainApiConfig {
     /// `max-body-size`), `1024..=67108864`.
     #[serde(default = "default_api_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// Largest upstream answer body relayed, in bytes. `0`, the default,
+    /// relays answers of any size, as one nodeos sends them; otherwise at
+    /// least 65536. An answer whose `Content-Length` is larger gets `502`
+    /// instead; one without a length is cut off once it passes this. A
+    /// push's answer is never limited.
+    #[serde(default)]
+    pub max_response_bytes: u64,
     /// Client connections open at once; excess sockets are closed at accept.
     /// Default 1024.
     #[serde(default = "default_api_max_connections")]
@@ -1344,6 +1355,11 @@ fn validate_chain_api(
             "{prefix}chain_api.max_body_bytes must be between {} and {}",
             API_MAX_BODY_BYTES.start(),
             API_MAX_BODY_BYTES.end()
+        );
+    }
+    if api.max_response_bytes != 0 && api.max_response_bytes < API_MIN_RESPONSE_BYTES {
+        bail!(
+            "{prefix}chain_api.max_response_bytes must be 0 or at least {API_MIN_RESPONSE_BYTES}"
         );
     }
     if !API_MAX_ATTEMPTS.contains(&api.max_attempts) {
@@ -3992,6 +4008,7 @@ mod tests {
         assert_eq!(api.block_source, BlockSource::FrozenFirst);
         assert!(api.push_servers.is_empty());
         assert_eq!(api.max_body_bytes, 2_097_152);
+        assert_eq!(api.max_response_bytes, 0, "answers of any size");
         assert_eq!(api.max_connections, 1024);
         assert_eq!(api.max_in_flight, 256);
         assert_eq!(api.max_in_flight_per_upstream, 64);
@@ -4164,6 +4181,7 @@ mod tests {
             "block_source": "live_first",
             "push_servers": ["live-1"],
             "max_body_bytes": 1024,
+            "max_response_bytes": 4_194_304,
             "max_connections": 10,
             "max_in_flight": 20,
             "max_in_flight_per_upstream": 5,
@@ -4537,6 +4555,10 @@ mod tests {
                 "chain_api.max_body_bytes must be between 1024 and 67108864",
             ),
             (
+                serde_json::json!({ "max_response_bytes": 65_535 }),
+                "chain_api.max_response_bytes must be 0 or at least 65536",
+            ),
+            (
                 serde_json::json!({ "max_attempts": 0 }),
                 "chain_api.max_attempts must be between 1 and 8",
             ),
@@ -4594,7 +4616,7 @@ mod tests {
             assert_eq!(validation_error(&api(extra.clone())), want, "{extra}");
         }
         let edges = serde_json::json!({
-            "max_body_bytes": 1024, "max_attempts": 1, "probe_ms": 60_000,
+            "max_body_bytes": 1024, "max_response_bytes": 65_536, "max_attempts": 1, "probe_ms": 60_000,
             "upstream_timeout_ms": 100, "request_deadline_ms": 100, "upstream_queue_ms": 100,
             "max_connections": 1, "max_in_flight": 1, "max_in_flight_per_upstream": 1
         });

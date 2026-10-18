@@ -11,8 +11,9 @@
 //! - Leap 4: starts at its first available block (a forward jump);
 //! - frozen segments: a fixed range with every id known, below the fleet LIB.
 //!
-//! Random acks, pauses, new requests, chain growth, forks, drops, Close
-//! frames, handoffs at segment ends and failovers interleave. Messages from
+//! Random acks (some past `u32::MAX`, some on open `u32::MAX` windows),
+//! pauses, new requests, chain growth, forks, drops, Close frames, handoffs
+//! at segment ends and failovers interleave. Messages from
 //! the router reach the upstream at once; results travel through a queue, so
 //! they can be in flight across acks, forks and link ends.
 //!
@@ -360,6 +361,8 @@ struct Stats {
     failovers: u64,
     reuses: u64,
     patched: u64,
+    /// Acks that took the window past `u32::MAX`.
+    saturated_acks: u64,
 }
 
 impl Sim {
@@ -459,10 +462,16 @@ impl Sim {
         } else {
             start + self.rng.range(1, 300)
         };
+        // Some clients open the window all the way.
+        let max_in_flight = if self.rng.chance(10) {
+            u32::MAX
+        } else {
+            self.rng.range(0, 30)
+        };
         let r = BlocksRequest {
             start,
             end,
-            max_in_flight: self.rng.range(0, 30),
+            max_in_flight,
             irreversible_only: self.rng.chance(10),
             ..BlocksRequest::default()
         };
@@ -490,13 +499,22 @@ impl Sim {
         self.open(kind, run_end, Purpose::Initial, step);
     }
 
+    /// A client ack, sometimes one that takes the window past `u32::MAX`.
+    /// The session forwards what C rose by; the upstream adds it with
+    /// Spring's wrapping `uint32_t` add, so a forwarded amount that diverged
+    /// from C would show up in (c).
     fn ack(&mut self) {
-        let n = self.rng.range(1, 5);
-        self.c.ack(n);
-        self.client.window += n;
+        let n = if self.rng.chance(3) {
+            u32::MAX - self.rng.range(0, 5)
+        } else {
+            self.rng.range(1, 5)
+        };
+        let raised = self.c.ack(n);
+        self.stats.saturated_acks += u64::from(raised < n);
+        self.client.window = self.client.window.saturating_add(n);
         if let Some((st, up)) = self.link.as_mut() {
             if st.req.is_some() {
-                up.credit = up.credit.wrapping_add(n);
+                up.credit = up.credit.wrapping_add(raised);
             }
         }
     }
@@ -548,7 +566,7 @@ impl Sim {
         let lr = st.req.clone().expect("a link request");
         let judgement = judge(&self.c, st, &creq, &lr, &f.h, |_| Lacks::Nothing, |_| true);
         match judgement {
-            Judgement::End(UpEnd::Uncovered) => {
+            Judgement::End(UpEnd::Uncovered | UpEnd::Discontinuity) => {
                 self.failover(step);
             }
             Judgement::End(end) => panic!("step {step}: honest upstream ended as {end:?}"),
@@ -662,6 +680,7 @@ fn credit_and_cursor_stay_in_lockstep_with_simulated_upstreams() {
         total.failovers += s.failovers;
         total.reuses += s.reuses;
         total.patched += s.patched;
+        total.saturated_acks += s.saturated_acks;
     }
     // The runs must actually exercise every path they claim to check.
     assert!(total.forwarded > 10_000, "{total:?}");
@@ -675,6 +694,7 @@ fn credit_and_cursor_stay_in_lockstep_with_simulated_upstreams() {
         ("failovers", total.failovers),
         ("socket reuses", total.reuses),
         ("patched head/LIB", total.patched),
+        ("saturated acks", total.saturated_acks),
     ] {
         assert!(n > 0, "no {what} in {total:?}");
     }

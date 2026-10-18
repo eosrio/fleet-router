@@ -155,6 +155,12 @@ pub(super) struct LinkState {
     /// When the link last started to owe blocks, or last made progress.
     pub became_owed_at: Instant,
     pub was_owed: bool,
+    /// A live stall found no other upstream to move to: it is checked again
+    /// at this instant, or at the next fleet view, whichever comes first.
+    pub stall_recheck: Option<Instant>,
+    /// The start of the silence whose stall was kept and logged, so it is
+    /// logged once.
+    pub stall_kept: Option<Instant>,
     pub frames: u64,
     /// Stitched: a link kept open with nothing to send (its leg is done) is
     /// closed at this instant unless a new request reuses it first.
@@ -222,6 +228,8 @@ impl LinkState {
             unknown_forwarded_at: None,
             became_owed_at: now,
             was_owed: false,
+            stall_recheck: None,
+            stall_kept: None,
             frames: 0,
             linger_until: None,
             ping_at: None,

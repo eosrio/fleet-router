@@ -14,17 +14,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upstream's reply. Until the fleet head and LIB are known, the request is
   still relayed to the session's upstream.
 - Two new checks are on by default: `upstream_stall_timeout_ms` (60 s) fails
-  over an upstream that stops sending blocks it owes (on a live upstream only
-  when another online upstream can serve the next block, so a sole live
-  upstream is never dropped while it still answers liveness pings), and
-  `live_lag_blocks` (1200) ranks a live node that far behind the fleet head
-  like a stale one for blocks above its own head. Set either to `0` to turn it
-  off.
+  over an upstream that stops sending blocks it owes, and `live_lag_blocks`
+  (1200) ranks a live node that far behind the fleet head like a stale one
+  for blocks above its own head. Set either to `0` to turn it off. The stall
+  check fails a live upstream over only when another online upstream can
+  serve the next block; a live upstream that none could replace is kept, with
+  one warning, until it has been silent for three times the timeout, and is
+  then redialed. `idle_timeout_ms` and the 5 s rule for an upstream the
+  monitor marked offline still fail over such an upstream sooner.
 - The upstream liveness check now counts bytes as they arrive, so the 0.6.0
   advice to raise `upstream_liveness_timeout_ms` for large blocks whose bytes
-  are already flowing on a slow link no longer applies. A block that spends
-  longer than `upstream_stall_timeout_ms` before its first byte is written
-  will still trigger a stall failover when another upstream is available.
+  are already flowing on a slow link no longer applies. A block whose first
+  byte takes longer than `upstream_stall_timeout_ms` still triggers a stall
+  failover: on a frozen upstream always (with a strike), on a live one when
+  another online upstream can serve the next block, else after three times
+  the timeout.
 - `max_connections`, at the top level and per listener, must be at most
   1000000. A larger value fails validation.
 - Existing config files stay valid, and a listener without frozen servers
@@ -137,6 +141,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a dial that lands on an upstream disabled meanwhile goes to another
   upstream when one can take the session. Disable, drain, priority and weight
   also apply to the chain API.
+- In a stitched listener, a leg's dial in progress is replaced as soon as a
+  view shows its upstream can no longer serve the cursor (disabled,
+  quarantined, or its range shrunk below it), and its request end follows the
+  view. It is kept when another upstream only ranks higher by then, or the
+  monitor misses a status of it.
+- A live seam whose first result does not continue the last delivered block
+  fails over when another upstream covers the block, with a warning that
+  gives both ids and `fleet_router_failovers_total{reason="discontinuity"}`.
+  When none does, the result is forwarded and logged as an error as before,
+  and the upstreams left at that seam are no longer avoided.
 - Dashboard and `/api/v1/status`: a listener's `ready` is what
   `/ready/<listener>` answers; a listener's `sessions` (and the total) count
   client sessions, while an upstream's `sessions` count the connections held
@@ -144,6 +158,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A client ack that takes the session's credit past `u32::MAX` leaves it at
+  `u32::MAX`, and the upstream is acked only what the credit rose by, so its
+  own counter can no longer wrap and part from the session's. Such an ack
+  made the session wait for blocks the upstream would never send (a false
+  stall, and a strike on an archive) or forward results counted as overruns.
+  One Spring node wraps the sum, which leaves a window that depends on the
+  results still in flight.
 - Failover now resumes with the client's outstanding credit instead of its
   original `max_messages_in_flight`, and acks sent during the swap are no
   longer replayed on top of it.
@@ -158,7 +179,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a failover.
 - Head and LIB in results never move backwards within a session.
 - An upstream that stays connected and answers pings but stops sending the
-  blocks it owes is failed over after `upstream_stall_timeout_ms`.
+  blocks it owes is failed over after `upstream_stall_timeout_ms` (a live
+  upstream that no other online upstream could replace, after three times
+  that).
 - A message larger than `max_message_bytes` closes the client with 1011 and
   the reason `block K exceeds max_message_bytes` instead of striking the
   upstream.

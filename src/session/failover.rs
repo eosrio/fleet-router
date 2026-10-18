@@ -198,6 +198,10 @@ pub(super) enum UpEnd {
     Violation(ViolationKind),
     /// A live resume jumped past the cursor while another upstream covers it.
     Uncovered,
+    /// A live seam's first result does not continue the last delivered block
+    /// (its `prev_block` is another id) while another upstream covers the
+    /// cursor.
+    Discontinuity,
     /// A message above `max_message_bytes`.
     TooLarge,
     /// The request write failed on a link that never produced a frame.
@@ -255,8 +259,9 @@ pub(super) struct EndFacts {
 
 /// The link-end table. Only unclean drops, frozen stalls and frozen contract
 /// violations strike the upstream; a clean close, an idle or live stall, a
-/// busy, uncovered or silent upstream, an operator move, an archive without
-/// a block log, an oversized message or a client-induced drop never do.
+/// busy, uncovered, discontinuous or silent upstream, an operator move, an
+/// archive without a block log, an oversized message or a client-induced
+/// drop never do.
 /// `cursor` is the client's next block.
 pub(super) fn classify(end: UpEnd, facts: &EndFacts, cursor: u32, now: Instant) -> EndAction {
     let failover = |strike: bool, budget: bool, delay: Duration, exclusion: Exclusion, reason| {
@@ -339,6 +344,15 @@ pub(super) fn classify(end: UpEnd, facts: &EndFacts, cursor: u32, now: Instant) 
             Duration::ZERO,
             Exclusion::Hard(UNCOVERED_EXCLUSION),
             FailoverReason::Uncovered,
+        ),
+        // The session drops this exclusion again when no upstream continues
+        // the block and it forwards the discontinuity after all.
+        UpEnd::Discontinuity => failover(
+            false,
+            false,
+            Duration::ZERO,
+            Exclusion::Hard(UNCOVERED_EXCLUSION),
+            FailoverReason::Discontinuity,
         ),
         UpEnd::TooLarge => EndAction::CloseClient {
             code: 1011,
@@ -634,6 +648,17 @@ mod tests {
                     Duration::ZERO,
                     Exclusion::Hard(Duration::from_secs(30)),
                     FailoverReason::Uncovered,
+                ),
+            ),
+            (
+                UpEnd::Discontinuity,
+                live,
+                fo(
+                    false,
+                    false,
+                    Duration::ZERO,
+                    Exclusion::Hard(Duration::from_secs(30)),
+                    FailoverReason::Discontinuity,
                 ),
             ),
             (

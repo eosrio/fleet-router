@@ -455,16 +455,7 @@ pub fn next_step(
     let cands: Vec<&UpstreamView> = v
         .upstreams
         .iter()
-        .filter(|u| !ex.hard_active(&u.endpoint, now))
-        .filter(|u| {
-            if below {
-                // Below fleet begin only the owner of fleet begin serves; it
-                // answers with id-less results until its own begin.
-                u.routable() && u.known && u.abi_ok && u.ids_begin() == ids_begin
-            } else {
-                eligible(v, u, sh.need, from, Union::Sticky, now)
-            }
-        })
+        .filter(|u| candidate(v, u, sh, from, ex, now))
         .collect();
     if cands.is_empty() {
         let why = if v.upstreams.iter().any(|u| ex.hard_active(&u.endpoint, now)) {
@@ -531,15 +522,9 @@ pub fn next_step(
             bounded: !tip_region(v, from),
         };
     }
-    let mut req_end = chosen.run;
-    if best.role == Role::Frozen {
-        let (head, lib) = tip;
-        let gate = if sh.irreversible_only { lib } else { head };
-        match gate {
-            Some(g) if from <= g.num => req_end = req_end.min(g.num.saturating_add(1)),
-            _ => return Step::Wait { block: from },
-        }
-    }
+    let Some(req_end) = gated_end(best, tip, sh, from, chosen.run) else {
+        return Step::Wait { block: from };
+    };
     if full(best) {
         return Step::Hold {
             block: from,
@@ -552,6 +537,88 @@ pub fn next_step(
         up: best.index,
         endpoint: best.endpoint.clone(),
         role: best.role,
+        start: from,
+        req_end,
+    })
+}
+
+/// Whether [`next_step`] ranks `u` for `from` at all, online or not and
+/// whatever its load: not hard-excluded, and eligible for the block (below
+/// the fleet's first id, only the owner of that first id serves; it answers
+/// with id-less results until its own begin).
+fn candidate(
+    v: &FleetView,
+    u: &UpstreamView,
+    sh: &Shape,
+    from: u32,
+    ex: &Excludes,
+    now: Instant,
+) -> bool {
+    if ex.hard_active(&u.endpoint, now) {
+        return false;
+    }
+    let ids_begin = v.ids.components.first().map(|c| c.begin);
+    if ids_begin.is_some_and(|b| from < b) {
+        u.routable() && u.known && u.abi_ok && u.ids_begin() == ids_begin
+    } else {
+        eligible(v, u, sh.need, from, Union::Sticky, now)
+    }
+}
+
+/// The end of the leg `u` is sent from `from`, given its run (clamped to the
+/// request's end): a frozen upstream's leg also stops at the gate + 1 (the
+/// fleet head, or LIB for `irreversible_only`). `None` when that gate is
+/// below `from`: the session waits.
+fn gated_end(
+    u: &UpstreamView,
+    tip: (Option<BlockPos>, Option<BlockPos>),
+    sh: &Shape,
+    from: u32,
+    run: u32,
+) -> Option<u32> {
+    if u.role != Role::Frozen {
+        return Some(run);
+    }
+    let (head, lib) = tip;
+    let gate = if sh.irreversible_only { lib } else { head };
+    match gate {
+        Some(g) if from <= g.num => Some(run.min(g.num.saturating_add(1))),
+        _ => None,
+    }
+}
+
+/// The leg [`next_step`] would send to upstream `up` from `from` if it
+/// ranked first: `None` when `up` cannot serve `from` at all (it is not a
+/// candidate, or no upstream could: a wait, a gap, an unreported archive).
+/// Whether it is online, full or outranked by another does not matter.
+///
+/// A session that is dialing `up` for a leg keeps that dial while this is
+/// `Some` (the dial itself tells whether `up` is reachable) and takes its
+/// `req_end`, rather than abandon the dial each time the ranking moves.
+pub fn serve_on(
+    v: &FleetView,
+    tip: (Option<BlockPos>, Option<BlockPos>),
+    sh: &Shape,
+    from: u32,
+    up: usize,
+    ex: &Excludes,
+    now: Instant,
+) -> Option<ServeStep> {
+    if from >= sh.end {
+        return None;
+    }
+    let ids_begin = v.ids.components.first().map(|c| c.begin);
+    let below = ids_begin.is_some_and(|b| from < b);
+    if (!below && !v.ids.has(from)) || (below && v.frozen_unknown > 0) {
+        return None;
+    }
+    let u = v.up(up).filter(|u| candidate(v, u, sh, from, ex, now))?;
+    let run = run_end(v, u, sh.need, from, now).min(sh.end);
+    let req_end = gated_end(u, tip, sh, from, run)?;
+    (req_end > from).then(|| ServeStep {
+        up: u.index,
+        endpoint: u.endpoint.clone(),
+        role: u.role,
         start: from,
         req_end,
     })
@@ -603,6 +670,29 @@ pub fn pool_pick(
     lag: u32,
     now: Instant,
 ) -> Option<usize> {
+    let (up, rank) = pool_rank(v, route, ex, failover, sid, lag, now)?;
+    if let Some((_, block)) = route {
+        if rank >= 2 {
+            tracing::warn!(
+                block,
+                "no upstream covers the requested block; falling back to least-connections"
+            );
+        }
+    }
+    Some(up)
+}
+
+/// [`pool_pick`] without its warning: the pick and its rank (`2` and up:
+/// it does not cover the block). For a check that routes nothing.
+pub fn pool_rank(
+    v: &FleetView,
+    route: Option<(Need, u32)>,
+    ex: &Excludes,
+    failover: bool,
+    sid: u64,
+    lag: u32,
+    now: Instant,
+) -> Option<(usize, u8)> {
     let cands = || {
         v.upstreams.iter().filter(move |u| {
             u.routable()
@@ -650,15 +740,7 @@ pub fn pool_pick(
     } else {
         best
     };
-    if let Some((_, block)) = route {
-        if pick.rank >= 2 {
-            tracing::warn!(
-                block,
-                "no upstream covers the requested block; falling back to least-connections"
-            );
-        }
-    }
-    Some(pick.up.index)
+    Some((pick.up.index, pick.rank))
 }
 
 #[cfg(test)]
@@ -1462,6 +1544,41 @@ mod tests {
             ),
             Some(1)
         );
+    }
+
+    #[test]
+    fn serve_on_keeps_any_upstream_that_can_serve_whatever_it_ranks() {
+        let now = now();
+        let mut slow = frozen(0, 2, 1001);
+        slow.max_sessions = Some(1);
+        slow.connections.store(1, Ordering::Relaxed);
+        slow.online = false;
+        let mut quarantined = frozen(1, 2, 1001);
+        quarantined.quarantines.push(BlockQuarantine {
+            block: 5,
+            range: 10,
+            until: now + NOW_TTL,
+        });
+        let v = view(vec![
+            slow,
+            quarantined,
+            frozen(2, 2, 1001),
+            frozen(3, 1001, 2001),
+        ]);
+        let sh = shape(all(), u32::MAX);
+        let none = Excludes::default();
+        let on = |up: usize, ex: &Excludes| serve_on(&v, tip_of(&v), &sh, 10, up, ex, now);
+        // The plan takes the free, online replica...
+        assert_eq!(served_by(&plan(&v, all(), 10)), (2, 10, 1001));
+        // ...but the full, offline one still serves block 10, with its leg.
+        let st = on(0, &none).expect("a full, offline candidate still serves");
+        assert_eq!((st.up, st.start, st.req_end), (0, 10, 1001));
+        // Quarantined at the block, not covering it, or hard-excluded: no.
+        assert_eq!(on(1, &none), None);
+        assert_eq!(on(3, &none), None);
+        let mut hard = Excludes::default();
+        hard.add_hard(v.upstreams[0].endpoint.clone(), NOW_TTL, now);
+        assert_eq!(on(0, &hard), None);
     }
 
     #[test]

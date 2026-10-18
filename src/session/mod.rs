@@ -80,8 +80,8 @@ use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 
 use crate::abi::abi_fingerprint;
 use crate::fleet::planner::{
-    can_take_over, eligible, next_step, pool_pick, run_end, tip_region, Excludes, Need, ServeStep,
-    Shape, Step, Union,
+    can_take_over, eligible, next_step, pool_pick, pool_rank, run_end, serve_on, tip_region,
+    Excludes, Need, ServeStep, Shape, Step, Union,
 };
 use crate::fleet::view::UpstreamView;
 use crate::fleet::{
@@ -122,6 +122,17 @@ const MONITOR_OFFLINE_SILENCE: Duration = Duration::from_secs(5);
 /// When the monitor marks the current upstream offline, the session pings it
 /// at once and fails over if nothing arrives within this time.
 const OFFLINE_PROBE: Duration = Duration::from_secs(1);
+
+/// A live upstream that stalls while no other upstream can serve the next
+/// block is kept for this many times `upstream_stall_timeout_ms` of silence,
+/// then failed over anyway: that redials it, and a new SHiP session clears a
+/// wedge that only one connection has.
+const SOLE_STALL_FACTOR: u32 = 3;
+
+/// A kept stall asks at least this often whether another upstream can take
+/// the stream now, besides every fleet view change: a freed slot, or an
+/// exclusion or a quarantine that ran out, publishes no new view.
+const STALL_RECHECK: Duration = Duration::from_secs(1);
 
 /// How long a status request waits for the fleet tip (or a link to relay it)
 /// when `handshake_timeout_ms` is 0.
@@ -501,6 +512,11 @@ struct Session {
     /// [`blockless_move_backoff`]).
     blockless_moves: u32,
     blockless_moved_at: Option<Instant>,
+    /// Upstreams left at the current seam because their first result did
+    /// not continue the last delivered block. Their exclusion is lifted when
+    /// no upstream continues it and the session forwards the discontinuity
+    /// after all: they are not to blame then.
+    seam_excluded: Vec<Arc<str>>,
 }
 
 impl Session {
@@ -554,6 +570,7 @@ impl Session {
             view_unseen: false,
             blockless_moves: 0,
             blockless_moved_at: None,
+            seam_excluded: Vec::new(),
         }
     }
 
@@ -819,6 +836,10 @@ impl Session {
 
     async fn on_view_change(&mut self) -> Flow {
         self.view_unseen = false;
+        // A kept stall asks again whether another upstream can take over.
+        if let Some(link) = self.link.as_mut() {
+            link.st.stall_recheck = None;
+        }
         self.probe_if_lost().await;
         if let Flow::Stop = self.drive_status().await {
             return Flow::Stop;
@@ -839,17 +860,36 @@ impl Session {
                     self.apply_step(step, purpose, self.c.credit).await
                 }
             }
+            // A leg's dial is kept while its upstream can still serve the
+            // cursor, whatever ranks higher by now (an exclusion that ran
+            // out, a load shift) and whether or not the monitor sees it
+            // online: the dial itself tells. Only its request end follows
+            // the view. An upstream that can no longer serve the cursor
+            // (disabled, quarantined, its range shrunk below it) is
+            // replaced before the request is sent.
             Phase::Dialing {
                 purpose,
                 step: Some(cur),
             } if self.c.in_progress() => {
+                if let Some(st) = self.dialed_leg(&cur) {
+                    if st.req_end != cur.req_end {
+                        self.set_phase(Phase::Dialing {
+                            purpose,
+                            step: Some(st),
+                        });
+                    }
+                    return Flow::Continue;
+                }
                 let step = self.plan(self.c.cursor, self.hold.is_some());
                 match &step {
-                    Step::Serve(st) if st.up == cur.up && st.req_end == cur.req_end => {
-                        Flow::Continue
-                    }
                     Step::Serve(_) => {
-                        if !self.view.up(cur.up).is_some_and(|u| u.routable()) {
+                        if self.view.up(cur.up).is_some_and(|u| u.routable()) {
+                            tracing::info!(
+                                upstream = %cur.endpoint,
+                                block = self.c.cursor,
+                                "upstream can no longer serve the leg it was being dialed for; serving from another"
+                            );
+                        } else {
                             tracing::info!(
                                 upstream = %cur.endpoint,
                                 "upstream disabled while it was being dialed; serving from another"
@@ -1045,17 +1085,21 @@ impl Session {
         }
     }
 
-    /// `C += n` (wrapping), forwarded to the link only while it has a
-    /// request. Otherwise it is folded into the credit the next request
-    /// carries.
+    /// `C += n` (saturating), and what C rose by is forwarded to the link
+    /// while it has a request, so the upstream's counter stays C less the
+    /// results in flight (see [`ClientSide::ack`]). Without a link request
+    /// it is folded into the credit the next request carries.
     async fn on_client_ack(&mut self, n: u32) -> Flow {
-        self.c.ack(n);
+        let raised = self.c.ack(n);
+        if raised == 0 {
+            return Flow::Continue;
+        }
         if let Some(link) = self.link.as_mut() {
             if link.st.req.is_some() {
                 // A failed write shows up as the end of the link's stream.
                 let _ = link
                     .tx
-                    .send(Message::Binary(wire::encode_ack(n).into()))
+                    .send(Message::Binary(wire::encode_ack(raised).into()))
                     .await;
             }
         }
@@ -1505,6 +1549,7 @@ impl Session {
                 tracing::debug!("block result with no request in progress dropped");
                 Flow::Continue
             }
+            Some(Judgement::End(UpEnd::Discontinuity)) => self.on_discontinuity(&h).await,
             Some(Judgement::End(end)) => self.on_link_end(end).await,
             Some(Judgement::Duplicate { advance_to }) => self.drop_duplicate(advance_to, &h).await,
             Some(Judgement::Forward(fw)) if fw.no_block => {
@@ -1517,6 +1562,28 @@ impl Session {
                 self.forward_result(frame, h, fw).await
             }
         }
+    }
+
+    /// A live seam's first result does not continue the last delivered
+    /// block, and another upstream covers the cursor: logged with both ids,
+    /// then failed over (no strike; the upstream is avoided for a while).
+    async fn on_discontinuity(&mut self, h: &ResultHead) -> Flow {
+        let Some(endpoint) = self.link.as_ref().map(|l| l.endpoint.clone()) else {
+            return Flow::Continue;
+        };
+        let hex = |p: Option<BlockPos>| p.map(|p| crate::tasks::hex_32(&p.id));
+        tracing::warn!(
+            upstream = %endpoint,
+            block = h.this_block.map(|p| p.num),
+            expected_prev = hex(self.c.last).as_deref(),
+            prev = hex(h.prev_block).as_deref(),
+            "upstream result does not continue the last delivered block; failing over"
+        );
+        let flow = self.on_link_end(UpEnd::Discontinuity).await;
+        if self.ex.hard_active(&endpoint, std_now()) && !self.seam_excluded.contains(&endpoint) {
+            self.seam_excluded.push(endpoint);
+        }
+        flow
     }
 
     /// A frozen result without the `block` the request asked for, for a block
@@ -1728,6 +1795,14 @@ impl Session {
                 block,
                 "upstream result does not continue the last delivered block"
             );
+            // No upstream continues the block: those left at this seam for
+            // not continuing it are usable again.
+            let released = std::mem::take(&mut self.seam_excluded);
+            if !released.is_empty() {
+                self.ex.hard.retain(|(ep, _)| !released.contains(ep));
+            }
+        } else {
+            self.seam_excluded.clear();
         }
         if fw.variant_mismatch {
             tracing::debug!(upstream = %endpoint, "result variant differs from the request version");
@@ -2484,6 +2559,22 @@ impl Session {
         )
     }
 
+    /// The leg the dial on its way to `cur.up` would now be sent, when that
+    /// upstream can still serve the cursor (see [`serve_on`]). It has no
+    /// side effects, unlike [`Session::plan`].
+    fn dialed_leg(&self, cur: &ServeStep) -> Option<ServeStep> {
+        let shape = self.c.req.as_ref().map(Shape::of)?;
+        serve_on(
+            &self.view,
+            self.ctx.hub.fresh_tip(&self.view),
+            &shape,
+            self.c.cursor,
+            cur.up,
+            &self.ex,
+            std_now(),
+        )
+    }
+
     /// The upstream of every connection slot this session holds: its link,
     /// its dial, its standby link and its pre-dial. A plan that serves from
     /// one of them reuses or replaces that slot (the socket, the standby, the
@@ -3124,8 +3215,11 @@ impl Session {
 
     /// Whether a stall failover off `link` (`Exclusion::Soft`) would move the
     /// session to another online upstream that covers the cursor. A live
-    /// upstream with nowhere else to go is kept: dropping it would only
-    /// redial the same node and abort a block it is still preparing.
+    /// upstream with nowhere else to go is kept for a while (see
+    /// [`SOLE_STALL_FACTOR`]): dropping it at once would only redial the same
+    /// node and abort a block it may still be preparing.
+    ///
+    /// It runs a planner pass, so it is asked only once the stall is due.
     fn stall_can_move(&self, link: &Link) -> bool {
         if link.st.role == Role::Frozen {
             return true;
@@ -3156,7 +3250,9 @@ impl Session {
             return matches!(step, Step::Serve(st) if st.up != link.st.up);
         }
         let need = Need::of(creq);
-        pool_pick(
+        // No routing happens here, so a pick that does not cover the block
+        // is not warned about.
+        pool_rank(
             &self.view,
             Some((need, k)),
             &ex,
@@ -3165,7 +3261,7 @@ impl Session {
             self.ctx.live_lag_blocks,
             now,
         )
-        .is_some_and(|up| {
+        .is_some_and(|(up, _)| {
             up != link.st.up
                 && self
                     .view
@@ -3174,21 +3270,76 @@ impl Session {
         })
     }
 
-    /// The silence limits that apply to an owed link, shortest first.
-    fn silence_limits(&self, link: &Link) -> [Option<(Duration, UpEnd)>; 3] {
+    /// When each silence limit of an owed link is due, in the order they are
+    /// checked: idle, stall, monitor offline. A kept stall is due again at its
+    /// recheck.
+    fn silence_deadlines(&self, link: &Link) -> [Option<(Instant, UpEnd)>; 3] {
+        let from = self.silence_from(link);
+        let after = |limit: Duration| from.checked_add(limit);
         let offline = self
             .view
             .up(link.st.up)
             .is_some_and(|u| u.monitor_offline_since.is_some());
-        let stall = self
-            .stall_timeout()
-            .filter(|_| self.stall_can_move(link))
-            .map(|d| (d, UpEnd::Stall));
+        let stall = self.stall_timeout().and_then(after).map(|at| {
+            let at = link.st.stall_recheck.map_or(at, |recheck| recheck.max(at));
+            (at, UpEnd::Stall)
+        });
         [
-            self.idle_timeout().map(|d| (d, UpEnd::Idle)),
+            self.idle_timeout()
+                .and_then(after)
+                .map(|at| (at, UpEnd::Idle)),
             stall,
-            offline.then_some((MONITOR_OFFLINE_SILENCE, UpEnd::MonitorOffline)),
+            offline
+                .then(|| after(MONITOR_OFFLINE_SILENCE))
+                .flatten()
+                .map(|at| (at, UpEnd::MonitorOffline)),
         ]
+    }
+
+    /// The silence limit that ends the owed link now, if any.
+    ///
+    /// A stall on a live upstream ends the link only when another upstream
+    /// can take the stream ([`Session::stall_can_move`]) or once the silence
+    /// reached [`SOLE_STALL_FACTOR`] times the stall timeout. Until then it is
+    /// kept, logged once, and asked again at the next view or after
+    /// [`STALL_RECHECK`].
+    fn silence_due(&mut self, now: Instant) -> Option<(UpEnd, Arc<str>)> {
+        let link = self.link.as_ref().filter(|l| l.st.was_owed)?;
+        let from = self.silence_from(link);
+        let silence = now.saturating_duration_since(from);
+        let stall = self.stall_timeout().unwrap_or(Duration::MAX);
+        let sole_limit = stall.saturating_mul(SOLE_STALL_FACTOR);
+        let mut kept = false;
+        let mut due = None;
+        for (at, end) in self.silence_deadlines(link).into_iter().flatten() {
+            if now < at {
+                continue;
+            }
+            if end == UpEnd::Stall && silence < sole_limit && !self.stall_can_move(link) {
+                kept = true;
+                continue;
+            }
+            due = Some((end, link.endpoint.clone()));
+            break;
+        }
+        if kept && due.is_none() {
+            let block = self.c.cursor;
+            let link = self.link.as_mut()?;
+            let redial = from.checked_add(sole_limit);
+            let recheck = now + STALL_RECHECK;
+            link.st.stall_recheck = Some(redial.map_or(recheck, |at| at.min(recheck)));
+            if link.st.stall_kept != Some(from) {
+                link.st.stall_kept = Some(from);
+                tracing::warn!(
+                    upstream = %link.endpoint,
+                    block,
+                    silent_ms = u64::try_from(silence.as_millis()).unwrap_or(u64::MAX),
+                    redial_after_ms = u64::try_from(sole_limit.as_millis()).unwrap_or(u64::MAX),
+                    "upstream stalled while blocks were owed, and no other upstream can serve the next block; keeping it"
+                );
+            }
+        }
+        due
     }
 
     /// Earliest of the client idle deadline, the status deadline, the owed
@@ -3208,11 +3359,10 @@ impl Session {
         };
         let hold = self.hold.and_then(|h| h.deadline);
         let link = self.link.as_ref().filter(|l| l.st.was_owed).and_then(|l| {
-            let from = self.silence_from(l);
-            self.silence_limits(l)
+            self.silence_deadlines(l)
                 .into_iter()
                 .flatten()
-                .filter_map(|(limit, _)| from.checked_add(limit))
+                .map(|(at, _)| at)
                 .min()
         });
         let linger = self.link.as_ref().and_then(|l| l.st.linger_until);
@@ -3267,15 +3417,7 @@ impl Session {
                 return self.hold_expired(hold).await;
             }
         }
-        let silent = self.link.as_ref().filter(|l| l.st.was_owed).and_then(|l| {
-            let silence = now.saturating_duration_since(self.silence_from(l));
-            self.silence_limits(l)
-                .into_iter()
-                .flatten()
-                .find(|(limit, _)| silence >= *limit)
-                .map(|(_, end)| (end, l.endpoint.clone()))
-        });
-        if let Some((end, endpoint)) = silent {
+        if let Some((end, endpoint)) = self.silence_due(now) {
             match end {
                 UpEnd::Idle => {
                     tracing::debug!(upstream = %endpoint, "upstream idle timeout; failing over")
@@ -3989,6 +4131,7 @@ mod tests {
     /// eligible peer comes online, the session fails over immediately.
     #[tokio::test]
     async fn a_sole_live_upstream_that_owes_blocks_is_not_stalled_until_an_alternative_can_serve() {
+        let (logs, _guard) = crate::test_log::capture();
         let (stuck, stuck_mock) = start_mock(MockShipConfig {
             hold_at_block: Some(103),
             ..MockShipConfig::live(1, 1000)
@@ -3996,7 +4139,7 @@ mod tests {
         .await;
         let (peer, _peer_mock) = start_mock(MockShipConfig::live(1, 1000)).await;
         let stall = ProxyLimits {
-            stall_timeout_ms: 400,
+            stall_timeout_ms: 600,
             upstream_liveness_timeout_ms: 200,
             ..limits(0)
         };
@@ -4007,8 +4150,15 @@ mod tests {
         client.send(blocks_request(100, 106, 100)).await.unwrap();
         assert_eq!(read_block_nums(&mut client, 3).await, vec![100, 101, 102]);
         // Wait well past both the liveness timeout (200 ms) and the stall
-        // timeout (400 ms) while `peer` is still offline.
+        // timeout (600 ms) while `peer` is still offline, and well before
+        // three stall timeouts (1.8 s).
         tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert_eq!(
+            logs.lines_with("no other upstream can serve the next block; keeping it")
+                .len(),
+            1,
+            "the kept stall is logged once"
+        );
         assert_eq!(
             stuck_mock.sessions_accepted(),
             1,
@@ -4021,6 +4171,269 @@ mod tests {
         set_online(&harness.hub, &peer).await;
         assert_eq!(read_block_nums(&mut client, 3).await, vec![103, 104, 105]);
         assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Stall), 1);
+    }
+
+    /// Pool: a session streams from a full-history node at its
+    /// `max_sessions` (its own link fills it) whose only peer is pruned above
+    /// the cursor. The stall check, which asks whether another upstream could
+    /// take the stream, runs only once a stall is due and never logs the
+    /// routing warning for blocks no peer covers.
+    #[tokio::test]
+    async fn streaming_from_a_full_node_whose_peer_is_pruned_logs_no_coverage_warning() {
+        let (logs, _guard) = crate::test_log::capture();
+        let (full, _full_mock) = start_mock(MockShipConfig::live(1, 1000)).await;
+        let (pruned, _pruned_mock) = start_mock(MockShipConfig::live(500, 1000)).await;
+        let servers: Vec<Server> = [(&full, Some(1)), (&pruned, None)]
+            .iter()
+            .enumerate()
+            .map(|(i, (endpoint, max))| Server {
+                name: format!("upstream-{i}"),
+                endpoint: endpoint.to_string(),
+                enabled: true,
+                max_sessions: *max,
+                ..Default::default()
+            })
+            .collect();
+        let resolved = listener(servers.clone());
+        let hub = FleetHub::new(
+            &resolved,
+            build_state_db(servers.clone()),
+            build_config_db(servers),
+        );
+        for endpoint in [&full, &pruned] {
+            set_online(&hub, endpoint).await;
+            set_tip(&hub, endpoint, 1000, 990).await;
+        }
+        {
+            let mut db = hub.state.lock().await;
+            let st = db.get_mut(&*pruned).unwrap();
+            st.trace_begin_block = 500;
+            st.chain_state_begin_block = 500;
+            hub.rebuild(&db);
+        }
+        let stall = ProxyLimits {
+            stall_timeout_ms: 60_000,
+            ..limits(0)
+        };
+        let harness = serve_one(&resolved, hub, stall).await;
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        client.send(blocks_request(100, 400, 400)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 300).await,
+            (100..400).collect::<Vec<_>>()
+        );
+        assert_eq!(info.upstream(), full);
+        assert_eq!(
+            logs.lines_with("no upstream covers the requested block")
+                .len(),
+            0
+        );
+    }
+
+    /// The acks a mock received, in order.
+    fn acks(mock: &mock_ship::MockShipHandle) -> Vec<u32> {
+        mock.requests()
+            .into_iter()
+            .filter_map(|o| match o {
+                mock_ship::Observed::Ack { n, .. } => Some(n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Pool: a client ack that takes its window past `u32::MAX`. The
+    /// session's credit saturates and the upstream is acked only what it rose
+    /// by, so the upstream's own (wrapping) counter never wraps and stays
+    /// equal to it: the upstream streams on when its head moves, and the
+    /// session never takes it for a stalled one and moves to the peer.
+    #[tokio::test]
+    async fn an_ack_past_u32_max_keeps_the_upstream_credit_in_lockstep() {
+        let (a, a_mock) = start_mock(MockShipConfig::live(1, 1000)).await;
+        let (b, b_mock) = start_mock(MockShipConfig::live(1, 1000)).await;
+        let stall = ProxyLimits {
+            stall_timeout_ms: 400,
+            ..limits(0)
+        };
+        let harness = start_session_with(&[&a, &b], &[&a], stall).await;
+        set_tip(&harness.hub, &a, 1000, 990).await;
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(999, 2000, 3)).await.unwrap();
+        assert_eq!(read_block_nums(&mut client, 2).await, vec![999, 1000]);
+        // One credit left; the ack takes C + n past u32::MAX.
+        client
+            .send(Message::binary(mock_ship::client::ack(u32::MAX)))
+            .await
+            .unwrap();
+        timeout(WAIT, async {
+            while acks(&a_mock).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the ack reaches the upstream");
+        assert_eq!(acks(&a_mock), vec![u32::MAX - 1], "what C rose by");
+        a_mock.set_head(1010, 1000);
+        b_mock.set_head(1010, 1000);
+        set_tip(&harness.hub, &a, 1010, 1000).await;
+        set_tip(&harness.hub, &b, 1010, 1000).await;
+        set_online(&harness.hub, &b).await;
+        assert_eq!(
+            read_block_nums(&mut client, 3).await,
+            vec![1001, 1002, 1003]
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(blocks_requests(&b_mock).is_empty(), "no move to the peer");
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Stall), 0);
+    }
+
+    /// Stitched: an ack past `u32::MAX` while the archive still holds part of
+    /// the window never makes the archive look stalled: it is acked what the
+    /// session's credit rose by, its own counter does not wrap, and it
+    /// streams on. No strike, and every block arrives.
+    #[tokio::test]
+    async fn an_ack_past_u32_max_never_strikes_an_archive() {
+        for pre_read in [1, 2] {
+            let (arch, _arch_mock) = start_mock(MockShipConfig {
+                block_delay: Some(Duration::from_millis(50)),
+                ..MockShipConfig::frozen(1, 2001)
+            })
+            .await;
+            let stall = ProxyLimits {
+                stall_timeout_ms: 400,
+                ..limits(0)
+            };
+            let harness = start_stitched_with(&[(&arch, 1, 2001)], stall).await;
+            let mut client = connect(&harness.url).await;
+            client.send(blocks_request(10, 22, 3)).await.unwrap();
+            let mut got = read_block_nums(&mut client, pre_read).await;
+            client
+                .send(Message::binary(mock_ship::client::ack(u32::MAX)))
+                .await
+                .unwrap();
+            got.extend(read_block_nums(&mut client, 12 - pre_read).await);
+            assert_eq!(got, (10..22).collect::<Vec<_>>(), "pre_read {pre_read}");
+            let failures = harness
+                .hub
+                .state
+                .lock()
+                .await
+                .get(&arch)
+                .unwrap()
+                .block_failures;
+            assert_eq!(failures, 0, "pre_read {pre_read}");
+            for reason in [FailoverReason::Stall, FailoverReason::Violation] {
+                assert_eq!(harness.hub.stats.failovers.get(reason), 0, "{reason:?}");
+            }
+        }
+    }
+
+    /// Pool: the client's blocks came from `a`, which is lost; `b` and `c`
+    /// both follow another chain from block 103. The first of them at the
+    /// seam fails over (logged as a discontinuity) while the other could
+    /// serve; the other has no alternative left and forwards the
+    /// discontinuity. The first one is then usable again: when the second
+    /// drops, the session resumes on it instead of an offline upstream.
+    #[tokio::test]
+    async fn a_discontinuity_no_upstream_continues_releases_the_upstreams_left_for_it() {
+        let (logs, _guard) = crate::test_log::capture();
+        let (a, a_mock) = start_mock(MockShipConfig {
+            hold_at_block: Some(105),
+            ..MockShipConfig::live(1, 1000)
+        })
+        .await;
+        let forked = || MockShipConfig {
+            fork: Some((103, 7)),
+            ..MockShipConfig::live(1, 1000)
+        };
+        let (b, b_mock) = start_mock(forked()).await;
+        let (c, c_mock) = start_mock(forked()).await;
+        let harness = start_session_with(&[&a, &b, &c], &[&a], limits(0)).await;
+        set_tip(&harness.hub, &a, 1000, 990).await;
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        // One credit is left once `a` has sent 100..=104.
+        client.send(blocks_request(100, 200, 6)).await.unwrap();
+        assert_eq!(
+            read_block_nums(&mut client, 5).await,
+            (100..105).collect::<Vec<_>>()
+        );
+        for endpoint in [&b, &c] {
+            set_tip(&harness.hub, endpoint, 1000, 990).await;
+            set_online(&harness.hub, endpoint).await;
+        }
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&a).unwrap().online = false;
+            harness.hub.rebuild(&db);
+        }
+        a_mock.drop_sessions();
+        assert_eq!(read_block_nums(&mut client, 1).await, vec![105]);
+        assert_eq!(
+            harness
+                .hub
+                .stats
+                .failovers
+                .get(FailoverReason::Discontinuity),
+            1
+        );
+        assert_eq!(
+            logs.lines_with("does not continue the last delivered block; failing over")
+                .len(),
+            1
+        );
+        let on = info.upstream();
+        let (on_mock, other) = if on == b {
+            (&b_mock, &c)
+        } else {
+            (&c_mock, &b)
+        };
+        on_mock.drop_sessions();
+        client
+            .send(Message::binary(mock_ship::client::ack(1)))
+            .await
+            .unwrap();
+        assert_eq!(read_block_nums(&mut client, 1).await, vec![106]);
+        assert_eq!(&info.upstream(), other, "resumed where the chain goes on");
+    }
+
+    /// A sole live upstream that answers pings but stays stalled is not kept
+    /// forever: after three stall timeouts of silence it is failed over,
+    /// which redials it, and the stall is counted.
+    #[tokio::test]
+    async fn a_sole_live_upstream_that_stays_stalled_is_redialed_after_three_stall_timeouts() {
+        let (stuck, stuck_mock) = start_mock(MockShipConfig {
+            hold_at_block: Some(103),
+            ..MockShipConfig::live(1, 1000)
+        })
+        .await;
+        let stall = ProxyLimits {
+            stall_timeout_ms: 400,
+            upstream_liveness_timeout_ms: 200,
+            ..limits(0)
+        };
+        let harness = start_session_with(&[&stuck], &[&stuck], stall).await;
+        set_tip(&harness.hub, &stuck, 1000, 990).await;
+        let mut client = connect(&harness.url).await;
+
+        client.send(blocks_request(100, 106, 100)).await.unwrap();
+        assert_eq!(read_block_nums(&mut client, 3).await, vec![100, 101, 102]);
+        let silent_since = Instant::now();
+        timeout(WAIT, async {
+            while stuck_mock.sessions_accepted() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stalled sole upstream is redialed");
+        assert!(
+            silent_since.elapsed() >= Duration::from_millis(1000),
+            "kept for three stall timeouts, not one: {:?}",
+            silent_since.elapsed()
+        );
+        assert_eq!(harness.hub.stats.failovers.get(FailoverReason::Stall), 1);
+        let up = harness.hub.stats.upstream(0).unwrap();
+        assert_eq!(up.stalls.load(Ordering::Relaxed), 1);
     }
 
     /// A request Spring answers only by rewinding to a stale position
@@ -5886,6 +6299,170 @@ mod tests {
             blocks_requests(&mock_second),
             vec![(1, 500, 510, Vec::new())]
         );
+    }
+
+    /// Stitched: two equal replicas. While the session dials one of them,
+    /// other sessions connect to one replica and then to the other, and
+    /// views are published. The least-connections order flips each time, but
+    /// the dial in progress is kept: one dial for the leg.
+    #[tokio::test]
+    async fn a_leg_dial_is_kept_when_the_load_between_replicas_shifts() {
+        let (a, mock_a) = start_mock(MockShipConfig {
+            throttle_bytes_per_sec: Some(60_000),
+            ..MockShipConfig::frozen(1, 2001)
+        })
+        .await;
+        let (b, mock_b) = start_mock(MockShipConfig {
+            throttle_bytes_per_sec: Some(60_000),
+            ..MockShipConfig::frozen(1, 2001)
+        })
+        .await;
+        let harness = start_stitched(&[(&a, 1, 2001), (&b, 1, 2001)]).await;
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(10, 30, 100)).await.unwrap();
+        timeout(WAIT, async {
+            while mock_a.sessions_accepted() + mock_b.sessions_accepted() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the leg is dialed");
+        let (first, second) = if mock_a.sessions_accepted() == 1 {
+            (&a, &b)
+        } else {
+            (&b, &a)
+        };
+        let load = |ep: &str, n: usize| {
+            let view = harness.hub.view();
+            let u = view.upstreams.iter().find(|u| &*u.endpoint == ep).unwrap();
+            u.connections.fetch_add(n, Ordering::Relaxed);
+        };
+        // Any view re-checks the dial; a head the archive reports moves one.
+        let publish = |head: u32| {
+            let hub = harness.hub.clone();
+            let ep = first.to_string();
+            async move {
+                let mut db = hub.state.lock().await;
+                db.get_mut(&ep).unwrap().head = Some(BlockPos {
+                    num: head,
+                    id: mock_ship::fake_block_id(head),
+                });
+                hub.rebuild(&db);
+            }
+        };
+        load(first, 1);
+        publish(1999).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        load(second, 2);
+        publish(1998).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            read_block_nums(&mut client, 20).await,
+            (10..30).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            mock_a.sessions_accepted() + mock_b.sessions_accepted(),
+            1,
+            "one dial for one leg"
+        );
+    }
+
+    /// Stitched: the preferred archive refuses connections. Its dial
+    /// exclusion (2 s) runs out while its slow twin is still being dialed,
+    /// and a view comes: the preferred archive ranks first again, but the
+    /// twin's dial is kept rather than abandoned for it.
+    #[tokio::test]
+    async fn a_leg_dial_is_kept_when_a_failed_archive_ranks_first_again() {
+        let (a, refusing) = refusing_upstream().await;
+        let (b, mock_b) = start_mock(MockShipConfig {
+            throttle_bytes_per_sec: Some(20_000),
+            ..MockShipConfig::frozen(1, 2001)
+        })
+        .await;
+        let harness = start_stitched_with(
+            &[(&a, 1, 2001), (&b, 1, 2001)],
+            ProxyLimits {
+                handshake_timeout_ms: 10_000,
+                ..limits(0)
+            },
+        )
+        .await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&b).unwrap().priority = 5;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(10, 30, 100)).await.unwrap();
+        timeout(WAIT, async {
+            while mock_b.sessions_accepted() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the twin is dialed after the refusal");
+        // The twin's ABI takes about 3 s at this rate; the exclusion of `a`
+        // runs out before.
+        tokio::time::sleep(DIAL_EXCLUSION + Duration::from_millis(200)).await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&b).unwrap().head = Some(BlockPos {
+                num: 1999,
+                id: mock_ship::fake_block_id(1999),
+            });
+            harness.hub.rebuild(&db);
+        }
+        assert_eq!(
+            read_block_nums(&mut client, 20).await,
+            (10..30).collect::<Vec<_>>()
+        );
+        assert_eq!(mock_b.sessions_accepted(), 1, "the twin's dial was kept");
+        refusing.abort();
+    }
+
+    /// Stitched: an operator move dials the replica, and the monitor misses
+    /// one status of the replica while the dial runs. The dial is kept (it
+    /// tells whether the replica answers), so the move is not undone.
+    #[tokio::test]
+    async fn a_move_dial_survives_a_monitor_blip_on_its_target() {
+        let (a, mock_a) = start_mock(MockShipConfig {
+            block_delay: Some(Duration::from_millis(5)),
+            ..MockShipConfig::frozen(1, 2001)
+        })
+        .await;
+        let (b, mock_b) = start_mock(MockShipConfig {
+            throttle_bytes_per_sec: Some(60_000),
+            ..MockShipConfig::frozen(1, 2001)
+        })
+        .await;
+        let harness = start_stitched(&[(&a, 1, 2001), (&b, 1, 2001)]).await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&b).unwrap().priority = 5;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        let info = registered(&client);
+        client.send(blocks_request(10, 1000, 1000)).await.unwrap();
+        let mut blocks = read_block_nums(&mut client, 10).await;
+        assert_eq!(info.upstream(), a);
+        info.request_move();
+        timeout(WAIT, async {
+            while mock_b.sessions_accepted() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the move dials the replica");
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&b).unwrap().online = false;
+            harness.hub.rebuild(&db);
+        }
+        blocks.extend(read_block_nums(&mut client, 30).await);
+        assert_eq!(blocks, (10..50).collect::<Vec<_>>());
+        assert_eq!(info.upstream(), b, "the move landed on the replica");
+        assert_eq!(mock_a.sessions_accepted(), 1, "no return to the archive");
     }
 
     /// Pool: the upstream an operator move dials is disabled before the dial

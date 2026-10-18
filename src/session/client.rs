@@ -143,7 +143,8 @@ pub(super) struct ClientSide {
     /// The current client request, as decoded.
     pub req: Option<BlocksRequest>,
     /// `send_credits` mirror (C): replaced by a request, raised by acks
-    /// (wrapping), lowered by every forwarded result.
+    /// (saturating at `u32::MAX`, see [`ClientSide::ack`]), lowered by every
+    /// forwarded result.
     pub credit: u32,
     /// The next block the client expects.
     pub cursor: u32,
@@ -161,11 +162,18 @@ pub(super) struct ClientSide {
 }
 
 impl ClientSide {
-    /// A client ack: `C = C.saturating_add(n)`, so acking an open (`u32::MAX`)
-    /// window never wraps the credit back to zero. It is folded in whether or
-    /// not a link is up.
-    pub fn ack(&mut self, n: u32) {
-        self.credit = self.credit.saturating_add(n);
+    /// A client ack: `C = C.saturating_add(n)`, folded in whether or not a
+    /// link is up. Returns how much C rose: what the link's upstream is to be
+    /// acked. Its own counter is C less the results in flight, so it stays
+    /// that, and never passes `u32::MAX` or wraps.
+    ///
+    /// One Spring node adds the ack to its `uint32_t` with a wrap, which past
+    /// `u32::MAX` leaves a window the client cannot know (it depends on the
+    /// results in flight). The router keeps the window open instead.
+    pub fn ack(&mut self, n: u32) -> u32 {
+        let before = self.credit;
+        self.credit = before.saturating_add(n);
+        self.credit - before
     }
 
     /// A new `get_blocks` replaces the request, the credit and the cursor.
@@ -375,8 +383,9 @@ pub(super) enum Judgement {
     Duplicate {
         advance_to: Option<u32>,
     },
-    /// End the link (contract violation, or a live resume jump while another
-    /// upstream covers the cursor).
+    /// End the link (a contract violation, or a live resume that jumps past
+    /// the cursor or does not continue the last delivered block, while
+    /// another upstream covers the cursor).
     End(UpEnd),
 }
 
@@ -470,7 +479,7 @@ pub(super) fn judge(
                 if (c.delivered_for_request > 0 || c.last_irreversible().is_some())
                     && alternative(k)
                 {
-                    return Judgement::End(UpEnd::Uncovered);
+                    return Judgement::End(UpEnd::Discontinuity);
                 }
                 fw.discontinuity = true;
             }
@@ -855,9 +864,9 @@ mod tests {
 
     /// L1: the credit ledger.
     #[test]
-    fn credit_ledger_replaces_wraps_charges_and_refunds() {
+    fn credit_ledger_replaces_saturates_charges_and_refunds() {
         let mut c = ClientSide::default();
-        c.ack(5);
+        assert_eq!(c.ack(5), 5);
         assert_eq!(c.credit, 5, "acks before any request are folded in");
         let pre = c.new_request(BlocksRequest {
             start: 100,
@@ -867,8 +876,12 @@ mod tests {
         });
         assert_eq!(pre, 5);
         assert_eq!(c.credit, 3, "a request replaces C");
-        c.ack(u32::MAX);
+        // An ack past u32::MAX saturates, and only what C rose by is left
+        // to forward, so the upstream's counter (at most C) never wraps.
+        assert_eq!(c.ack(u32::MAX), u32::MAX - 3);
         assert_eq!(c.credit, u32::MAX, "an ack saturates at u32::MAX");
+        assert_eq!(c.ack(7), 0, "an open window rises no further");
+        assert_eq!(c.credit, u32::MAX);
 
         // Every forwarded kind costs one.
         let mut st = state(Role::Live, 100, 200, Purpose::Initial);
@@ -970,7 +983,7 @@ mod tests {
                 |_| Lacks::Nothing,
                 |k| k == 100
             ),
-            Judgement::End(UpEnd::Uncovered)
+            Judgement::End(UpEnd::Discontinuity)
         );
         assert!(matches!(
             judge(

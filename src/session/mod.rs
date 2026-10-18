@@ -864,8 +864,9 @@ impl Session {
             // cursor, whatever ranks higher by now (an exclusion that ran
             // out, a load shift): the dial itself tells. Only its request
             // end follows the view. An upstream the monitor sees offline is
-            // kept only while no online upstream can serve the cursor (a
-            // dead host would hold the leg until the dial times out). An
+            // kept only while no other online upstream can serve the cursor,
+            // excluded ones and the one just failed off aside (a dead host
+            // would hold the leg until the dial times out). An
             // upstream that can no longer serve the cursor (disabled,
             // quarantined, its range shrunk below it) is replaced before the
             // request is sent.
@@ -2519,9 +2520,9 @@ impl Session {
         let Some(shape) = self.c.req.as_ref().map(Shape::of) else {
             return Step::Done;
         };
-        let mut step = self.next_step_for(&shape, from, allow_offline);
+        let mut step = self.next_step_for(&shape, from, &self.ex, allow_offline);
         if matches!(step, Step::Hold { .. }) && self.release_move_exclusion() {
-            step = self.next_step_for(&shape, from, allow_offline);
+            step = self.next_step_for(&shape, from, &self.ex, allow_offline);
         }
         if matches!(
             step,
@@ -2531,7 +2532,7 @@ impl Session {
             }
         ) && self.retired.take().is_some()
         {
-            step = self.next_step_for(&shape, from, allow_offline);
+            step = self.next_step_for(&shape, from, &self.ex, allow_offline);
         }
         if let Step::Hold {
             block,
@@ -2552,14 +2553,14 @@ impl Session {
         step
     }
 
-    fn next_step_for(&self, shape: &Shape, from: u32, allow_offline: bool) -> Step {
+    fn next_step_for(&self, shape: &Shape, from: u32, ex: &Excludes, allow_offline: bool) -> Step {
         let tip = self.ctx.hub.fresh_tip(&self.view);
         next_step(
             &self.view,
             tip,
             shape,
             from,
-            &self.ex,
+            ex,
             &self.own_slots(),
             self.id,
             &self.ctx.stitching,
@@ -2586,15 +2587,22 @@ impl Session {
     }
 
     /// The leg an online upstream would serve instead of the dial on its
-    /// way to `cur.up`, when the monitor sees that upstream offline. It has
-    /// no side effects, unlike [`Session::plan`]: an operator move's
-    /// exclusion stays, so a blip on the move's target keeps its dial.
+    /// way to `cur.up`, when the monitor sees that upstream offline. It is
+    /// never an excluded upstream: the soft exclusion (the upstream the
+    /// session just failed off) counts as hard here, since online it would
+    /// outrank the dial and take the leg back there to fail again. It has no
+    /// side effects, unlike [`Session::plan`]: an operator move's exclusion
+    /// stays, so a blip on the move's target keeps its dial.
     fn online_instead_of(&self, cur: &ServeStep) -> Option<Step> {
         if self.view.up(cur.up).is_some_and(|u| u.online) {
             return None;
         }
         let shape = self.c.req.as_ref().map(Shape::of)?;
-        let step = self.next_step_for(&shape, self.c.cursor, false);
+        let mut ex = self.ex.clone();
+        if let Some(failed) = ex.soft.take() {
+            ex.add_hard(failed, Duration::MAX, std_now());
+        }
+        let step = self.next_step_for(&shape, self.c.cursor, &ex, false);
         matches!(&step, Step::Serve(st) if st.up != cur.up).then_some(step)
     }
 
@@ -3442,9 +3450,10 @@ impl Session {
             if hold.deadline.is_some_and(|at| now >= at) {
                 // The retries back off to 3.2 s, and a freed slot or an
                 // expired exclusion publishes no view: one last try before
-                // closing the client. A retry's dial still on its way is
-                // planned again too: it is kept when it is still the best
-                // try, as the last one.
+                // closing the client. A retry's dial still on its way is that
+                // try while its upstream can serve the cursor, whatever ranks
+                // higher by now (the dial itself tells); it is planned again
+                // only when that upstream can no longer serve it.
                 let holding = match self.phase {
                     Phase::Holding { purpose, .. } | Phase::Dialing { purpose, .. } => {
                         Some(purpose)
@@ -3452,6 +3461,23 @@ impl Session {
                     _ => None,
                 };
                 if let (Some(purpose), false) = (holding, hold.last_try) {
+                    let dialed = match &self.phase {
+                        Phase::Dialing {
+                            step: Some(cur), ..
+                        } => self.dialed_leg(cur),
+                        _ => None,
+                    };
+                    if let Some(st) = dialed {
+                        if let Some(h) = self.hold.as_mut() {
+                            h.last_try = true;
+                            h.deadline = None;
+                        }
+                        self.set_phase(Phase::Dialing {
+                            purpose,
+                            step: Some(st),
+                        });
+                        return Flow::Continue;
+                    }
                     let step = self.plan(self.c.cursor, true);
                     if matches!(step, Step::Serve(_)) {
                         if let Some(h) = self.hold.as_mut() {
@@ -6749,6 +6775,196 @@ mod tests {
         );
         assert_eq!(mock_y.sessions_accepted(), 1);
         hung.abort();
+    }
+
+    /// Stitched, bounded hold: both archives are offline and a hold retry
+    /// dials the preferred one, a slow but working host. Its twin comes
+    /// online at `max_sessions` while that dial runs. At the hold's deadline
+    /// the dial is the last try: the full twin does not close the client
+    /// while the dial still runs.
+    #[tokio::test]
+    async fn a_hold_retry_dial_at_the_deadline_outlasts_a_full_online_twin() {
+        let (x, mock_x) = start_mock(MockShipConfig {
+            throttle_bytes_per_sec: Some(40_000),
+            ..MockShipConfig::frozen(1, 2001)
+        })
+        .await;
+        let (y, mock_y) = start_mock(MockShipConfig::frozen(1, 2001)).await;
+        let harness = start_stitched_tuned(
+            &[(&x, 1, 2001), (&y, 1, 2001)],
+            ProxyLimits {
+                connect_timeout_ms: 8_000,
+                handshake_timeout_ms: 8_000,
+                ..limits(0)
+            },
+            StitchingPolicy {
+                gap_wait_ms: 800,
+                ..StitchingPolicy::default()
+            },
+        )
+        .await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&y).unwrap().priority = 5;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&x).unwrap().online = false;
+            db.get_mut(&y).unwrap().online = false;
+            harness.hub.rebuild(&db);
+        }
+        client.send(blocks_request(10, 30, 100)).await.unwrap();
+        timeout(WAIT, async {
+            while mock_x.sessions_accepted() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the retry dials the slow archive");
+        harness
+            .hub
+            .view()
+            .upstreams
+            .iter()
+            .find(|u| *u.endpoint == y)
+            .unwrap()
+            .connections
+            .fetch_add(1, Ordering::Relaxed);
+        {
+            let mut db = harness.hub.state.lock().await;
+            let twin = db.get_mut(&y).unwrap();
+            twin.online = true;
+            twin.max_sessions = Some(1);
+            harness.hub.rebuild(&db);
+        }
+        assert_eq!(
+            read_block_nums(&mut client, 20).await,
+            (10..30).collect::<Vec<_>>()
+        );
+        assert_eq!(mock_x.sessions_accepted(), 1);
+        assert_eq!(mock_y.sessions_accepted(), 0, "the full twin is not dialed");
+    }
+
+    /// Stitched, bounded hold: two equal slow archives are offline and a
+    /// hold retry dials one of them. Its load rises while that dial runs, so
+    /// the other ranks first by the hold's deadline. The dial is still the
+    /// last try: no second dial replaces it.
+    #[tokio::test]
+    async fn a_hold_retry_dial_at_the_deadline_is_kept_through_a_load_shift() {
+        let slow = || MockShipConfig {
+            throttle_bytes_per_sec: Some(40_000),
+            ..MockShipConfig::frozen(1, 2001)
+        };
+        let (a, mock_a) = start_mock(slow()).await;
+        let (b, mock_b) = start_mock(slow()).await;
+        let harness = start_stitched_tuned(
+            &[(&a, 1, 2001), (&b, 1, 2001)],
+            ProxyLimits {
+                connect_timeout_ms: 8_000,
+                handshake_timeout_ms: 8_000,
+                ..limits(0)
+            },
+            StitchingPolicy {
+                gap_wait_ms: 800,
+                ..StitchingPolicy::default()
+            },
+        )
+        .await;
+        let mut client = connect(&harness.url).await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&a).unwrap().online = false;
+            db.get_mut(&b).unwrap().online = false;
+            harness.hub.rebuild(&db);
+        }
+        client.send(blocks_request(10, 30, 100)).await.unwrap();
+        timeout(WAIT, async {
+            while mock_a.sessions_accepted() + mock_b.sessions_accepted() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the retry dials an archive");
+        let dialed = if mock_a.sessions_accepted() == 1 {
+            &a
+        } else {
+            &b
+        };
+        harness
+            .hub
+            .view()
+            .upstreams
+            .iter()
+            .find(|u| *u.endpoint == **dialed)
+            .unwrap()
+            .connections
+            .fetch_add(5, Ordering::Relaxed);
+        assert_eq!(
+            read_block_nums(&mut client, 20).await,
+            (10..30).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            mock_a.sessions_accepted() + mock_b.sessions_accepted(),
+            1,
+            "the retry's dial was not replaced"
+        );
+    }
+
+    /// Stitched: the preferred archive drops the stream at a corrupt block,
+    /// and the failover dials its twin, which the monitor marks offline
+    /// while that dial runs. The archive just failed off is no online
+    /// upstream to serve instead: the dial is kept, and the leg does not
+    /// return there to fail again.
+    #[tokio::test]
+    async fn a_failover_dial_gone_offline_does_not_return_to_the_failed_archive() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (y, _mock_y) = start_mock(MockShipConfig {
+            corrupt_block: Some(15),
+            corrupt_hits: Some(hits.clone()),
+            ..MockShipConfig::frozen(1, 2001)
+        })
+        .await;
+        let (x, mock_x) = start_mock(MockShipConfig {
+            throttle_bytes_per_sec: Some(40_000),
+            ..MockShipConfig::frozen(1, 2001)
+        })
+        .await;
+        let harness = start_stitched_with(
+            &[(&y, 1, 2001), (&x, 1, 2001)],
+            ProxyLimits {
+                connect_timeout_ms: 8_000,
+                handshake_timeout_ms: 8_000,
+                ..limits(0)
+            },
+        )
+        .await;
+        {
+            let mut db = harness.hub.state.lock().await;
+            db.get_mut(&x).unwrap().priority = 5;
+            harness.hub.rebuild(&db);
+        }
+        let mut client = connect(&harness.url).await;
+        client.send(blocks_request(10, 30, 100)).await.unwrap();
+        let mut blocks = read_block_nums(&mut client, 5).await;
+        timeout(WAIT, async {
+            while mock_x.sessions_accepted() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the failover dials the twin");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        mark_online(&harness.hub, &x, false).await;
+        blocks.extend(read_block_nums(&mut client, 15).await);
+        assert_eq!(blocks, (10..30).collect::<Vec<_>>());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "no return to the failed archive"
+        );
+        assert_eq!(mock_x.sessions_accepted(), 1);
     }
 
     /// Pool: the upstream an operator move dials is disabled before the dial

@@ -7,7 +7,7 @@ The dashboard is **off by default**. Turn it on with [`dashboard.enabled`](confi
 | `/ui/` | Live dashboard (browser). `/` redirects here. |
 | `/status` | Plain status page: server-rendered HTML, no JavaScript. |
 | `/api/v1/...` | JSON API used by both pages. Read endpoints are open; control endpoints need a token. |
-| `/health`, `/ready`, `/ready/<listener>`, `/metrics` | Unchanged. See [Observability](observability.md). |
+| `/health`, `/ready`, `/ready/<listener>`, `/coverage`, `/metrics` | Unchanged. See [Observability](observability.md). |
 
 The endpoint has the same exposure as `/metrics`: keep it on a trusted network. The API shows upstream addresses and client IP addresses. See [Security](#security).
 
@@ -93,7 +93,9 @@ Full router state. This is the same object the [live stream](#live-stream) sends
 | `quarantined` | Online, with at least one active block-range quarantine. Routable outside those ranges. |
 | `up` | Online and advancing. |
 
-`priority` and `weight` are the values in effect. `config` holds the values from the config file, so a client can show when an operator changed them at runtime. `sessions` is the number of sessions on it now. `sessions_total` counts every session it has been assigned since start, including failovers to it. `failovers_total` counts sessions that left it through failover: the stream ended, the session was rerouted for its finality range or a quarantine, or an operator moved or drained it. `blocks_total` and `bytes_total` count block frames and bytes forwarded from it to clients.
+`priority` and `weight` are the values in effect. `config` holds the values from the config file, so a client can show when an operator changed them at runtime. An upstream's `sessions` is the number of connections sessions hold to it now; in a stitched listener a session can also hold a pre-dialed standby link to the next range's upstream. A listener's `sessions` and `totals.sessions` count client sessions. `sessions_total` counts every session it has been assigned since start, including failovers to it. `failovers_total` counts sessions that left it through failover: the stream ended, a request was rerouted to an upstream that serves it better, or an operator moved or drained it. `blocks_total` and `bytes_total` count block frames and bytes forwarded from it to clients.
+
+A listener's `ready` is what [`/ready/<listener>`](observability.md#readiness-and-coverage) answers: a stitched listener needs an online live upstream.
 
 `head_block` is the last block in its trace or chain-state range (`max(end) - 1`), or `null` before the first status reply.
 
@@ -122,7 +124,7 @@ Active client sessions, oldest first. Optional `?listener=<name>` and `?upstream
 }
 ```
 
-`start_block` and `last_block` are `null` until the client sends a `get_blocks` request or receives its first block. `finality` is true when the request asked for finality data.
+`start_block` and `last_block` are `null` until the client sends a `get_blocks` request or receives its first block. `finality` is true when the request asked for finality data. `upstream` and `upstream_name` are empty while the session has no upstream link: between a failover and the next link, and in a stitched listener while it holds, waits or has only asked for status.
 
 ### `GET /api/v1/history`
 
@@ -202,15 +204,17 @@ Every successful action is recorded as a `control` event and logged.
 | --- | --- | --- |
 | `GET /api/v1/auth` | | `204` if the token is valid. Lets a client check a token before showing controls. |
 | `POST /api/v1/listeners/{listener}/upstreams/{endpoint}/disable` | | Stop routing **new** sessions to it. Current sessions stay. The monitor keeps polling it. |
-| `POST /api/v1/listeners/{listener}/upstreams/{endpoint}/drain` | | Disable it and move its current sessions to other upstreams with the normal failover (resume at the next block, no client reconnect). A session moves only when another online upstream's trace range starts at or before the session's next block. Sessions that no other upstream can serve (for example readers of old history when draining the only archive node) stay where they are, and the `control` event says how many stayed. |
+| `POST /api/v1/listeners/{listener}/upstreams/{endpoint}/drain` | | Disable it and move its current sessions to other upstreams with the normal failover (resume at the next block, no client reconnect). A session moves only when another upstream can take it: online, below its `max_sessions`, not quarantined at the session's next block, and with a trace range that starts at or before that block (a frozen range server's range must contain it). Sessions that no other upstream can serve (for example readers of old history when draining the only archive node) stay where they are, and the `control` event says how many stayed. |
 | `POST /api/v1/listeners/{listener}/upstreams/{endpoint}/enable` | | Route to it again. |
 | `PATCH /api/v1/listeners/{listener}/upstreams/{endpoint}` | `{"priority": 5, "weight": 2}` (either field) | Change priority or weight. `weight` must be at least 1. Applies to new sessions and failovers. |
 | `POST /api/v1/listeners/{listener}/upstreams/{endpoint}/reset` | | Restore `priority`, `weight`, and enabled state from the config. |
 | `POST /api/v1/listeners/{listener}/upstreams/{endpoint}/clear-quarantine` | | Remove its active block-range quarantines. |
-| `POST /api/v1/sessions/{id}/move` | | Move one session to another upstream with the normal failover. Returns `409` when no other online upstream's range starts at or before the session's next block. |
+| `POST /api/v1/sessions/{id}/move` | | Move one session to another upstream with the normal failover. Returns `409` when no other upstream can take it, by the same rule as a drain. |
 | `POST /api/v1/sessions/{id}/close` | | Close one session with WebSocket close code 1000 and reason `closed by operator`. |
 
 Upstream actions return the updated upstream object (same shape as in `status`). Session actions return `202` with `{"ok": true}`; the move or close happens asynchronously and shows up as an event.
+
+A moved session avoids the upstream it left until its next link is up. If no other upstream can take it after all (the target filled up or failed meanwhile), it returns to the upstream it left instead of closing. A session whose dial lands on an upstream an operator disabled meanwhile goes to another upstream when one can take it. Disabling, draining and changing `priority` or `weight` also apply to the listener's [chain API](chain-api.md).
 
 Upstreams disabled in the config file (`"enabled": false`) are not monitored and cannot be enabled at runtime.
 

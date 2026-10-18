@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, Semaphore};
 
-use crate::functions::has_alternative_for;
+use crate::fleet::planner::can_take_over;
 use crate::health::ListenerHealthState;
 use crate::models::{Server, ServerConfigDb, ServerState};
 use crate::tasks::hex_32;
@@ -44,6 +44,25 @@ impl ListenerContext {
     pub fn name(&self) -> &str {
         self.health.name.as_deref().unwrap_or("default")
     }
+
+    /// Whether another upstream than `endpoint` can take over a session
+    /// whose next block is `next_block`, for an operator move or drain. See
+    /// [`can_take_over`].
+    fn has_alternative_for(&self, endpoint: &str, next_block: Option<u32>) -> bool {
+        self.health.hub.as_ref().is_some_and(|hub| {
+            hub.view()
+                .upstreams
+                .iter()
+                .any(|u| &*u.endpoint != endpoint && can_take_over(u, next_block))
+        })
+    }
+
+    /// Publish a change to the state map to the listener's sessions.
+    fn publish(&self, db: &HashMap<String, ServerState>) {
+        if let Some(hub) = &self.health.hub {
+            hub.rebuild(db);
+        }
+    }
 }
 
 /// Shared state of the HTTP endpoint.
@@ -62,6 +81,21 @@ pub struct AppState {
 
 /// Concurrent `/api/v1/stream` connections.
 pub const MAX_STREAMS: usize = 32;
+
+impl AppState {
+    /// An endpoint with health, readiness, coverage and metrics only.
+    #[cfg(test)]
+    pub fn health_only(health: Vec<ListenerHealthState>) -> SharedState {
+        Arc::new(AppState {
+            listeners: Vec::new(),
+            health,
+            dashboard: false,
+            control_token: None,
+            allowed_hosts: Vec::new(),
+            streams: Arc::new(Semaphore::new(MAX_STREAMS)),
+        })
+    }
+}
 
 pub type SharedState = Arc<AppState>;
 
@@ -243,16 +277,22 @@ async fn listener_view(ctx: &ListenerContext, now: Instant) -> ListenerView {
         }
     }
     drop(db);
-    let ready = upstreams
-        .iter()
-        .any(|upstream| upstream.online && !upstream.operator_disabled);
+    // The verdict of `/ready`: a stitched listener needs a live upstream.
+    let ready = crate::health::tip_ready(&ctx.health).await;
     ListenerView {
         name: ctx.name().to_string(),
         port: ctx.port,
         chain_id: ctx.chain_id.as_ref().map(hex_32),
         ready,
         max_connections: ctx.max_connections,
-        sessions: upstreams.iter().map(|upstream| upstream.sessions).sum(),
+        // Client sessions, as `max_connections` counts them. An upstream's
+        // `sessions` are its connection slots: a stitched session can hold
+        // two (a standby link, a pre-dial) or none (holding, waiting).
+        sessions: telemetry::global()
+            .sessions()
+            .iter()
+            .filter(|session| &*session.listener == ctx.name())
+            .count(),
         accepted_total: ctx.stats.accepted_total.load(Ordering::Relaxed),
         rejected_total: ctx.stats.rejected_total.load(Ordering::Relaxed),
         upstreams,
@@ -550,7 +590,7 @@ async fn update_upstream(
     if matches!(action, Some(UpstreamAction::Drain)) {
         for session in telemetry::global().sessions() {
             if &*session.listener == listener && session.upstream() == endpoint {
-                if has_alternative_for(&db, endpoint, session.next_block()) {
+                if ctx.has_alternative_for(endpoint, session.next_block()) {
                     movable.push(session);
                 } else {
                     stranded += 1;
@@ -625,6 +665,8 @@ async fn update_upstream(
         }
     };
     let view = upstream_view(listener, endpoint, state, config.as_ref(), Instant::now());
+    // Sessions plan with the new settings from the next view on.
+    ctx.publish(&db);
     drop(db);
     audit(listener, Some(endpoint), None, message);
     Ok(view)
@@ -692,8 +734,7 @@ async fn session_action(
         SessionAction::Move => {
             let ctx = find_listener(app, &session.listener)?;
             let next_block = session.next_block();
-            let db = ctx.health.state_db.lock().await;
-            if !has_alternative_for(&db, &upstream, next_block) {
+            if !ctx.has_alternative_for(&upstream, next_block) {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
                     match next_block {
@@ -702,7 +743,6 @@ async fn session_action(
                     },
                 ));
             }
-            drop(db);
             session.request_move();
             audit(
                 &session.listener,
@@ -882,6 +922,145 @@ mod tests {
         assert_eq!(upstream_status(&mut state, now), "stale");
         state.operator_disabled = true;
         assert_eq!(upstream_status(&mut state, now), "disabled");
+    }
+
+    /// A stitched listener whose archives are online but whose live node is
+    /// not is shown as not ready, as `/ready` answers 503 for it.
+    #[tokio::test]
+    async fn a_stitched_listener_is_ready_on_the_dashboard_only_as_for_ready() {
+        use crate::fleet::FleetHub;
+        use crate::models::{
+            build_config_db, build_state_db, ResolvedListener, ResolvedTopology, Role,
+            StitchingPolicy,
+        };
+        let (archive, live) = ("127.0.0.1:18081", "127.0.0.1:18082");
+        let servers = vec![
+            Server {
+                name: "archive".to_string(),
+                endpoint: archive.to_string(),
+                enabled: true,
+                role: Role::Frozen,
+                range: Some(crate::ship::Range {
+                    begin: 1,
+                    end: 1001,
+                }),
+                ..Default::default()
+            },
+            Server {
+                name: "live".to_string(),
+                endpoint: live.to_string(),
+                enabled: true,
+                role: Role::Live,
+                ..Default::default()
+            },
+        ];
+        let resolved = ResolvedListener {
+            name: None,
+            listen_address: "127.0.0.1".to_string(),
+            listen_port: 0,
+            max_connections: 10,
+            expected_chain_id: None,
+            require_chain_id: false,
+            block_failure_quarantine: None,
+            servers: servers.clone(),
+            topology: ResolvedTopology::Stitched,
+            stitching: StitchingPolicy::default(),
+            abi_pin: None,
+        };
+        let hub = FleetHub::new(
+            &resolved,
+            build_state_db(servers.clone()),
+            build_config_db(servers.clone()),
+        );
+        let ctx = ListenerContext {
+            health: ListenerHealthState {
+                name: None,
+                state_db: hub.state.clone(),
+                hub: Some(hub.clone()),
+                chain_api: None,
+            },
+            config_db: build_config_db(servers),
+            order: vec![archive.to_string(), live.to_string()],
+            port: 0,
+            chain_id: None,
+            max_connections: 10,
+            stats: Arc::new(ListenerStats::default()),
+        };
+        let set_online = |endpoint: &'static str| {
+            let hub = hub.clone();
+            async move {
+                let mut db = hub.state.lock().await;
+                db.get_mut(endpoint).unwrap().online = true;
+                hub.rebuild(&db);
+            }
+        };
+        set_online(archive).await;
+        assert!(!listener_view(&ctx, Instant::now()).await.ready);
+        set_online(live).await;
+        assert!(listener_view(&ctx, Instant::now()).await.ready);
+    }
+
+    /// A listener's session count is its client sessions, not the slots its
+    /// upstreams hold: a stitched session with a standby link holds two, and
+    /// one that holds or waits holds none.
+    #[tokio::test]
+    async fn listener_sessions_count_clients_not_upstream_slots() {
+        let servers = vec![
+            Server {
+                name: "a".to_string(),
+                endpoint: "127.0.0.1:18083".to_string(),
+                enabled: true,
+                ..Default::default()
+            },
+            Server {
+                name: "b".to_string(),
+                endpoint: "127.0.0.1:18084".to_string(),
+                enabled: true,
+                ..Default::default()
+            },
+        ];
+        let state_db = crate::models::build_state_db(servers.clone());
+        {
+            let db = state_db.lock().await;
+            db["127.0.0.1:18083"]
+                .connections
+                .store(1, Ordering::Relaxed);
+            db["127.0.0.1:18084"]
+                .connections
+                .store(1, Ordering::Relaxed);
+        }
+        let ctx = ListenerContext {
+            health: ListenerHealthState {
+                name: Some("slot-count".to_string()),
+                state_db,
+                hub: None,
+                chain_api: None,
+            },
+            config_db: crate::models::build_config_db(servers),
+            order: vec!["127.0.0.1:18083".to_string(), "127.0.0.1:18084".to_string()],
+            port: 0,
+            chain_id: None,
+            max_connections: 10,
+            stats: Arc::new(ListenerStats::default()),
+        };
+        // One client: its link to a and its standby link to b.
+        let client = "127.0.0.1:5002".parse().unwrap();
+        let session = telemetry::global().register_session(
+            Arc::from("slot-count"),
+            client,
+            "127.0.0.1:18083",
+        );
+        let view = listener_view(&ctx, Instant::now()).await;
+        assert_eq!(view.sessions, 1);
+        assert_eq!(
+            view.upstreams
+                .iter()
+                .map(|u| u.sessions)
+                .collect::<Vec<_>>(),
+            [1, 1]
+        );
+        drop(session);
+        assert_eq!(listener_view(&ctx, Instant::now()).await.sessions, 0);
     }
 
     #[test]

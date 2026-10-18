@@ -137,6 +137,8 @@ pub struct SessionInfo {
     upstream: Mutex<String>,
     start_block: AtomicU64,
     last_block: AtomicU64,
+    /// The start of the latest request, then one past each block delivered.
+    next_block: AtomicU64,
     finality: AtomicBool,
     blocks: AtomicU64,
     bytes: AtomicU64,
@@ -171,12 +173,11 @@ impl SessionInfo {
         Self::block(&self.last_block)
     }
 
-    /// The block this session needs next: one past the last block delivered,
-    /// or the requested start block before any arrives.
+    /// The block this session needs next: one past the last block delivered
+    /// for its latest request, or that request's start block before any
+    /// arrives.
     pub fn next_block(&self) -> Option<u32> {
-        self.last_block()
-            .map(|block| block.saturating_add(1))
-            .or_else(|| self.start_block())
+        Self::block(&self.next_block)
     }
 
     pub fn finality(&self) -> bool {
@@ -199,6 +200,8 @@ impl SessionInfo {
     pub fn note_request(&self, start_block: u32, finality: bool) {
         self.start_block
             .store(u64::from(start_block), Ordering::Relaxed);
+        self.next_block
+            .store(u64::from(start_block), Ordering::Relaxed);
         self.finality.store(finality, Ordering::Relaxed);
     }
 
@@ -209,6 +212,8 @@ impl SessionInfo {
         if let Some(block) = block {
             self.blocks.fetch_add(1, Ordering::Relaxed);
             self.last_block.store(u64::from(block), Ordering::Relaxed);
+            self.next_block
+                .store(u64::from(block.saturating_add(1)), Ordering::Relaxed);
         }
     }
 
@@ -329,6 +334,7 @@ impl Telemetry {
             upstream: Mutex::new(upstream.to_string()),
             start_block: AtomicU64::new(NO_BLOCK),
             last_block: AtomicU64::new(NO_BLOCK),
+            next_block: AtomicU64::new(NO_BLOCK),
             finality: AtomicBool::new(false),
             blocks: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
@@ -398,5 +404,23 @@ mod tests {
 
         drop(registration);
         assert!(telemetry.session(id).is_none());
+    }
+
+    #[test]
+    fn a_new_request_restarts_the_next_block_at_its_start() {
+        let telemetry = global();
+        let client: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        let registration = telemetry.register_session(Arc::from("t"), client, "up:1");
+        let info = registration.info.clone();
+        info.note_request(4_000, false);
+        info.note_frame(10, Some(5_000));
+        assert_eq!(info.next_block(), Some(5_001));
+        // The client asks for older blocks: the API decides on them, not on
+        // where the previous request ended.
+        info.note_request(100, false);
+        assert_eq!(info.next_block(), Some(100));
+        assert_eq!(info.last_block(), Some(5_000), "still the last delivered");
+        info.note_frame(10, Some(100));
+        assert_eq!(info.next_block(), Some(101));
     }
 }

@@ -2,8 +2,11 @@
 //!
 //! Always served (GET):
 //!   - `/health`, `/healthz`           -> 200 while the process is running
-//!   - `/ready`,  `/readyz`            -> 200 if every listener has ≥1 usable upstream online, else 503
-//!   - `/ready/<name>`, `/readyz/<name>` -> 200 / 503 for one listener, 404 if unknown
+//!   - `/ready`,  `/readyz`            -> 200 if every listener can serve the tip, else 503
+//!   - `/ready/<name>`, `/readyz/<name>` -> the same for one listener, 404 if unknown
+//!   - `?scope=history` on either      -> also requires complete, online archive coverage (stitched)
+//!   - `?scope=api` on either          -> whether the chain API can answer (listeners with one)
+//!   - `/coverage`, `/coverage/<name>` -> JSON fleet coverage of every listener, or of one
 //!   - `/metrics`                      -> Prometheus text exposition
 //!
 //! With `dashboard.enabled`: `/` and `/ui` redirect to `/ui/` (the embedded
@@ -16,7 +19,7 @@ use std::time::Duration;
 
 use std::net::IpAddr;
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -29,7 +32,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Semaphore};
 
 use crate::api::{self, SharedState, StatusView};
-use crate::health::{evaluate_listener_readiness, evaluate_overall_readiness, render_metrics};
+use crate::health::{coverage_response, readiness, render_metrics};
 
 include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
 
@@ -112,6 +115,8 @@ pub fn router(app: SharedState) -> Router {
         .route("/readyz", get(ready))
         .route("/ready/{name}", get(ready_listener))
         .route("/readyz/{name}", get(ready_listener))
+        .route("/coverage", get(coverage))
+        .route("/coverage/{name}", get(coverage_listener))
         .route("/metrics", get(metrics));
     if app.dashboard {
         let dashboard = Router::new()
@@ -173,13 +178,27 @@ async fn health() -> Response {
     text("200 OK", "text/plain", "ok\n".to_string())
 }
 
-async fn ready(State(app): State<SharedState>) -> Response {
-    let (status, content_type, body) = evaluate_overall_readiness(&app.health).await;
+async fn ready(State(app): State<SharedState>, RawQuery(query): RawQuery) -> Response {
+    let (status, content_type, body) = readiness(&app.health, None, query.as_deref()).await;
     text(status, content_type, body)
 }
 
-async fn ready_listener(State(app): State<SharedState>, Path(name): Path<String>) -> Response {
-    let (status, content_type, body) = evaluate_listener_readiness(&app.health, &name).await;
+async fn ready_listener(
+    State(app): State<SharedState>,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let (status, content_type, body) = readiness(&app.health, Some(&name), query.as_deref()).await;
+    text(status, content_type, body)
+}
+
+async fn coverage(State(app): State<SharedState>) -> Response {
+    let (status, content_type, body) = coverage_response(&app.health, None);
+    text(status, content_type, body)
+}
+
+async fn coverage_listener(State(app): State<SharedState>, Path(name): Path<String>) -> Response {
+    let (status, content_type, body) = coverage_response(&app.health, Some(&name));
     text(status, content_type, body)
 }
 
@@ -384,11 +403,28 @@ async fn status_page(State(app): State<SharedState>) -> Response {
         .into_response()
 }
 
+/// Send one raw HTTP/1.1 request to a server for `app` and return the full
+/// response text.
 #[cfg(test)]
-mod tests {
+pub(crate) async fn request(app: SharedState, raw: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let server = tokio::spawn(serve(listener, app, shutdown_rx));
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client.write_all(raw.as_bytes()).await.unwrap();
+    let mut resp = String::new();
+    client.read_to_string(&mut resp).await.unwrap();
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+    resp
+}
+
+#[cfg(test)]
+mod tests {
     use super::*;
     use crate::api::{AppState, ListenerContext};
     use crate::health::ListenerHealthState;
@@ -400,8 +436,7 @@ mod tests {
             name: name.to_string(),
             endpoint: endpoint.to_string(),
             enabled: true,
-            priority: 0,
-            weight: 1,
+            ..Default::default()
         }
     }
 
@@ -417,6 +452,8 @@ mod tests {
         let health = ListenerHealthState {
             name: Some("eos".to_string()),
             state_db,
+            hub: None,
+            chain_api: None,
         };
         Arc::new(AppState {
             listeners: vec![ListenerContext {
@@ -434,21 +471,6 @@ mod tests {
             allowed_hosts: vec!["router.internal".to_string()],
             streams: Arc::new(Semaphore::new(api::MAX_STREAMS)),
         })
-    }
-
-    /// Send one raw HTTP/1.1 request and return the full response text.
-    async fn request(app: SharedState, raw: &str) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-        let server = tokio::spawn(serve(listener, app, shutdown_rx));
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        client.write_all(raw.as_bytes()).await.unwrap();
-        let mut resp = String::new();
-        client.read_to_string(&mut resp).await.unwrap();
-        let _ = shutdown_tx.send(());
-        let _ = server.await;
-        resp
     }
 
     fn get(path: &str) -> String {

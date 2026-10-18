@@ -1,0 +1,73 @@
+{
+  "listen_address": "0.0.0.0",
+  "upstream_reconnect_ms": 3000,
+  "upstream_monitoring_ms": 5000,
+  "upstream_status_ms": 1000,
+  "metrics_port": 9090,
+  "listeners": [
+    {
+      "name": "main",
+      "listen_port": 17000,
+      "chain_id": "aca376f206b8fc25a6ed44dbdc66547c36c6c33e3a119ffbeaef943642f0e906",
+      "stitching": {
+        "history_preference": "frozen",
+        "predial_blocks": 2000,
+        "gap_wait_ms": 30000
+      },
+      "chain_api": {
+        "listen_port": 18888,
+        "listen_address": "10.0.0.5"
+      },
+      "servers": [
+        {
+          "name": "archive-0a",
+          "endpoint": "10.0.3.10:8080",
+          "enabled": true,
+          "role": "frozen",
+          "range": { "begin": 2, "end": 50000001 },
+          "max_sessions": 64,
+          "api_endpoint": "http://10.0.3.10:8890"
+        },
+        {
+          "name": "archive-0b",
+          "endpoint": "10.0.3.11:8080",
+          "enabled": true,
+          "role": "frozen",
+          "range": { "begin": 2, "end": 50000001 },
+          "max_sessions": 64,
+          "api_endpoint": "http://10.0.3.11:8890"
+        },
+        {
+          "name": "archive-1a",
+          "endpoint": "10.0.3.12:8080",
+          "enabled": true,
+          "role": "frozen",
+          "range": { "begin": 50000001, "end": 100000001 },
+          "max_sessions": 64,
+          "api_endpoint": "http://10.0.3.12:8890"
+        },
+        {
+          "name": "archive-1b",
+          "endpoint": "10.0.3.13:8080",
+          "enabled": true,
+          "role": "frozen",
+          "range": { "begin": 50000001, "end": 100000001 },
+          "max_sessions": 64,
+          "api_endpoint": "http://10.0.3.13:8890"
+        },
+        {
+          "name": "live-1",
+          "endpoint": "10.0.1.10:8080",
+          "enabled": true,
+          "api_endpoint": "http://10.0.1.10:8888"
+        },
+        {
+          "name": "live-2",
+          "endpoint": "10.0.1.11:8080",
+          "enabled": true,
+          "api_endpoint": "http://10.0.1.11:8888"
+        }
+      ]
+    }
+  ]
+}

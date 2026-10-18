@@ -6,7 +6,7 @@ A reverse proxy and load balancer for the Antelope **SHiP** (State History Plugi
 [![Crates.io](https://img.shields.io/crates/v/fleet-router.svg)](https://crates.io/crates/fleet-router)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[Homepage](https://eosrio.github.io/fleet-router/) · [Configuration](docs/configuration.md) · [Operations](docs/operations.md) · [Observability](docs/observability.md) · [Dashboard & API](docs/api.md) · [Changelog](CHANGELOG.md)
+[Homepage](https://eosrio.github.io/fleet-router/) · [Configuration](docs/configuration.md) · [Operations](docs/operations.md) · [Observability](docs/observability.md) · [Chain API](docs/chain-api.md) · [Dashboard & API](docs/api.md) · [Changelog](CHANGELOG.md)
 
 Run more than one SHiP node? Put fleet-router in front of them and give your clients (Hyperion, other indexers, custom consumers) **one resilient endpoint** instead of pinning each consumer to one node.
 
@@ -28,9 +28,11 @@ Clients open a single WebSocket connection to the router. The router picks a hea
 
 ## Features
 
-- **Failover without reconnecting.** On upstream loss the session moves to another node, resumes at the next block, drops replayed blocks, and replays client frames sent during the swap.
-- **Range-aware, least-connections routing.** Requests go to an upstream whose trace range covers the requested block, otherwise to the least-loaded healthy one. Optional per-node `priority` and `weight` mark preferred and last-resort nodes and split load. `fetch_finality_data` requests go only to nodes whose finality range covers the block.
-- **Stale nodes are deprioritized, not excluded.** Upstreams that stop advancing drop down the list.
+- **Failover without reconnecting.** On upstream loss, a silent socket or a stalled stream, the session moves to another node, resumes at the next block with the client's outstanding credit, and drops blocks the client already has.
+- **Range-aware, least-connections routing.** Each `get_blocks` goes to an upstream that has the requested block for every log it asks for (traces, deltas, finality data), otherwise to the least-loaded healthy one. Optional per-node `priority` and `weight` mark preferred and last-resort nodes and split load.
+- **Stale and lagging nodes are deprioritized, not excluded.** Upstreams that stop advancing, or fall behind the fleet head, drop down the list.
+- **Range-split fleets.** Mark archive upstreams `"role": "frozen"` and the listener presents live nodes plus frozen range servers (fixed block ranges served from archived logs, no nodeos) as one SHiP node: the router answers status itself, routes each request by block range, and hands the stream from one upstream to the next. See [Range-split fleets](docs/operations.md#range-split-fleets).
+- **Chain API (opt-in).** A nodeos-compatible HTTP port per listener: block lookups go to the frozen range server or live node that holds the block, `get_info` and state calls to live nodes, push and exec are off by default. See [Chain API](docs/chain-api.md).
 - **Bounded failure on corrupted SHiP logs.** A block that breaks every upstream ends the session with close code 1011 and a clear reason instead of a silent stall. Opt-in quarantine skips one node for just the bad block range.
 - **Several networks in one process.** Each listener has its own port, upstream pool, `chain_id`, connection cap, and `/ready/<name>` check.
 - **`chain_id` verification.** Upstreams that report the wrong chain stay offline. Older nodes that omit `chain_id` (FIO and other EOSIO 2.0-based builds) stay usable unless you require it.
@@ -103,6 +105,9 @@ INFO listening for clients address=0.0.0.0 port=17000
 ```text
 fleet-router config init <path>     Write a sample config file to <path>.
 fleet-router config test <path>     Parse and validate a config, then test upstream connectivity.
+             [--strict]             Also exit 1 on an invalid config, a coverage hole, an
+                                    unreported archive, or archived blocks that no archive
+                                    with api_endpoint covers on a chain API listener.
 fleet-router run [--config <path>]  Run the proxy.
 fleet-router check [--port <port>]  Exit 0 if 127.0.0.1:<port> accepts TCP (default 17000).
 fleet-router --version              Print the version.
@@ -113,15 +118,17 @@ fleet-router --help                 Print help.
 
 ## Documentation
 
-- **[Configuration reference](docs/configuration.md)**: every field and default, upstream TLS, and multi-network `listeners`.
-- **[Running in production](docs/operations.md)**: security, running as a service (systemd, Docker, launchd, Windows), graceful shutdown, corrupted SHiP logs, and tuning.
-- **[Observability](docs/observability.md)**: logging, health and readiness endpoints, and the Prometheus metrics.
+- **[Configuration reference](docs/configuration.md)**: every field and default, topology and stitching, the chain API, upstream TLS, and multi-network `listeners`.
+- **[Running in production](docs/operations.md)**: routing and failover, range-split fleets with frozen range servers, security, running as a service (systemd, Docker, launchd, Windows), graceful shutdown, corrupted SHiP logs, and tuning.
+- **[Observability](docs/observability.md)**: logging, health and readiness endpoints, `/coverage`, the Prometheus metrics, and alerts.
+- **[Chain API](docs/chain-api.md)**: the opt-in nodeos-compatible HTTP port and how it routes requests.
 - **[Dashboard and control API](docs/api.md)**: the opt-in live dashboard, status page, JSON API, and token-protected control actions.
+- **Example configs**: [`example.config.json`](example.config.json) (two full nodes) and [`example.stitched.config.json`](example.stitched.config.json) (archived ranges, live nodes and a chain API).
 - **Deployment samples**: [`deploy/fleet-router.service`](deploy/fleet-router.service), [`deploy/fleet-router@.service`](deploy/fleet-router@.service), and [`deploy/docker-compose.multi-network.yml`](deploy/docker-compose.multi-network.yml).
 
 ## Security
 
-The client listener is **plaintext `ws://` and unauthenticated**. Run fleet-router on a trusted network or behind a TLS-terminating reverse proxy that adds access control. **Do not expose it directly to the public internet.** See [Security](docs/operations.md#security) for details.
+The client listener is **plaintext `ws://` and unauthenticated**, and so is the optional chain API port (plain HTTP). Run fleet-router on a trusted network or behind a TLS-terminating reverse proxy that adds access control. **Do not expose it directly to the public internet.** See [Security](docs/operations.md#security) for details.
 
 To report a vulnerability, follow [SECURITY.md](SECURITY.md). Please do not open public issues for security reports.
 

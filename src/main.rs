@@ -11,6 +11,7 @@
 //! operational guidance.
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::fs::{read_to_string, write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -20,35 +21,46 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use clap::{arg, value_parser, Command};
 use color_print::cprintln;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use serde_json::from_str;
 use tokio::net::TcpListener;
 use tokio::spawn;
 use tokio::sync::{broadcast, Semaphore};
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, timeout, timeout_at};
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::Instrument;
 
 use crate::config_sample::CONFIG_SAMPLE;
-use crate::connection_handler::handle_client;
+use crate::fleet::view::uncovered;
+use crate::fleet::{FleetHub, FleetView, Log};
 use crate::models::{
-    build_config_db, build_state_db_with_chain_id, format_bind_addr, ServerConfig, ServerConfigDb,
-    ServerStateDb, StaticConfig,
+    build_config_db, build_state_db_with_chain_id, format_bind_addr, ResolvedChainApi,
+    ResolvedListener, ResolvedTopology, Role, ServerConfig, ServerConfigDb, ServerStateDb,
+    StaticConfig,
 };
-use crate::tasks::{monitoring_connection, state_monitoring_loop, upstream_ws_config};
+use crate::session::{handle_client, ListenerCtx};
+use crate::ship::wire::{self, UpstreamMsg};
+use crate::ship::Range;
+use crate::tasks::{
+    apply_status_update, monitoring_connection, state_monitoring_loop, upstream_ws_config,
+};
 
 mod abi;
 mod api;
+mod chain_api;
 mod config_sample;
-mod connection_handler;
-mod errors;
+mod fleet;
 mod functions;
 mod health;
 mod http;
 mod models;
+mod session;
+mod ship;
 mod tasks;
 mod telemetry;
+#[cfg(test)]
+mod test_log;
 mod zcd;
 
 #[tokio::main]
@@ -61,13 +73,13 @@ async fn main() -> Result<()> {
         .ok();
 
     let config: ServerConfig = match process_args() {
-        Ok(Some((test, conf))) => {
-            if test {
-                run_tests(&conf).await;
-                return Ok(());
+        Ok(Some((Action::Test { strict }, conf))) => {
+            if !run_tests(&conf, strict).await {
+                std::process::exit(1);
             }
-            conf
+            return Ok(());
         }
+        Ok(Some((Action::Run, conf))) => conf,
         Ok(None) => return Ok(()),
         Err(e) => bail!(e),
     };
@@ -76,6 +88,9 @@ async fn main() -> Result<()> {
 
     // Validate the configuration up front with clear, actionable errors.
     config.validate()?;
+    for warning in config.warnings() {
+        tracing::warn!("{warning}");
+    }
     let control_token = if config.dashboard.enabled {
         config.dashboard.resolve_control_token()?
     } else {
@@ -95,10 +110,11 @@ async fn main() -> Result<()> {
     };
     let limits = config.proxy_limits();
     let resolved_listeners = config.resolved_listeners();
+    let resolved_chain_apis = config.resolved_chain_apis();
 
     // Bind all client TCP listeners up front so any port conflict fails fast.
     let mut bound_listeners = Vec::with_capacity(resolved_listeners.len());
-    for listener_cfg in resolved_listeners {
+    for (listener_cfg, chain_api) in resolved_listeners.into_iter().zip(resolved_chain_apis) {
         let bind_addr = format_bind_addr(&listener_cfg.listen_address, listener_cfg.listen_port);
         let tcp_listener = TcpListener::bind(&bind_addr)
             .await
@@ -127,7 +143,23 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        bound_listeners.push((listener_cfg, tcp_listener));
+        // The listener's chain API, bound with the SHiP listeners.
+        let chain_api = match chain_api {
+            Some(api) => {
+                let api_listener = TcpListener::bind(&api.bind).await.map_err(|e| {
+                    anyhow::anyhow!("error binding the chain API to {}: {}", api.bind, e)
+                })?;
+                tracing::info!(
+                    listener = listener_cfg.name.as_deref().unwrap_or("default"),
+                    address = %api.bind,
+                    upstreams = api.upstreams.len(),
+                    "chain API listening"
+                );
+                Some((api, api_listener))
+            }
+            None => None,
+        };
+        bound_listeners.push((listener_cfg, tcp_listener, chain_api));
     }
 
     // Graceful-shutdown broadcast: every long-lived task subscribes.
@@ -137,18 +169,41 @@ async fn main() -> Result<()> {
     let mut listener_contexts = Vec::with_capacity(bound_listeners.len());
     let mut conn_limits = Vec::with_capacity(bound_listeners.len());
     let mut accept_handles = Vec::with_capacity(bound_listeners.len());
+    let mut chain_apis = Vec::new();
 
-    for (listener_cfg, tcp_listener) in bound_listeners {
+    for (listener_cfg, tcp_listener, chain_api) in bound_listeners {
         let server_config_db: ServerConfigDb = build_config_db(listener_cfg.servers.clone());
         let server_state_db: ServerStateDb = build_state_db_with_chain_id(
             listener_cfg.servers.clone(),
             listener_cfg.expected_chain_id,
             listener_cfg.require_chain_id,
         );
+        // The listener's fleet view: monitors publish into it, the metrics
+        // endpoint reads it.
+        let hub = FleetHub::new(
+            &listener_cfg,
+            server_state_db.clone(),
+            server_config_db.clone(),
+        );
+
+        // The listener's chain API, served further down; readiness, coverage
+        // and metrics read it.
+        let chain_api = chain_api.map(|(api, api_listener)| {
+            let api_ctx = chain_api::ChainApiCtx::new(
+                &api,
+                hub.clone(),
+                Duration::from_millis(limits.connect_timeout_ms),
+                limits.handshake_timeout_ms,
+                config.live_lag_blocks,
+            );
+            (api_ctx, api_listener)
+        });
 
         let health_state = health::ListenerHealthState {
             name: listener_cfg.name.clone(),
             state_db: server_state_db.clone(),
+            hub: Some(hub.clone()),
+            chain_api: chain_api.as_ref().map(|(api_ctx, _)| api_ctx.clone()),
         };
         let listener_stats = Arc::new(telemetry::ListenerStats::default());
         listener_contexts.push(api::ListenerContext {
@@ -189,14 +244,27 @@ async fn main() -> Result<()> {
             spawn(monitoring_connection(
                 server,
                 static_config.clone(),
-                server_state_db.clone(),
+                hub.clone(),
                 shutdown_tx.subscribe(),
             ));
         }
 
+        // What every client session of this listener shares.
+        let ctx = ListenerCtx::new(&listener_cfg, limits, config.live_lag_blocks, hub.clone());
+
+        // The chain API: its probes and its accept loop. Its connections
+        // drain with the SHiP ones. `chain_apis` lines up with the
+        // listeners.
+        let api_ctx = chain_api.map(|(api_ctx, api_listener)| {
+            conn_limits.push((api_ctx.connections.clone(), api_ctx.max_connections()));
+            accept_handles.push(api_ctx.spawn(api_listener, &shutdown_tx));
+            api_ctx
+        });
+        chain_apis.push(api_ctx);
+
         // Periodic block-progress / staleness monitor for this listener's pool.
         spawn(state_monitoring_loop(
-            server_state_db.clone(),
+            hub,
             static_config.upstream_monitoring_ms,
             shutdown_tx.subscribe(),
         ));
@@ -207,8 +275,6 @@ async fn main() -> Result<()> {
         conn_limits.push((conn_limit.clone(), max_connections));
 
         let listener_name = listener_cfg.name.clone();
-        let session_listener: Arc<str> =
-            Arc::from(listener_cfg.name.as_deref().unwrap_or("default"));
         let listener_shutdown_tx = shutdown_tx.clone();
         let mut accept_shutdown_rx = shutdown_tx.subscribe();
 
@@ -238,9 +304,7 @@ async fn main() -> Result<()> {
                         listener_stats.accepted_total.fetch_add(1, Ordering::Relaxed);
                         tracing::debug!(%client_addr, "accepted tcp connection");
 
-                        let s_state_db = server_state_db.clone();
-                        let s_config_db = server_config_db.clone();
-                        let s_listener = session_listener.clone();
+                        let ctx = ctx.clone();
                         let shutdown_rx = listener_shutdown_tx.subscribe();
                         let span = match &listener_name {
                             Some(name) => tracing::info_span!("client", listener = %name, addr = %client_addr),
@@ -250,17 +314,7 @@ async fn main() -> Result<()> {
                         spawn(
                             async move {
                                 let _permit = permit; // released when this task ends
-                                handle_client(
-                                    client_stream,
-                                    client_addr,
-                                    s_listener,
-                                    s_state_db,
-                                    s_config_db,
-                                    limits,
-                                    listener_cfg.block_failure_quarantine,
-                                    shutdown_rx,
-                                )
-                                .await;
+                                handle_client(client_stream, client_addr, ctx, shutdown_rx).await;
                             }
                             .instrument(span),
                         );
@@ -307,7 +361,10 @@ async fn main() -> Result<()> {
     ));
 
     shutdown_signal().await;
-    tracing::info!("shutdown signal received; draining connections");
+    tracing::info!(
+        chain_apis = chain_apis.iter().flatten().count(),
+        "shutdown signal received; draining connections"
+    );
     let _ = shutdown_tx.send(());
     for handle in accept_handles {
         let _ = handle.await;
@@ -412,12 +469,256 @@ async fn probe_upstream(endpoint: &str, max_message_bytes: usize, bound: Duratio
     }
 }
 
-async fn run_tests(config: &ServerConfig) {
+/// `config test`: ask an upstream for its status, v1 first and then v0 for a
+/// node that does not answer v1. Returns the raw status result.
+async fn probe_status(
+    endpoint: &str,
+    max_message_bytes: usize,
+    bound: Duration,
+) -> Option<Vec<u8>> {
+    for v1 in [true, false] {
+        if let Some(status) = probe_status_once(endpoint, max_message_bytes, bound, v1).await {
+            return Some(status);
+        }
+    }
+    None
+}
+
+/// One status probe; the whole exchange is bounded by `bound`.
+async fn probe_status_once(
+    endpoint: &str,
+    max_message_bytes: usize,
+    bound: Duration,
+    v1: bool,
+) -> Option<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + bound;
+    let connect =
+        connect_async_with_config(endpoint, Some(upstream_ws_config(max_message_bytes)), true);
+    let (ws, _) = timeout_at(deadline, connect).await.ok()?.ok()?;
+    let (mut writer, mut reader) = ws.split();
+    // The ABI comes first.
+    match timeout_at(deadline, reader.next()).await {
+        Ok(Some(Ok(Message::Text(_)))) => {}
+        _ => return None,
+    }
+    let request = Message::Binary(wire::encode_status_request(v1).into());
+    timeout_at(deadline, writer.send(request))
+        .await
+        .ok()?
+        .ok()?;
+    loop {
+        match timeout_at(deadline, reader.next()).await.ok()?? {
+            Ok(Message::Binary(frame)) => {
+                if matches!(wire::classify_upstream(&frame), UpstreamMsg::Status { .. }) {
+                    let _ = timeout_at(deadline, writer.send(Message::Close(None))).await;
+                    return Some(frame.to_vec());
+                }
+            }
+            Ok(Message::Close(_)) | Err(_) => return None,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// `[begin,end)`, or `-` for an empty range.
+fn range_text(r: Range) -> String {
+    if r.is_empty() {
+        "-".to_string()
+    } else {
+        format!("[{},{})", r.begin, r.end)
+    }
+}
+
+/// `config test` for a stitched listener: apply the probed status results the
+/// way the monitor does, then print each upstream's ranges and the coverage
+/// they add up to. Returns the view, and what `--strict` fails on: a hole in
+/// the trace or chain-state coverage, and an enabled frozen upstream that did
+/// not report its ranges (a declared range is not verified).
+async fn report_coverage(
+    listener: &ResolvedListener,
+    statuses: &[(String, Option<Vec<u8>>)],
+) -> (Arc<FleetView>, Vec<String>) {
+    let state_db = build_state_db_with_chain_id(
+        listener.servers.clone(),
+        listener.expected_chain_id,
+        listener.require_chain_id,
+    );
+    let hub = FleetHub::new(
+        listener,
+        state_db,
+        build_config_db(listener.servers.clone()),
+    );
+    let mut reported: HashSet<&str> = HashSet::new();
+    for (endpoint, status) in statuses {
+        let Some(status) = status else {
+            continue;
+        };
+        let Some(server) = hub.config.lock().await.get(endpoint).cloned() else {
+            continue;
+        };
+        let applied = apply_status_update(status, &hub.state, &server).await;
+        let known = hub
+            .state
+            .lock()
+            .await
+            .get(endpoint)
+            .is_some_and(|s| s.ranges_known && s.online);
+        if matches!(applied, Ok(Some(_))) && known {
+            reported.insert(endpoint.as_str());
+        }
+    }
+    hub.refresh().await;
+    let view = hub.view();
+    print_coverage(&view, &reported);
+
+    let mut failures = Vec::new();
+    for log in [Log::Trace, Log::ChainState] {
+        for gap in &view.cov(log).gaps {
+            failures.push(format!(
+                "hole {} in {} coverage",
+                range_text(*gap),
+                log.as_str()
+            ));
+        }
+    }
+    for u in view
+        .upstreams
+        .iter()
+        .filter(|u| u.enabled && u.role == Role::Frozen && !reported.contains(&*u.endpoint))
+    {
+        failures.push(format!(
+            "frozen upstream '{}' did not report its ranges",
+            u.name
+        ));
+    }
+    (view, failures)
+}
+
+fn print_coverage(view: &FleetView, reported: &HashSet<&str>) {
+    cprintln!("\n 🗺️  <bright-magenta,bold>Coverage</> (stitched)");
+    for log in Log::ALL {
+        let cov = view.cov(log);
+        let parts: Vec<String> = cov.components.iter().map(|c| range_text(*c)).collect();
+        let parts = if parts.is_empty() {
+            "-".to_string()
+        } else {
+            parts.join(" ")
+        };
+        let gaps: Vec<String> = cov.gaps.iter().map(|g| range_text(*g)).collect();
+        if gaps.is_empty() {
+            cprintln!("    {:<12} {}", log.as_str(), parts);
+        } else {
+            cprintln!(
+                "    {:<12} {}  <red>holes: {}</>",
+                log.as_str(),
+                parts,
+                gaps.join(" ")
+            );
+        }
+    }
+    for u in &view.upstreams {
+        let source = if reported.contains(&*u.endpoint) {
+            "reported"
+        } else if u.known {
+            "declared"
+        } else {
+            "unknown"
+        };
+        let ranges: Vec<String> = Log::ALL
+            .iter()
+            .map(|&log| format!("{} {}", log.as_str(), range_text(u.range(log))))
+            .collect();
+        cprintln!(
+            "    <cyan>{:<16}</> {:<6} {:<8} {}",
+            u.name,
+            u.role.as_str(),
+            source,
+            ranges.join("  ")
+        );
+    }
+}
+
+/// `config test`: the chain API of a listener, one line per enabled server,
+/// and a warning for each enabled frozen server without `api_endpoint`.
+/// Returns what `--strict` fails on: archived blocks of the stitched
+/// listener's coverage (`view`) that no frozen server with an `api_endpoint`
+/// covers, which only live nodes can then answer. A replica without one is
+/// no failure while another archive's API covers its range.
+fn report_chain_api(
+    listener: &ResolvedListener,
+    api: &ResolvedChainApi,
+    view: Option<&FleetView>,
+) -> Vec<String> {
+    cprintln!(
+        "\n 🔌 <bright-magenta,bold>Chain API</> on <cyan>{}</> ({} upstream API(s))",
+        api.bind,
+        api.upstreams.len()
+    );
+    let enabled = || listener.servers.iter().filter(|s| s.enabled);
+    for server in enabled() {
+        let endpoint = server.api_endpoint.as_deref().unwrap_or("-");
+        cprintln!(
+            "    <cyan>{:<16}</> {:<6} {}",
+            server.name,
+            server.role.as_str(),
+            endpoint
+        );
+    }
+    for server in enabled().filter(|s| s.role == Role::Frozen && s.api_endpoint.is_none()) {
+        cprintln!(
+            "    <yellow>warning: frozen server '{}' has no api_endpoint; the chain API does not use it</>",
+            server.name
+        );
+    }
+    let Some(view) = view else {
+        return Vec::new();
+    };
+    let with_api: HashSet<&str> = enabled()
+        .filter(|s| s.api_endpoint.is_some())
+        .map(|s| s.endpoint.as_str())
+        .collect();
+    archived_without_api(view, &with_api)
+        .into_iter()
+        .map(|r| {
+            format!(
+                "archived blocks {} have no frozen server with an api_endpoint; chain API requests for them are answered by live nodes only",
+                range_text(r)
+            )
+        })
+        .collect()
+}
+
+/// The blocks of a stitched listener's archived history (the trace and
+/// chain-state ranges of its enabled frozen upstreams, reported or declared)
+/// that no frozen upstream whose server has an `api_endpoint` covers.
+/// `with_api` holds the SHiP endpoints of the servers with one.
+fn archived_without_api(view: &FleetView, with_api: &HashSet<&str>) -> Vec<Range> {
+    let ranges = |api_only: bool| -> Vec<Range> {
+        view.upstreams
+            .iter()
+            .filter(|u| u.enabled && u.known && u.role == Role::Frozen)
+            .filter(|u| !api_only || with_api.contains(&*u.endpoint))
+            .flat_map(|u| [u.range(Log::Trace), u.range(Log::ChainState)])
+            .collect()
+    };
+    uncovered(ranges(false), ranges(true))
+}
+
+/// Probe every server of every listener. Returns false when `strict` and a
+/// stitched listener's coverage has a hole or an unreported frozen upstream,
+/// or a chain API listener has archived blocks that no frozen server with an
+/// `api_endpoint` covers.
+async fn run_tests(config: &ServerConfig, strict: bool) -> bool {
     let mut total_valid = 0;
     let mut all_listeners_valid = true;
+    let mut strict_failures: Vec<String> = Vec::new();
     let bound = Duration::from_millis(config.upstream_connect_timeout_ms());
 
-    for listener in config.resolved_listeners() {
+    for (listener, chain_api) in config
+        .resolved_listeners()
+        .into_iter()
+        .zip(config.resolved_chain_apis())
+    {
         if let Some(name) = &listener.name {
             cprintln!(
                 "\n 🌐 Listener <bright-magenta,bold>{}</> (<cyan>{}</>)",
@@ -432,6 +733,8 @@ async fn run_tests(config: &ServerConfig) {
             }
         }
         let mut listener_valid = 0;
+        // Stitched: the status of every server that answered with an ABI.
+        let mut statuses: Vec<(String, Option<Vec<u8>>)> = Vec::new();
         for server in &listener.servers {
             let endpoint = server.ws_url();
             cprintln!("\n 🧪 Testing <bright-cyan>{}</>", endpoint);
@@ -441,6 +744,15 @@ async fn run_tests(config: &ServerConfig) {
                     cprintln!(" ✅  <green>ABI Received!</>");
                     listener_valid += 1;
                     total_valid += 1;
+                    if listener.topology == ResolvedTopology::Stitched && server.enabled {
+                        let status = probe_status(&endpoint, config.max_message_bytes, bound).await;
+                        if status.is_some() {
+                            cprintln!(" ✅  <green>Status Received!</>");
+                        } else {
+                            cprintln!(" ❌  <red>{}:</> No status result!", endpoint);
+                        }
+                        statuses.push((server.endpoint.clone(), status));
+                    }
                 }
                 Probe::ConnectTimeout => {
                     cprintln!(
@@ -489,16 +801,59 @@ async fn run_tests(config: &ServerConfig) {
         if listener_valid == 0 {
             all_listeners_valid = false;
         }
+        let mut view = None;
+        if listener.topology == ResolvedTopology::Stitched {
+            let (stitched, failures) = report_coverage(&listener, &statuses).await;
+            view = Some(stitched);
+            for failure in &failures {
+                cprintln!("    <yellow>warning: {}</>", failure);
+            }
+            let prefix = listener
+                .name
+                .as_deref()
+                .map(|name| format!("listener '{name}': "))
+                .unwrap_or_default();
+            strict_failures.extend(failures.into_iter().map(|f| format!("{prefix}{f}")));
+        }
+        if let Some(api) = &chain_api {
+            let failures = report_chain_api(&listener, api, view.as_deref());
+            for failure in &failures {
+                cprintln!("    <yellow>warning: {}</>", failure);
+            }
+            let prefix = listener
+                .name
+                .as_deref()
+                .map(|name| format!("listener '{name}': "))
+                .unwrap_or_default();
+            strict_failures.extend(failures.into_iter().map(|f| format!("{prefix}{f}")));
+        }
     }
     if total_valid > 0 && all_listeners_valid {
         cprintln!("\n ✅  Valid servers: <cyan,bold>{}</>", total_valid);
     } else {
         cprintln!("\n ❌  <red,bold>No valid servers, please check your configuration file!</>");
     }
+    let passed = !strict || strict_failures.is_empty();
+    if !passed {
+        cprintln!(
+            "\n ❌  <red,bold>--strict: {} coverage or chain API problem(s), see the warnings above</>",
+            strict_failures.len()
+        );
+    }
     println!();
+    passed
 }
 
-fn process_args() -> Result<Option<(bool, ServerConfig)>> {
+/// What the command line asks for.
+enum Action {
+    Run,
+    /// `config test`; `strict` makes coverage problems fail the run.
+    Test {
+        strict: bool,
+    },
+}
+
+fn process_args() -> Result<Option<(Action, ServerConfig)>> {
     let cmd = Command::new("fleet-router")
         .about("Protocol-aware reverse proxy for Antelope SHiP")
         .version(env!("CARGO_PKG_VERSION"))
@@ -528,7 +883,8 @@ fn process_args() -> Result<Option<(bool, ServerConfig)>> {
                         .arg(
                             arg!(<CONFIG> "config file to test")
                                 .value_parser(value_parser!(PathBuf)),
-                        ),
+                        )
+                        .arg(arg!(--strict "Exit 1 when the configuration is invalid, or a stitched listener's coverage has a hole or a frozen upstream that did not report its ranges, or a chain API listener has archived blocks that no frozen server with an api_endpoint covers")),
                 ),
         )
         .subcommand(Command::new("run").about("Start the proxy server (default)"))
@@ -570,7 +926,14 @@ fn process_args() -> Result<Option<(bool, ServerConfig)>> {
             }
             Some(("test", test)) => match test.get_one::<PathBuf>("CONFIG") {
                 None => bail!("missing config file"),
-                Some(test_path) => return Ok(test_config(test_path)),
+                Some(test_path) => {
+                    let strict = test.get_flag("strict");
+                    return match test_config(test_path) {
+                        Some(config) => Ok(Some((Action::Test { strict }, config))),
+                        None if strict => bail!("configuration test failed"),
+                        None => Ok(None),
+                    };
+                }
             },
             _ => {}
         };
@@ -592,7 +955,7 @@ fn process_args() -> Result<Option<(bool, ServerConfig)>> {
         Err(e) => bail!("failed to parse configuration file: {}", e),
     };
 
-    Ok(Some((false, config)))
+    Ok(Some((Action::Run, config)))
 }
 
 /// TCP liveness probe used by the container `HEALTHCHECK`.
@@ -607,7 +970,7 @@ fn probe_listen_port(port: u16) -> Result<()> {
     Ok(())
 }
 
-fn test_config(path: &PathBuf) -> Option<(bool, ServerConfig)> {
+fn test_config(path: &PathBuf) -> Option<ServerConfig> {
     match read_to_string(path) {
         Ok(data) => match from_str::<ServerConfig>(&data) {
             Ok(config) => {
@@ -616,7 +979,10 @@ fn test_config(path: &PathBuf) -> Option<(bool, ServerConfig)> {
                     return None;
                 }
                 cprintln!("<green>configuration is valid.</>");
-                Some((true, config))
+                for warning in config.warnings() {
+                    cprintln!("<yellow>warning: {}</>", warning);
+                }
+                Some(config)
             }
             Err(e) => {
                 cprintln!("<red>failed to parse configuration file: {}</>", e);

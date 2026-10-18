@@ -33,7 +33,7 @@ Full router state. This is the same object the [live stream](#live-stream) sends
 
 ```json
 {
-  "version": "0.6.0",
+  "version": "0.7.0",
   "now_ms": 1760700000000,
   "started_ms": 1760690000000,
   "uptime_secs": 10000,

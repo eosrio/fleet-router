@@ -108,7 +108,7 @@ A state call, and a block request whose body gives no block number, goes to an u
 Both classes are off by default (see [Security](operations.md#security)).
 
 - **Exec** (`compute_transaction`, `send_read_only_transaction`) goes to a live node chosen as for a state call. Only a connection that could not be made moves on to the next node. Once the request may have been written, any answer is final, and a connection lost or a timeout gets `503 Upstream connection lost after the request was sent`: the request is never sent twice.
-- **Push** goes to the first up server in [`push_servers`](configuration.md#chain-api), in the configured order, or to the `get_info` primary when the list is empty. It is written once. A connection that cannot be made, or a target whose slots stay full for `upstream_queue_ms`, moves on to the next target. A failure after the push may have been written gets `503 Upstream connection lost after the request was sent`, and the push is never resent. A push never goes to a frozen range server. With no target up, the client gets `503 No live chain API upstream available`.
+- **Push** goes to the first up server in [`push_servers`](configuration.md#chain-api), in the configured order, or to the `get_info` primary when the list is empty. It is written once. A connection that cannot be made, or a target whose slots stay full for `upstream_queue_ms`, moves on to the next target. A failure after the push may have been written gets `503 Upstream connection lost after the request was sent`, and the push is never resent. The node's answer to a push is relayed whole, whatever [`max_response_bytes`](configuration.md#chain-api) says: it reports a push the node may have applied. A push never goes to a frozen range server. With no target up, the client gets `503 No live chain API upstream available`.
 
 ## get_supported_apis, OPTIONS and CORS
 
@@ -172,7 +172,7 @@ The router sends a frozen range server only block requests for blocks in its `bl
 | Upstream connect | `handshake_timeout_ms` (10 s when `0`) | Next candidate. |
 | Upstream response head | `upstream_timeout_ms` per attempt | Next candidate; for an exec or push that may have been written, `503`. |
 | Gap inside an upstream's answer body | `upstream_timeout_ms` | The answer is cut off and the connection is closed. An upstream that keeps sending within this gap is never cut off for its pace. |
-| Size of an upstream's answer body | `max_response_bytes` (no limit when `0`, the default) | A larger `Content-Length`: `502`, and nothing of the answer is sent. No `Content-Length`: cut off once past the limit, and the connection is closed. |
+| Size of an upstream's answer body | `max_response_bytes` (no limit when `0`, the default) | A larger `Content-Length`: `502`, and nothing of the answer is sent. No `Content-Length`: cut off once past the limit, and the connection is closed. A push's answer is never limited. |
 | Whole request | `request_deadline_ms` | No further attempt. |
 
 ## Errors the router writes
@@ -198,7 +198,7 @@ The `503` reasons:
 
 - Any `Host` header is accepted, as with nodeos's `http-validate-host = false`.
 - A body over `max_body_bytes` gets `413` with the body above; nodeos sends no such answer.
-- With `max_response_bytes` set, an upstream answer longer than it gets `502` (or is cut off, when it has no `Content-Length`); nodeos limits no answer's size.
+- With `max_response_bytes` set, an upstream answer longer than it, other than a push's, gets `502` (or is cut off, when it has no `Content-Length`); nodeos limits no answer's size.
 - `OPTIONS` is always answered by the router, and there are no CORS headers unless `cors` is set.
 - The `Server` header comes from whichever upstream answered; the router's own answers have none.
 - With no live node up, the router answers `503` where a stopped nodeos would refuse the connection.

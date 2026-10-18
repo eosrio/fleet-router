@@ -96,6 +96,10 @@ const PROBE_POOL_PER_UPSTREAM: usize = 2;
 /// another request, before it answers Busy.
 const SLOT_RACES: usize = 16;
 
+// An answer buffered to classify it (at most `PEEK_LIMIT`) is relayed
+// without a size check: it must never pass the smallest `max_response_bytes`.
+const _: () = assert!(PEEK_LIMIT as u64 <= crate::models::API_MIN_RESPONSE_BYTES);
+
 /// A request's hold on the listener's `max_in_flight`; counted in the
 /// in-flight gauge while held.
 pub struct RequestPermit {
@@ -876,12 +880,10 @@ impl ChainApiCtx {
             }
             if policy == Policy::Exec {
                 slot.results.inc(result_of(status, None));
-                return self.answered(
-                    self.relayed(
-                        response,
-                        self.hold(permit, Some(guard)),
-                        self.relay_for(&slot, call, head_timeout),
-                    ),
+                return self.relayed(
+                    response,
+                    self.hold(permit, Some(guard)),
+                    self.relay_for(&slot, call, head_timeout),
                     &slot,
                     tried.len(),
                 );
@@ -891,12 +893,10 @@ impl ChainApiCtx {
                 match classify(region, Answer::Response { status, body: None }) {
                     Outcome::Final => {
                         slot.results.inc(result_of(status, None));
-                        return self.answered(
-                            self.relayed(
-                                response,
-                                self.hold(permit, Some(guard)),
-                                self.relay_for(&slot, call, head_timeout),
-                            ),
+                        return self.relayed(
+                            response,
+                            self.hold(permit, Some(guard)),
+                            self.relay_for(&slot, call, head_timeout),
                             &slot,
                             tried.len(),
                         );
@@ -1029,10 +1029,18 @@ impl ChainApiCtx {
         }
     }
 
-    /// An upstream answer, streamed to the client. One whose `Content-Length`
-    /// is above `max_response_bytes` is not relayed at all: the client gets
-    /// `502` before any of it, rather than a head and a body cut short.
-    fn relayed(&self, response: Response<Incoming>, hold: Hold, relay: Relay) -> Response<ApiBody> {
+    /// The answer of `slot`, streamed to the client. One whose
+    /// `Content-Length` is above `relay.max_bytes` is not relayed at all:
+    /// the client gets the router's `502` before any of it, rather than a
+    /// head and a body cut short, and it counts as the router's answer.
+    fn relayed(
+        &self,
+        response: Response<Incoming>,
+        hold: Hold,
+        relay: Relay,
+        slot: &Arc<ApiSlot>,
+        tries: usize,
+    ) -> Answered {
         let length = response.body().size_hint().exact();
         if let (Some(length), Some(max)) = (length, relay.max_bytes) {
             if length > max {
@@ -1046,10 +1054,10 @@ impl ChainApiCtx {
                     "chain API upstream answer is longer than max_response_bytes; answering 502"
                 );
                 drop(hold);
-                return router_error(RouterError::AnswerTooLarge(max));
+                return Answered::router(router_error(RouterError::AnswerTooLarge(max)), tries);
             }
         }
-        streamed(response, hold, relay)
+        self.answered(streamed(response, hold, relay), slot, tries)
     }
 
     fn answered(&self, response: Response<ApiBody>, slot: &Arc<ApiSlot>, tries: usize) -> Answered {
@@ -1137,12 +1145,17 @@ impl ChainApiCtx {
                     } else {
                         PushResult::Error
                     });
-                    return self.answered(
-                        self.relayed(
-                            response,
-                            self.hold(permit, Some(guard)),
-                            self.relay_for(slot, call, head_timeout),
-                        ),
+                    // The answer reports a push the node may have applied:
+                    // relayed whole whatever `max_response_bytes` says, as a
+                    // 502 would read as a push that failed.
+                    let relay = Relay {
+                        max_bytes: None,
+                        ..self.relay_for(slot, call, head_timeout)
+                    };
+                    return self.relayed(
+                        response,
+                        self.hold(permit, Some(guard)),
+                        relay,
                         slot,
                         tries,
                     );

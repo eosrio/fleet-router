@@ -746,6 +746,75 @@ async fn max_response_bytes_refuses_a_longer_answer_and_cuts_one_without_a_lengt
     let _ = served.shutdown.send(());
 }
 
+// A push's answer reports a write the node may have applied: one longer than
+// max_response_bytes is relayed whole, not answered 502, which would read as
+// a push that failed. An exec answer commits nothing and stays bounded.
+#[tokio::test]
+async fn a_push_answer_longer_than_max_response_bytes_is_relayed_whole() {
+    let api = live_api().await;
+    let push = "/v1/chain/push_transaction";
+    let exec = "/v1/chain/compute_transaction";
+    let limit = 64 * 1024;
+    for target in [push, exec] {
+        api.set_fault(
+            Some(target),
+            Some(Fault::Respond {
+                status: 202,
+                body: vec![b'x'; 2 * limit].into(),
+            }),
+        );
+    }
+    let served = serve(
+        &api,
+        json!({
+            "listen_port": 1,
+            "probe_ms": 100,
+            "allow": ["block", "info", "state", "exec", "push"],
+            "max_response_bytes": limit
+        }),
+    )
+    .await;
+    let answer = post(served.addr, push, br#"{"packed_trx":"00"}"#).await;
+    assert_eq!((answer.status, answer.body.len()), (202, 2 * limit));
+    assert_eq!(api.requests_to(push).len(), 1, "the push was sent once");
+    assert_eq!(served.ctx.stats.pushes.get(PushResult::Ok), 1);
+    let answer = post(served.addr, exec, br#"{"transaction":{}}"#).await;
+    assert_eq!(answer.status, 502);
+    let _ = served.shutdown.send(());
+}
+
+// The 502 for an answer longer than max_response_bytes is the router's
+// own: a block request it ends counts with role none, not as the live node's.
+#[tokio::test]
+async fn a_refused_long_answer_counts_as_the_routers_own() {
+    let api = live_api().await;
+    let info = "/v1/chain/get_block_info";
+    let limit = 64 * 1024;
+    api.set_fault(
+        Some(info),
+        Some(Fault::Respond {
+            status: 200,
+            body: vec![b'x'; 2 * limit].into(),
+        }),
+    );
+    let served = serve(
+        &api,
+        json!({ "listen_port": 1, "probe_ms": 100, "max_response_bytes": limit }),
+    )
+    .await;
+    let answer = post(served.addr, info, br#"{"block_num":995}"#).await;
+    assert_eq!(answer.status, 502);
+    let stats = &served.ctx.stats;
+    assert_eq!(
+        (
+            stats.block_requests(BlockRegion::Reversible, AnswerRole::Live),
+            stats.block_requests(BlockRegion::Reversible, AnswerRole::None),
+        ),
+        (0, 1)
+    );
+    let _ = served.shutdown.send(());
+}
+
 /// A live chain API that answers its probes, and answers `get_account`
 /// with a head and the first bytes of a body, then sends nothing more.
 async fn stalling_api() -> String {

@@ -283,7 +283,7 @@ Per listener:
 - `fleet_router_api_in_flight` counts requests holding one of the listener's `max_in_flight` slots.
 - `fleet_router_api_rejected_total{reason}`: `connections` (closed at accept over `max_connections`), `in_flight` (503 at `max_in_flight`), `body_too_large` (413) and `timeout` (a body not received in time, or a client that took none of its answer).
 - `fleet_router_api_retries_total{reason}` counts attempts whose answer passed the request on to the next candidate: `unknown_block`, `not_found`, `busy`, `connect`, `timeout` and `error` (a `get_info` 5xx other than 503).
-- `fleet_router_api_block_requests_total{region,role}` counts block requests by region (`irreversible`, `reversible`, or `unhinted` for a body with no block number the router could read) and by who wrote the answer (`live`, `frozen`, or `none` when the router answered Busy). Only the combinations that can occur are rendered: a frozen range server answers only irreversible blocks.
+- `fleet_router_api_block_requests_total{region,role}` counts block requests by region (`irreversible`, `reversible`, or `unhinted` for a body with no block number the router could read) and by who wrote the answer (`live`, `frozen`, or `none` when the router answered: Busy, or the `502` for an answer longer than `max_response_bytes`). Only the combinations that can occur are rendered: a frozen range server answers only irreversible blocks.
 - `fleet_router_api_pushes_total{result}`: `ok` (a 2xx), `error` (another answer, or no node reached) and `ambiguous` (the connection failed after the push was written; it is never resent).
 
 Each chain API listener adds 173 series, and each upstream API 13 (live) or 14 (frozen).

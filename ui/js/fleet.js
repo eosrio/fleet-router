@@ -1,8 +1,9 @@
 // Fleet view: one panel per listener, one board row per upstream. The row's
-// block track is a broken axis: the full retained range on the left, then a
-// section break, then the last TIP_WINDOW blocks before the best head, so
-// both pruned history and head lag are visible at once.
+// block track shows the last reported history range on the left and measured
+// head lag on a separate relative scale on the right. Sampled history ends
+// must never be used as a second, contradictory measure of head lag.
 
+import { axisMarkup, trackMarkup, trackLabel } from "./track.js";
 import { bestHead, currentRates, headLag, isFlashing, store } from "./store.js";
 import {
   countdown,
@@ -17,7 +18,6 @@ import {
   upstreamKey,
 } from "./util.js";
 
-const TIP_WINDOW = 60;
 const SPARK_POINTS = 300; // last five minutes
 const LAG_WARN = 10;
 
@@ -283,17 +283,20 @@ class UpstreamRow {
     setText(this.bytesRate, byteRate(r.Bps));
 
     const lag = headLag(u);
-    if (u.head_block === null || u.head_block === undefined) {
+    if (u.chain_head_block === null || u.chain_head_block === undefined) {
       setText(this.lag, "–");
       this.lag.className = "big";
       setText(this.head, "no status yet");
     } else {
       setText(this.lag, lag === null ? "sampled" : lag === 0 ? "at head" : `−${int(lag)}`);
       this.lag.className = `big ${lag === 0 ? "is-set" : lag > LAG_WARN ? "is-warn" : ""}`;
-      this.lag.title = lag === null ? "Last reported block range; no live peer comparison available"
+      this.lag.title = lag === null ? "Last reported chain head; no live peer comparison available"
         : lag === 0 ? "No lag observed against live peers at the last status request; differences within a polling interval may not be visible"
         : `At least ${int(lag)} blocks behind the live peer head already known when this status request began`;
-      setText(this.head, `#${int(u.head_block)}`);
+      setText(this.head, `#${int(u.chain_head_block)}`);
+      this.head.title = u.head_sample_age_ms === null || u.head_sample_age_ms === undefined
+        ? "Last reported chain head"
+        : `Chain head sampled ${(u.head_sample_age_ms / 1000).toFixed(1)} seconds ago`;
     }
 
     setText(this.failovers, int(u.failovers_total));
@@ -349,119 +352,6 @@ function sparkShell() {
   return node;
 }
 
-function geometry(width, axis) {
-  const gap = 18;
-  const leftW = Math.max(40, Math.round(width * 0.64));
-  const rightX0 = leftW + gap;
-  const rightW = Math.max(20, width - rightX0 - 2);
-  const span = Math.max(1, axis.best + 1 - axis.min);
-  const tipStart = axis.best - TIP_WINDOW;
-  return {
-    leftW,
-    rightX0,
-    rightW,
-    gap,
-    xL: (b) => clamp(((b - axis.min) / span) * leftW, 0, leftW),
-    xR: (b) => clamp(rightX0 + ((b - tipStart) / TIP_WINDOW) * rightW, rightX0, rightX0 + rightW),
-    tipStart,
-  };
-}
-
-function clamp(v, lo, hi) {
-  return Math.min(hi, Math.max(lo, v));
-}
-
-function f(n) {
-  return Number.isFinite(n) ? n.toFixed(1) : "0";
-}
-
-function breakMark(g, y) {
-  const x = g.leftW + g.gap / 2;
-  return `<path class="brk" d="M${f(x - 5)} ${y + 5}L${f(x - 1)} ${y - 5}M${f(x + 1)} ${y + 5}L${f(x + 5)} ${y - 5}"/>`;
-}
-
-function axisMarkup(width, axis) {
-  const g = geometry(width, axis);
-  const y = 20;
-  const parts = [
-    `<line class="tick" x1="0" x2="${f(g.leftW)}" y1="${y}" y2="${y}"/>`,
-    `<line class="tick" x1="${f(g.rightX0)}" x2="${f(g.rightX0 + g.rightW)}" y1="${y}" y2="${y}"/>`,
-    `<line class="tick" x1="0.5" x2="0.5" y1="${y - 4}" y2="${y}"/>`,
-    `<line class="tick" x1="${f(g.leftW - 0.5)}" x2="${f(g.leftW - 0.5)}" y1="${y - 4}" y2="${y}"/>`,
-    `<line class="tick" x1="${f(g.rightX0 + 0.5)}" x2="${f(g.rightX0 + 0.5)}" y1="${y - 4}" y2="${y}"/>`,
-    `<line class="tick" x1="${f(g.rightX0 + g.rightW - 0.5)}" x2="${f(g.rightX0 + g.rightW - 0.5)}" y1="${y - 4}" y2="${y}"/>`,
-    breakMark(g, y - 4),
-    `<text x="0" y="${y - 6}">#${int(axis.min)}</text>`,
-  ];
-  if (g.leftW > 150) parts.push(`<text x="${f(g.leftW)}" y="${y - 6}" text-anchor="end">#${int(axis.best)}</text>`);
-  parts.push(`<text x="${f(g.rightX0)}" y="${y - 6}">−${TIP_WINDOW}</text>`);
-  parts.push(`<text x="${f(g.rightX0 + g.rightW)}" y="${y - 6}" text-anchor="end">head</text>`);
-  return parts.join("");
-}
-
-const DRAW_STATES = new Set(["up", "stale", "quarantined", "down", "disabled", "failover"]);
-
-function trackMarkup(width, axis, u, rawStatus) {
-  // Only known words reach the markup; the server's string is never inserted as-is.
-  const status = DRAW_STATES.has(rawStatus) ? rawStatus : "down";
-  const g = geometry(width, axis);
-  const y = 12;
-  const yf = 21;
-  const parts = [
-    `<line class="rail" x1="0" x2="${f(g.leftW)}" y1="${y}" y2="${y}"/>`,
-    `<line class="rail" x1="${f(g.rightX0)}" x2="${f(g.rightX0 + g.rightW)}" y1="${y}" y2="${y}"/>`,
-    breakMark(g, y),
-    `<line class="headline" x1="${f(g.rightX0 + g.rightW)}" x2="${f(g.rightX0 + g.rightW)}" y1="2" y2="27"/>`,
-  ];
-  const t = u.trace;
-  if (t && t.end > 0) {
-    const last = t.end - 1;
-    const x1 = g.xL(t.begin);
-    const x2 = Math.max(x1 + 2, g.xL(last));
-    parts.push(`<line class="range" data-status="${status}" x1="${f(x1)}" x2="${f(x2)}" y1="${y}" y2="${y}"/>`);
-    if (last >= g.tipStart) {
-      const xr = g.xR(last);
-      parts.push(`<line class="range" data-status="${status}" x1="${f(g.rightX0)}" x2="${f(xr)}" y1="${y}" y2="${y}"/>`);
-      parts.push(`<line class="cap" data-status="${status}" x1="${f(xr)}" x2="${f(xr)}" y1="${y - 6}" y2="${y + 6}"/>`);
-    } else {
-      // The head is before the tip window: mark it at the window's left edge.
-      const x = g.rightX0;
-      parts.push(`<path class="behind" d="M${f(x + 7)} ${y - 4}L${f(x + 1)} ${y}L${f(x + 7)} ${y + 4}Z"/>`);
-    }
-  }
-  const fin = u.finality;
-  if (fin && fin.end > 0) {
-    const last = fin.end - 1;
-    const x1 = g.xL(fin.begin);
-    parts.push(`<line class="fin" data-status="${status}" x1="${f(x1)}" x2="${f(Math.max(x1 + 2, g.xL(last)))}" y1="${yf}" y2="${yf}"/>`);
-    if (last >= g.tipStart) {
-      parts.push(`<line class="fin" data-status="${status}" x1="${f(Math.max(g.rightX0, g.xR(fin.begin)))}" x2="${f(g.xR(last))}" y1="${yf}" y2="${yf}"/>`);
-    }
-  }
-  for (const q of u.quarantines || []) {
-    const x = g.xL(q.block);
-    parts.push(`<rect class="q" x="${f(x - 3)}" y="${y - 6}" width="6" height="12"/>`);
-    if (q.block >= g.tipStart) {
-      const xr = g.xR(q.block);
-      parts.push(`<rect class="q" x="${f(xr - 3)}" y="${y - 6}" width="6" height="12"/>`);
-    }
-  }
-  return parts.join("");
-}
-
-function trackLabel(u, axis) {
-  const bits = [];
-  if (u.trace && u.trace.end > 0) bits.push(`trace blocks ${int(u.trace.begin)} to ${int(u.trace.end - 1)}`);
-  else bits.push("no trace range reported yet");
-  if (u.finality && u.finality.end > 0) bits.push(`finality blocks ${int(u.finality.begin)} to ${int(u.finality.end - 1)}`);
-  if (axis && u.head_block !== null && u.head_block !== undefined) {
-    const lag = headLag(u);
-    bits.push(lag === null ? "last reported head" : lag === 0 ? "no lag observed at the last status check" : `at least ${int(lag)} blocks behind at the last status check`);
-  }
-  if (u.quarantines?.length) bits.push(`${u.quarantines.length} quarantined block range${u.quarantines.length === 1 ? "" : "s"}`);
-  return bits.join(", ");
-}
-
 /** Sparkline path in a 100 x 18 box. Buckets keep the max so short spikes survive. */
 function sparkMarkup(values, floor) {
   const vals = values.map((v) => (v === null ? 0 : v));
@@ -479,6 +369,10 @@ function sparkMarkup(values, floor) {
   const line = coords.map(([x, y], i) => `${i ? "L" : "M"}${f(x)} ${f(y)}`).join("");
   const area = `${line}L100 18L0 18Z`;
   return `<path class="spark-area" d="${area}"/><path d="${line}"/>`;
+}
+
+function f(n) {
+  return Number.isFinite(n) ? n.toFixed(1) : "0";
 }
 
 function cssId(name) {

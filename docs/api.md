@@ -67,6 +67,8 @@ Full router state. This is the same object the [live stream](#live-stream) sends
           "chain_state": { "begin": 2, "end": 412345678 },
           "finality": null,
           "head_block": 412345677,
+          "chain_head_block": 412345677,
+          "head_sample_age_ms": 235,
           "head_lag_blocks": 0,
           "sessions": 8,
           "sessions_total": 210,
@@ -100,13 +102,26 @@ A listener's `ready` is what [`/ready/<listener>`](observability.md#readiness-an
 
 `head_block` is the last block in its trace or chain-state range (`max(end) - 1`), or `null` before the first status reply.
 
+`chain_head_block` is the chain head reported by SHiP, independent of the end of
+its history logs. `head_sample_age_ms` is the age of that status sample in
+milliseconds. Both are `null` before the first accepted status reply. The
+dashboard's Head column displays this chain head; trace, chain-state and finality
+ranges retain their exact reported bounds.
+
 `head_lag_blocks` compares a fresh status reply with the highest online live
-peer range head already known before that request was sent. It is a conservative
+peer chain head already known before that request was sent. It is a conservative
 lower bound: differences smaller than one status polling interval may not be
 observed. It is `null` for offline or frozen upstreams and before a comparison
-is available. The dashboard uses it for the lag label; subtracting independently
+is available. The dashboard uses it for both the lag label and the right-hand
+graph marker; subtracting independently
 sampled `head_block` values can falsely alternate which synchronized node is
-behind after a restart. Exact reported range ends remain visible.
+behind after a restart. The left-hand graph shows the sampled history ranges
+(including finality and quarantines); the right-hand scale shows measured lag
+from 60 blocks behind to "at head". An unavailable comparison has no head marker.
+
+After upgrading the router, reload an already-open dashboard tab to load the new
+JavaScript. Reconnecting its live data stream does not replace code already
+loaded in the browser.
 
 ### `GET /api/v1/sessions`
 

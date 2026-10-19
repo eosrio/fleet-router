@@ -74,6 +74,20 @@ For the smallest two-node regression, without background listeners or load:
 cargo test --locked --test control_api restarted_synced_nodes_do_not_alternate_dashboard_lag -- --nocapture
 ```
 
+For the graph and the distinction between chain head and retained history:
+
+```sh
+node --test tests/dashboard-head.test.mjs
+cargo test --locked --test head_progress
+```
+
+The graph regression includes two status samples two blocks apart with
+`head_lag_blocks: 0` on both, plus offsets of one, three and seven blocks. Both
+markers must reach "at head". A positive measured lag must move the marker back,
+and unavailable measurements must have no marker. The Rust tests verify that
+different log ends cannot make equal chain heads appear behind, while equal log
+ends cannot hide real chain-head lag of one, seven or 200 blocks.
+
 ## Baseline observations
 
 On the unmodified v0.7.0 runtime, three paced Windows release runs reproduced
@@ -89,7 +103,7 @@ The performance incident remains unconfirmed. These local protocol doubles
 do not establish production Hyperion behavior or reproduce the upstream
 software, ABI sizes, host CPU budget and complete configuration.
 
-The fix measures a conservative lag against live peer samples already known
+The fix measures a conservative lag against live peer chain heads already known
 when each status request starts. It avoids treating poll age as lag, while
 preserving a positive reading when a fresh response remains behind an already
 known peer head. Differences within one polling interval can go undetected;

@@ -144,6 +144,9 @@ pub struct UpstreamView {
     pub chain_state: Option<RangeView>,
     pub finality: Option<RangeView>,
     pub head_block: Option<u32>,
+    /// Chain head from SHiP, independent of retained history ranges.
+    pub chain_head_block: Option<u32>,
+    pub head_sample_age_ms: Option<u64>,
     pub head_lag_blocks: Option<u32>,
     pub sessions: usize,
     pub sessions_total: u64,
@@ -252,6 +255,10 @@ fn upstream_view(
             state.finality_data_end_block,
         ),
         head_block: head_block(state),
+        chain_head_block: state.head.map(|head| head.num),
+        head_sample_age_ms: state
+            .status_at
+            .map(|at| now.saturating_duration_since(at).as_millis() as u64),
         head_lag_blocks: state.online.then_some(state.head_lag_blocks).flatten(),
         sessions: state.connections.load(Ordering::Relaxed),
         sessions_total: state.counters.sessions_total.load(Ordering::Relaxed),

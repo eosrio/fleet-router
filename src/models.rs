@@ -2031,7 +2031,7 @@ pub struct ServerState {
     pub ranges_known: bool,
     /// When the last accepted status result arrived.
     pub status_at: Option<Instant>,
-    /// Highest live peer range head known before this status request was sent.
+    /// Highest live peer chain head known before this status request was sent.
     /// Never compare a reply against peer samples collected after its request.
     pub status_head_reference: Option<u32>,
     /// Conservative lag measured by the last accepted status reply. Differences

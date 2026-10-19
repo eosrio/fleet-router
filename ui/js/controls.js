@@ -319,9 +319,9 @@ function renderFacts(u) {
     ["Sessions", [`${int(u.sessions)} now`, el("span.sub", null, `  ${int(u.sessions_total)} since start`)]],
     [
       "Head",
-      u.head_block === null
+      u.chain_head_block === null || u.chain_head_block === undefined
         ? el("span.sub", null, "no status yet")
-        : [`#${int(u.head_block)}`, el("span.sub", null, lag === null ? "  last reported range" : lag === 0 ? "  no lag observed at last check" : `  at least ${int(lag)} behind at last check`)],
+        : [`#${int(u.chain_head_block)}`, el("span.sub", null, lag === null ? "  last reported chain head" : lag === 0 ? "  no lag observed at last check" : `  at least ${int(lag)} behind at last check`)],
     ],
     ["Trace range", range(u.trace)],
     ["Chain state", range(u.chain_state)],

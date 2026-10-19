@@ -326,12 +326,7 @@ async fn capture_head_reference(db: &ServerStateDb, endpoint: &str) {
                 && !state.operator_disabled
                 && state.role == Role::Live
         })
-        .filter_map(|(_, state)| {
-            state
-                .trace_end_block
-                .max(state.chain_state_end_block)
-                .checked_sub(1)
-        })
+        .filter_map(|(_, state)| state.head.map(|head| head.num))
         .max();
     if let Some(state) = states.get_mut(endpoint) {
         state.status_head_reference = reference;
@@ -842,12 +837,12 @@ pub(crate) async fn apply_status_update(
         state.ranges_known = true;
         state.status_at = Some(now);
         state.head_lag_blocks = if state.role == Role::Live {
-            trace_end.max(chain_end).checked_sub(1).map(|head| {
+            Some(
                 state
                     .status_head_reference
-                    .unwrap_or(head)
-                    .saturating_sub(head)
-            })
+                    .unwrap_or(head.num)
+                    .saturating_sub(head.num),
+            )
         } else {
             None
         };
@@ -1006,15 +1001,17 @@ mod tests {
             let mut states = db.lock().await;
             let p = states.get_mut(&peer.endpoint).unwrap();
             p.online = true;
-            p.trace_end_block = 1001;
+            p.head = Some(BlockPos {
+                num: 1000,
+                id: [0; 32],
+            });
         }
         super::capture_head_reference(&db, &server.endpoint).await;
         // The peer's newer reply arrives while our request is in flight.
-        db.lock()
-            .await
-            .get_mut(&peer.endpoint)
-            .unwrap()
-            .trace_end_block = 1201;
+        db.lock().await.get_mut(&peer.endpoint).unwrap().head = Some(BlockPos {
+            num: 1200,
+            id: [0; 32],
+        });
         apply_status_update(&status_message(&status_body()), &db, &server)
             .await
             .unwrap();
@@ -1049,7 +1046,10 @@ mod tests {
                 p.online = online;
                 p.operator_disabled = disabled;
                 p.role = role;
-                p.trace_end_block = 9999;
+                p.head = Some(BlockPos {
+                    num: 9998,
+                    id: [0; 32],
+                });
             }
             super::capture_head_reference(&db, &server.endpoint).await;
             assert_eq!(

@@ -126,7 +126,7 @@ export function findUpstream(listener, endpoint) {
   return l?.upstreams.find((u) => u.endpoint === endpoint) || null;
 }
 
-/** Best (highest) head block among a listener's upstreams. */
+/** Highest reported stored block; sets the history range scale, not lag. */
 export function bestHead(listener) {
   let best = null;
   for (const u of listener.upstreams) {

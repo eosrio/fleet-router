@@ -61,10 +61,6 @@ async function request(method, path, { body, token, auth = false } = {}) {
 }
 
 export const api = {
-  status: () => request("GET", "status"),
-  sessions: () => request("GET", "sessions"),
-  history: () => request("GET", "history"),
-  events: (after) => request("GET", after ? `events?after=${encodeURIComponent(after)}` : "events"),
   checkToken: (token) => request("GET", "auth", { auth: true, token }),
 
   upstreamAction(listener, endpoint, action) {
@@ -82,27 +78,34 @@ function upstreamPath(listener, endpoint) {
   return `listeners/${encodeURIComponent(listener)}/upstreams/${encodeURIComponent(endpoint)}`;
 }
 
-/**
- * Open the live stream. Calls `onSnapshot(status)`, `onEvent(event)` and
- * `onState("live" | "reconnecting")`. EventSource reconnects by itself.
- */
-export function openStream({ onSnapshot, onEvent, onState }) {
-  const source = new EventSource(apiUrl("stream"));
-  source.addEventListener("open", () => onState("live"));
-  source.addEventListener("error", () => onState("reconnecting"));
-  source.addEventListener("snapshot", (e) => {
-    try {
-      onSnapshot(JSON.parse(e.data));
-    } catch (err) {
-      console.error("bad snapshot", err);
-    }
-  });
-  source.addEventListener("event", (e) => {
-    try {
-      onEvent(JSON.parse(e.data));
-    } catch (err) {
-      console.error("bad event", err);
-    }
-  });
-  return source;
+/** One server stream bootstraps and updates every read model. EventSource
+ * handles transport reconnects; protocol gaps also reconnect for a full resync.
+ * "Live" means a complete frame has been applied, not just an open socket. */
+export function openStream({ onFrame, onState }) {
+  let source;
+  let retry;
+  let closed = false;
+  function connect() {
+    if (closed) return;
+    const connection = new EventSource(apiUrl("dashboard/stream"));
+    source = connection;
+    connection.addEventListener("error", () => {
+      if (source === connection && !closed) onState("reconnecting");
+    });
+    connection.addEventListener("dashboard", (e) => {
+      if (source !== connection || closed) return;
+      try {
+        onFrame(JSON.parse(e.data));
+        onState("live");
+      } catch (err) {
+        console.error("Invalid dashboard update; resyncing", err);
+        connection.close();
+        source = null;
+        onState("reconnecting");
+        retry = window.setTimeout(connect, 1000);
+      }
+    });
+  }
+  connect();
+  return { close() { closed = true; source?.close(); window.clearTimeout(retry); } };
 }

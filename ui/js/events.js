@@ -88,6 +88,9 @@ export function renderAll(fresh = new Set()) {
 
 /** Badge on the Events tab: warnings and errors since the view was last opened. */
 let seenId = 0;
+export function resetEventsSeen() {
+  seenId = 0;
+}
 export function markEventsSeen() {
   seenId = store.lastEventId;
   updateBadge();

@@ -29,7 +29,7 @@ The endpoint has the same exposure as `/metrics`: keep it on a trusted network. 
 
 ### `GET /api/v1/status`
 
-Full router state. This is the same object the [live stream](#live-stream) sends as `snapshot`.
+Full router state. The [dashboard stream](#get-apiv1dashboardstream) includes this object as `status`; the compatibility stream sends it as `snapshot`.
 
 ```json
 {
@@ -205,8 +205,49 @@ Recent events, newest last (up to 500 kept in memory). Optional `?after=<id>` re
 
 ## Live stream
 
+### `GET /api/v1/dashboard/stream`
+
+The browser uses one persistent server-sent event connection for all dashboard
+reads. It does not poll status or sessions, fetch history separately, or make
+additional reads after control actions. Commands still use authenticated HTTP.
+
+Each SSE event is named `dashboard`. Its `id` and JSON `revision` increase within
+one router process. The first event on **every connection**, including reconnects,
+is a complete bootstrap:
+
+```text
+event: dashboard
+id: 42
+data: {"revision":42,"bootstrap":true,"status":{...},"sessions":[...],"events":[...],"history":{"interval_ms":1000,"samples":[...]}}
+```
+
+Subsequent frames contain the full `status` and `sessions` views plus new `events`.
+Once per second they also carry a `sample` in the same format as one history
+entry. Lifecycle changes wake the shared publisher, coalesced to at most four
+publications per second; extra lifecycle frames do not add chart samples.
+
+Apply all fields before rendering any panel. Session counts in `status` and
+rows in `sessions` use the same registry snapshot. Upstream connection-slot
+counts retain their separate meaning. This is an atomic dashboard publication;
+upstream SHiP observations still have their own sample times, exposed through
+`head_sample_age_ms`.
+
+The router builds and encodes live frames once for all viewers. A slow stream
+that falls behind the eight-frame queue gets another bootstrap, containing up
+to 900 history samples and 500 events, instead of an unbounded backlog. Bootstrap
+replaces retained history and events. The browser skips duplicate or older
+revisions; an unexpected revision gap triggers reconnect and resync. A changed
+`status.started_ms` identifies a process restart and resets event IDs and rates.
+`Last-Event-ID` does not request replay: every reconnect receives a bootstrap.
+
+Both stream routes share a 32-connection limit. Further connections receive 503.
+Keepalive comments are sent every 15 seconds. The UI marks the connection live
+only after applying a complete frame. Reload an already-open tab after upgrading
+to load the new client code.
+
 ### `GET /api/v1/stream`
 
+Compatibility stream for existing API consumers and older dashboard tabs.
 [Server-sent events](https://developer.mozilla.org/docs/Web/API/Server-sent_events). Open it with `new EventSource("/api/v1/stream")`. No token is needed.
 
 | SSE `event:` | `data:` | When |

@@ -348,9 +348,10 @@ async fn main() -> Result<()> {
                 .map(|host| host.trim().to_ascii_lowercase())
                 .collect(),
             streams: Arc::new(tokio::sync::Semaphore::new(api::MAX_STREAMS)),
+            dashboard_feed: Arc::default(),
         });
         if app.dashboard {
-            spawn(api::run_sampler(app.clone(), shutdown_tx.subscribe()));
+            spawn(api::run_dashboard(app.clone(), shutdown_tx.subscribe()));
         }
         spawn(http::run_http_server(addr, app, shutdown_tx.subscribe()));
     }

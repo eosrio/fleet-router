@@ -470,6 +470,7 @@ mod tests {
             control_token: token.map(str::to_string),
             allowed_hosts: vec!["router.internal".to_string()],
             streams: Arc::new(Semaphore::new(api::MAX_STREAMS)),
+            dashboard_feed: Arc::default(),
         })
     }
 

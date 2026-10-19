@@ -15,7 +15,7 @@ use serde::Serialize;
 use tokio::sync::{broadcast, Notify};
 
 /// Events kept in memory for `GET /api/v1/events`.
-const MAX_EVENTS: usize = 500;
+pub const MAX_EVENTS: usize = 500;
 /// One sample per second for 15 minutes.
 pub const HISTORY_SAMPLES: usize = 900;
 /// Sentinel for an unset block number in [`SessionInfo`].
@@ -163,6 +163,7 @@ impl SessionInfo {
 
     pub fn set_upstream(&self, endpoint: &str) {
         *lock(&self.upstream) = endpoint.to_string();
+        global().changed.notify_one();
     }
 
     pub fn start_block(&self) -> Option<u32> {
@@ -203,6 +204,7 @@ impl SessionInfo {
         self.next_block
             .store(u64::from(start_block), Ordering::Relaxed);
         self.finality.store(finality, Ordering::Relaxed);
+        global().changed.notify_one();
     }
 
     /// Record one frame forwarded to the client.
@@ -251,6 +253,7 @@ pub struct SessionRegistration {
 impl Drop for SessionRegistration {
     fn drop(&mut self) {
         lock(&global().sessions).remove(&self.info.id);
+        global().changed.notify_one();
     }
 }
 
@@ -262,6 +265,9 @@ pub struct Telemetry {
     history: Mutex<VecDeque<Sample>>,
     next_session_id: AtomicU64,
     sessions: Mutex<HashMap<u64, Arc<SessionInfo>>>,
+    /// Coalesced lifecycle changes for the single dashboard publisher. Block
+    /// counters are sampled separately; forwarding never wakes this task.
+    pub changed: Notify,
 }
 
 static TELEMETRY: OnceLock<Telemetry> = OnceLock::new();
@@ -276,6 +282,7 @@ pub fn global() -> &'static Telemetry {
         history: Mutex::new(VecDeque::with_capacity(HISTORY_SAMPLES)),
         next_session_id: AtomicU64::new(1),
         sessions: Mutex::new(HashMap::new()),
+        changed: Notify::new(),
     })
 }
 
@@ -292,6 +299,7 @@ impl Telemetry {
         events.push_back(event.clone());
         drop(events);
         let _ = self.events_tx.send(event);
+        self.changed.notify_one();
     }
 
     /// Events with an id greater than `after`, oldest first.
@@ -344,6 +352,7 @@ impl Telemetry {
             control: Notify::new(),
         });
         lock(&self.sessions).insert(info.id, info.clone());
+        self.changed.notify_one();
         SessionRegistration { info }
     }
 

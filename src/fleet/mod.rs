@@ -517,6 +517,7 @@ impl FleetHub {
         mem.generation += 1;
         view.generation = mem.generation;
         self.view_tx.send_replace(Arc::new(view));
+        crate::telemetry::global().changed.notify_one();
     }
 
     /// Lock the state map and [`Self::rebuild`] from it.

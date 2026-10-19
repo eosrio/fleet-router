@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The dashboard now reads status, sessions, events and chart samples through one
+  revisioned push stream. It no longer polls sessions or fetches history and
+  event backfill separately. All panels apply each revision together; reconnects
+  and slow clients receive a complete resync. One shared publisher coalesces
+  lifecycle updates and samples counters once per second. Existing REST read
+  endpoints and the original SSE stream remain available for API consumers.
+
 ### Fixed
 
 - The dashboard could alternate which synchronized upstream appeared behind

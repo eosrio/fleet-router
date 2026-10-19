@@ -1,18 +1,14 @@
-// Sessions view: GET /api/v1/sessions, polled every 2 s while visible.
+// Sessions view reads the same pushed revision as the fleet and event log.
 
-import { api } from "./api.js";
+import { store } from "./store.js";
 import { syncOptions } from "./events.js";
 import { bytes, duration, el, int, plural, setText } from "./util.js";
 
-const POLL_MS = 2000;
 const filters = { listener: "", upstream: "", search: "" };
 let sort = { key: "age", dir: "descending" };
-let rows = [];
-let timer = null;
 let active = false;
 let controlMode = "off";
 let onAction = () => {};
-let lastError = null;
 
 export function initSessions({ sessionAction }) {
   onAction = sessionAction;
@@ -46,8 +42,7 @@ export function initSessions({ sessionAction }) {
 
 export function setSessionsActive(on) {
   active = on;
-  window.clearTimeout(timer);
-  if (on) poll();
+  if (on) render();
 }
 
 export function setSessionsControlMode(mode) {
@@ -70,34 +65,13 @@ export function syncSessionFilters(status) {
   setText(document.getElementById("nav-sessions"), int(total));
 }
 
-export async function refreshSessions() {
-  try {
-    const data = await api.sessions();
-    rows = data.sessions || [];
-    lastError = null;
-  } catch (err) {
-    lastError = err.message;
-  }
-  render();
+export function renderSessions() {
+  if (active) render();
 }
-
-async function poll() {
-  if (!active) return;
-  await refreshSessions();
-  if (active && !document.hidden) timer = window.setTimeout(poll, POLL_MS);
-  else if (active) timer = window.setTimeout(poll, POLL_MS * 5);
-}
-
-document.addEventListener("visibilitychange", () => {
-  if (active && !document.hidden) {
-    window.clearTimeout(timer);
-    poll();
-  }
-});
 
 function filtered() {
   const q = filters.search.toLowerCase();
-  return rows.filter(
+  return store.sessions.filter(
     (s) =>
       (!filters.listener || s.listener === filters.listener) &&
       (!filters.upstream || s.upstream === filters.upstream) &&
@@ -127,7 +101,8 @@ function render() {
     else th.removeAttribute("aria-sort");
   }
   const list = filtered().sort(compare);
-  const now = Date.now();
+  const now = store.status?.now_ms ?? Date.now();
+  const rows = store.sessions;
   const tbody = table.tBodies[0];
   const unlocked = controlMode === "unlocked";
   table.querySelector(".col-actions").hidden = !unlocked;
@@ -145,9 +120,9 @@ function render() {
   });
 
   const empty = document.getElementById("sessions-empty");
-  if (lastError) {
+  if (!store.status) {
     empty.hidden = false;
-    setText(empty, `Could not load sessions: ${lastError}`);
+    setText(empty, "Waiting for live state from the router.");
   } else if (!list.length) {
     empty.hidden = false;
     setText(empty, rows.length ? "No sessions match these filters." : "No client sessions are open right now.");

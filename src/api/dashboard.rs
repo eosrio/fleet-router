@@ -228,6 +228,51 @@ pub(super) async fn get_stream(
     ))
 }
 
+struct Capture {
+    status: StatusView,
+    sessions: Vec<SessionView>,
+    events: Vec<Event>,
+}
+
+async fn capture(
+    app: &SharedState,
+    previous: &HashMap<String, &'static str>,
+    last_event: u64,
+) -> Capture {
+    let telemetry = telemetry::global();
+    loop {
+        if let Some(generation) = telemetry.capture_version() {
+            let sessions = session_views(app).await;
+            let mut counts = HashMap::new();
+            for session in &sessions {
+                *counts.entry(session.listener.clone()).or_default() += 1;
+            }
+            let status = status_with_session_counts(app, counts).await;
+            let mut transitions = Vec::new();
+            for listener in &status.listeners {
+                for u in &listener.upstreams {
+                    let key = format!("{}|{}", listener.name, u.endpoint);
+                    if let Some(before) = previous.get(&key) {
+                        if let Some(event) = transition_event(&u.name, before, u.status) {
+                            transitions.push(event.listener(&listener.name).upstream(&u.endpoint));
+                        }
+                    }
+                }
+            }
+            if let Some(events) = telemetry.capture_events(generation, last_event, transitions) {
+                return Capture {
+                    status,
+                    sessions,
+                    events,
+                };
+            }
+        }
+        // Yield to writers instead of spinning while a burst changes the fleet.
+        // The caller can cancel this future immediately on shutdown.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Runs once per process when the dashboard is enabled. The counter hot path
 /// never builds JSON or wakes viewers. Lifecycle bursts coalesce at four Hz.
 pub async fn run(app: SharedState, mut shutdown: broadcast::Receiver<()>) {
@@ -246,23 +291,20 @@ pub async fn run(app: SharedState, mut shutdown: broadcast::Receiver<()>) {
             _ = shutdown.recv() => break,
             _ = sleep_until(next_publish) => {},
         }
-        let sessions = session_views(&app).await;
-        let mut counts = HashMap::new();
-        for session in &sessions {
-            *counts.entry(session.listener.clone()).or_default() += 1;
-        }
-        // Session badges, listener totals and table rows use one membership cut.
-        let status = status_with_session_counts(&app, counts).await;
+        let Capture {
+            status,
+            sessions,
+            events,
+        } = tokio::select! {
+            _ = shutdown.recv() => break,
+            snapshot = capture(&app, &previous, last_event) => snapshot,
+        };
         let sample_due = Instant::now() >= next_sample;
         let mut upstreams = BTreeMap::new();
         for listener in &status.listeners {
             for u in &listener.upstreams {
                 let key = format!("{}|{}", listener.name, u.endpoint);
-                if let Some(before) = previous.insert(key.clone(), u.status) {
-                    if let Some(event) = transition_event(&u.name, before, u.status) {
-                        telemetry.emit(event.listener(&listener.name).upstream(&u.endpoint));
-                    }
-                }
+                previous.insert(key.clone(), u.status);
                 if sample_due {
                     upstreams.insert(
                         key,
@@ -284,7 +326,6 @@ pub async fn run(app: SharedState, mut shutdown: broadcast::Receiver<()>) {
         if let Some(sample) = &sample {
             telemetry.record_sample(sample.clone());
         }
-        let events = telemetry.events_after(last_event);
         let through = events.last().map_or(last_event, |e| e.id);
         match app.dashboard_feed.publish(status, sessions, events, sample) {
             Ok(()) => last_event = through,
@@ -303,6 +344,144 @@ mod tests {
     use super::super::{ControlView, TotalsView};
     use super::*;
     use crate::telemetry::{EventKind, Level};
+
+    fn interleaving_app() -> SharedState {
+        use crate::api::{AppState, ListenerContext, MAX_STREAMS};
+        use crate::health::ListenerHealthState;
+        use crate::models::{build_config_db, build_state_db, Server};
+        let listeners = ["capture-a", "capture-b"]
+            .into_iter()
+            .map(|name| {
+                let servers = vec![Server {
+                    name: name.into(),
+                    endpoint: name.into(),
+                    enabled: true,
+                    ..Default::default()
+                }];
+                ListenerContext {
+                    health: ListenerHealthState {
+                        name: Some(name.into()),
+                        state_db: build_state_db(servers.clone()),
+                        hub: None,
+                        chain_api: None,
+                    },
+                    config_db: build_config_db(servers),
+                    order: vec![name.into()],
+                    port: 0,
+                    chain_id: None,
+                    max_connections: 100,
+                    stats: Arc::default(),
+                }
+            })
+            .collect();
+        Arc::new(AppState {
+            listeners,
+            health: vec![],
+            dashboard: true,
+            control_token: None,
+            allowed_hosts: vec![],
+            streams: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS)),
+            dashboard_feed: Arc::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_control_during_capture_cannot_publish_its_event_with_older_state() {
+        let app = interleaving_app();
+        let blocked = app.listeners[1].health.state_db.lock().await;
+        let previous = HashMap::new();
+        let mut capturing = Box::pin(capture(&app, &previous, 0));
+        // A has been captured; the real capture is waiting on B's state lock.
+        assert!(futures::poll!(&mut capturing).is_pending());
+        super::super::update_upstream(
+            &app,
+            "capture-a",
+            "capture-a",
+            Some(super::super::UpstreamAction::Disable),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        drop(blocked);
+        let captured = capturing.await;
+        assert!(captured.events.iter().any(
+            |e| e.listener.as_deref() == Some("capture-a") && e.message == "disabled capture-a"
+        ));
+        assert!(
+            captured.status.listeners[0].upstreams[0].operator_disabled,
+            "the disable event and state must agree within this single publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failover_during_capture_cannot_publish_its_event_with_the_old_assignment() {
+        let app = interleaving_app();
+        let telemetry = telemetry::global();
+        let registration = telemetry.register_session(
+            "capture-a".into(),
+            "127.0.0.1:1000".parse().unwrap(),
+            "old-node",
+        );
+        let blocked = app.listeners[1].health.state_db.lock().await;
+        let previous = HashMap::new();
+        let mut capturing = Box::pin(capture(&app, &previous, 0));
+        assert!(futures::poll!(&mut capturing).is_pending());
+        registration.info.set_upstream("new-node");
+        telemetry.emit(
+            Event::new(Level::Warn, EventKind::SessionFailover, "moved to new-node")
+                .listener("capture-a")
+                .upstream("new-node")
+                .session(registration.info.id),
+        );
+        drop(blocked);
+        let captured = capturing.await;
+        let event = captured
+            .events
+            .iter()
+            .find(|e| e.session == Some(registration.info.id))
+            .unwrap();
+        let session = captured
+            .sessions
+            .iter()
+            .find(|s| s.id == registration.info.id)
+            .unwrap();
+        assert_eq!(
+            event.upstream.as_deref(),
+            Some(session.upstream.as_str()),
+            "the failover event and assignment must agree within this single publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_waits_for_all_nested_lifecycle_writers() {
+        let app = interleaving_app();
+        let telemetry = telemetry::global();
+        let outer = telemetry.begin_change();
+        let inner = telemetry.begin_change();
+        let previous = HashMap::new();
+        let mut capturing = Box::pin(capture(&app, &previous, 0));
+        assert!(futures::poll!(&mut capturing).is_pending());
+        super::super::update_upstream(
+            &app,
+            "capture-a",
+            "capture-a",
+            Some(super::super::UpstreamAction::Disable),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        drop(outer);
+        assert!(
+            telemetry.capture_version().is_none(),
+            "one writer is still active"
+        );
+        assert!(futures::poll!(&mut capturing).is_pending());
+        drop(inner);
+        let captured = tokio::time::timeout(Duration::from_secs(2), capturing)
+            .await
+            .unwrap();
+        assert!(captured.status.listeners[0].upstreams[0].operator_disabled);
+    }
 
     fn publish(feed: &Feed, n: u64) {
         let status = StatusView {

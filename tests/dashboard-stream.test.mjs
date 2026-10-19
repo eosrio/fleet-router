@@ -6,7 +6,7 @@ function frame(revision, { bootstrap = false, started = 100, sessions = [], even
   return {
     revision, bootstrap,
     status: { started_ms: started, now_ms: 3000, totals: { sessions: sessions.length }, listeners: [] },
-    sessions, events, sample,
+    sessions, events: events.map(e => ({ t_ms: 3000, level: "info", kind: "control", message: "Changed", ...e })), sample,
     ...(bootstrap ? { history: { interval_ms: 1000, samples: history } } : {}),
   };
 }
@@ -106,6 +106,31 @@ test("a malformed bootstrap cannot clear the last usable state", () => {
   assert.throws(() => applyDashboardFrame(badSample), /invalid/i);
   assert.equal(store.revision, 1);
   assert.equal(store.series.get("test|node").t.length, 1);
+});
+
+test("malformed events preserve all usable state and allow the corrected revision", () => {
+  applyDashboardFrame(frame(1, { bootstrap: true, sessions: [{ id: 2 }], events: [{ id: 9 }],
+    history: [sample(1000, 10), sample(2000, 20)] }));
+  store.flashes.set("test|node", 123456);
+  const snapshot = () => structuredClone({ status: store.status, sessions: store.sessions,
+    instance: store.instance, revision: store.revision, series: store.series,
+    events: store.events, lastEventId: store.lastEventId, flashes: store.flashes });
+  const before = snapshot();
+  let notifications = 0;
+  on(() => notifications++);
+  for (const malformed of [
+    { kind: null }, { kind: 7 }, { kind: "" }, { message: null }, { level: null },
+    { t_ms: "bad" }, { t_ms: NaN }, { t_ms: Infinity }, { t_ms: -1 }, { t_ms: 8640000000000001 },
+    { listener: {} }, { upstream: [] }, { session: "bad" },
+  ]) {
+    const invalid = frame(2, { bootstrap: true, events: [{ id: 10, ...malformed }] });
+    assert.throws(() => applyDashboardFrame(invalid), /invalid dashboard event/i);
+    assert.deepEqual(snapshot(), before);
+    assert.equal(notifications, 0);
+  }
+  assert.equal(applyDashboardFrame(frame(2, { bootstrap: true, events: [{ id: 10 }] })), true);
+  assert.equal(store.revision, 2);
+  assert.equal(notifications, 1);
 });
 
 test("the browser uses one push read path, marks live after apply, and resyncs a gap", async (t) => {

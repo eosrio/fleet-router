@@ -232,6 +232,13 @@ counts retain their separate meaning. This is an atomic dashboard publication;
 upstream SHiP observations still have their own sample times, exposed through
 `head_sample_age_ms`.
 
+The publisher retries capture when a lifecycle mutation overlaps it. Control
+changes and session assignments are coordinated with their audit events, and
+the event watermark is taken only after accepting the state capture. Forwarded
+block/byte counters remain independently sampled; they do not acquire the
+lifecycle guard. The browser validates event fields before replacing usable
+state, so malformed frames trigger resync without consuming their revision.
+
 The router builds and encodes live frames once for all viewers. A slow stream
 that falls behind the eight-frame queue gets another bootstrap, containing up
 to 900 history samples and 500 events, instead of an unbounded backlog. Bootstrap

@@ -2287,6 +2287,7 @@ impl Session {
     /// count it for its upstream, show it in the registry, and report the
     /// failover or operator move that led here.
     fn note_link_up(&mut self) {
+        let _change = telemetry::global().begin_change();
         let Some((endpoint, counters)) = self
             .link
             .as_ref()

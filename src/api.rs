@@ -633,6 +633,7 @@ async fn update_upstream(
         ));
     };
     let name = state.name.clone();
+    let _change = telemetry::global().begin_change();
     let message = match action {
         Some(UpstreamAction::Disable) => {
             state.operator_disabled = true;
@@ -751,6 +752,7 @@ async fn session_action(
     id: u64,
     action: SessionAction,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let _change = telemetry::global().begin_change();
     let Some(session) = telemetry::global().session(id) else {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,

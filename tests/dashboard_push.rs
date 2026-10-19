@@ -108,17 +108,19 @@ async fn push_bootstraps_sessions_controls_and_reconnect_without_read_requests()
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    let mut saw_control = false;
-    stream
+    let disabled = stream
         .until(|f| {
-            saw_control |= f["events"]
+            f["events"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|e| e["kind"] == "control");
-            saw_control && f["status"]["listeners"][0]["upstreams"][0]["operator_disabled"] == true
+                .any(|e| e["kind"] == "control")
         })
         .await;
+    assert_eq!(
+        disabled["status"]["listeners"][0]["upstreams"][0]["operator_disabled"], true,
+        "the first frame carrying the disable event must carry the updated state"
+    );
 
     // Reconnection supplies state, retained history and retained events again;
     // the browser never needs separate status/sessions/history/events GETs.
@@ -178,17 +180,20 @@ async fn failover_pushes_the_new_assignment_and_event_on_the_existing_stream() {
     let assigned = stream.until(|f| f["sessions"][0]["upstream"] == ep1).await;
     let id = assigned["sessions"][0]["id"].clone();
     primary.drop_sessions();
-    let mut saw_event = false;
     let moved = timeout(Duration::from_secs(5), async {
         loop {
             let f = stream.next().await;
             assert_eq!(f["status"]["totals"]["sessions"], 1);
-            saw_event |= f["events"]
+            let saw_event = f["events"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|e| e["kind"] == "session_failover" && e["session"] == id);
-            if saw_event && f["sessions"][0]["upstream"] == ep2 {
+            if saw_event {
+                assert_eq!(
+                    f["sessions"][0]["upstream"], ep2,
+                    "the failover event must accompany its new assignment"
+                );
                 break f;
             }
         }

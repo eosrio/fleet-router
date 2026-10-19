@@ -162,8 +162,8 @@ impl SessionInfo {
     }
 
     pub fn set_upstream(&self, endpoint: &str) {
+        let _change = global().begin_change();
         *lock(&self.upstream) = endpoint.to_string();
-        global().changed.notify_one();
     }
 
     pub fn start_block(&self) -> Option<u32> {
@@ -199,12 +199,12 @@ impl SessionInfo {
 
     /// Record a client `get_blocks` request.
     pub fn note_request(&self, start_block: u32, finality: bool) {
+        let _change = global().begin_change();
         self.start_block
             .store(u64::from(start_block), Ordering::Relaxed);
         self.next_block
             .store(u64::from(start_block), Ordering::Relaxed);
         self.finality.store(finality, Ordering::Relaxed);
-        global().changed.notify_one();
     }
 
     /// Record one frame forwarded to the client.
@@ -220,6 +220,7 @@ impl SessionInfo {
     }
 
     pub fn note_failover(&self) {
+        let _change = global().begin_change();
         self.failovers.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -252,8 +253,29 @@ pub struct SessionRegistration {
 
 impl Drop for SessionRegistration {
     fn drop(&mut self) {
+        let _change = global().begin_change();
         lock(&global().sessions).remove(&self.info.id);
-        global().changed.notify_one();
+    }
+}
+
+#[derive(Default)]
+struct Lifecycle {
+    generation: u64,
+    writers: usize,
+}
+
+/// Marks a lifecycle transaction without holding a lock across its work. Nested
+/// and concurrent writers are allowed; capture retries while any are active.
+pub(crate) struct LifecycleChange<'a>(&'a Telemetry);
+
+impl Drop for LifecycleChange<'_> {
+    fn drop(&mut self) {
+        let mut lifecycle = lock(&self.0.lifecycle);
+        lifecycle.writers -= 1;
+        lifecycle.generation = lifecycle.generation.wrapping_add(1);
+        if lifecycle.writers == 0 {
+            self.0.changed.notify_one();
+        }
     }
 }
 
@@ -265,6 +287,7 @@ pub struct Telemetry {
     history: Mutex<VecDeque<Sample>>,
     next_session_id: AtomicU64,
     sessions: Mutex<HashMap<u64, Arc<SessionInfo>>>,
+    lifecycle: Mutex<Lifecycle>,
     /// Coalesced lifecycle changes for the single dashboard publisher. Block
     /// counters are sampled separately; forwarding never wakes this task.
     pub changed: Notify,
@@ -282,24 +305,70 @@ pub fn global() -> &'static Telemetry {
         history: Mutex::new(VecDeque::with_capacity(HISTORY_SAMPLES)),
         next_session_id: AtomicU64::new(1),
         sessions: Mutex::new(HashMap::new()),
+        lifecycle: Mutex::default(),
         changed: Notify::new(),
     })
 }
 
 impl Telemetry {
-    /// Assign an id and timestamp, keep the event, and publish it to live streams.
-    pub fn emit(&self, mut event: Event) {
-        event.t_ms = now_ms();
+    /// Use around state changes and their associated events. Frame counters do
+    /// not enter this path: their samples remain independent relaxed atomics.
+    pub(crate) fn begin_change(&self) -> LifecycleChange<'_> {
+        let mut lifecycle = lock(&self.lifecycle);
+        lifecycle.generation = lifecycle.generation.wrapping_add(1);
+        lifecycle.writers += 1;
+        LifecycleChange(self)
+    }
+
+    pub(crate) fn capture_version(&self) -> Option<u64> {
+        let lifecycle = lock(&self.lifecycle);
+        (lifecycle.writers == 0).then_some(lifecycle.generation)
+    }
+
+    /// Complete a capture only if no lifecycle writer overlapped it. Derived
+    /// status transitions join the event log under the same lock as its final
+    /// watermark, so intervening external events cannot be skipped.
+    pub(crate) fn capture_events(
+        &self,
+        generation: u64,
+        after: u64,
+        transitions: Vec<Event>,
+    ) -> Option<Vec<Event>> {
+        let lifecycle = lock(&self.lifecycle);
+        if lifecycle.writers != 0 || lifecycle.generation != generation {
+            return None;
+        }
         let mut events = lock(&self.events);
-        // Assigned under the lock so ids are in log order.
+        for event in transitions {
+            let event = self.append_event(&mut events, event);
+            let _ = self.events_tx.send(event);
+        }
+        Some(
+            events
+                .iter()
+                .filter(|event| event.id > after)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    fn append_event(&self, events: &mut VecDeque<Event>, mut event: Event) -> Event {
+        event.t_ms = now_ms();
+        // Assigned under the event lock so ids are in log order.
         event.id = self.next_event_id.fetch_add(1, Ordering::Relaxed);
         if events.len() == MAX_EVENTS {
             events.pop_front();
         }
         events.push_back(event.clone());
-        drop(events);
+        event
+    }
+
+    /// Assign an id and timestamp, keep the event, and publish it to live streams.
+    pub fn emit(&self, event: Event) {
+        let _change = self.begin_change();
+        let mut events = lock(&self.events);
+        let event = self.append_event(&mut events, event);
         let _ = self.events_tx.send(event);
-        self.changed.notify_one();
     }
 
     /// Events with an id greater than `after`, oldest first.
@@ -334,6 +403,7 @@ impl Telemetry {
         client: SocketAddr,
         upstream: &str,
     ) -> SessionRegistration {
+        let _change = self.begin_change();
         let info = Arc::new(SessionInfo {
             id: self.next_session_id.fetch_add(1, Ordering::Relaxed),
             listener,
@@ -352,7 +422,6 @@ impl Telemetry {
             control: Notify::new(),
         });
         lock(&self.sessions).insert(info.id, info.clone());
-        self.changed.notify_one();
         SessionRegistration { info }
     }
 

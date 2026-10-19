@@ -501,6 +501,7 @@ impl FleetHub {
     /// quarantine change. Holding the lock keeps publications in the order of
     /// the state changes.
     pub fn rebuild(&self, states: &HashMap<String, ServerState>) {
+        let _change = crate::telemetry::global().begin_change();
         let mut mem = lock(&self.mem);
         let ctx = BuildCtx {
             topology: self.topology,
@@ -517,7 +518,6 @@ impl FleetHub {
         mem.generation += 1;
         view.generation = mem.generation;
         self.view_tx.send_replace(Arc::new(view));
-        crate::telemetry::global().changed.notify_one();
     }
 
     /// Lock the state map and [`Self::rebuild`] from it.

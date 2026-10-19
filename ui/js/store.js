@@ -102,7 +102,18 @@ export function applyDashboardFrame(frame) {
       throw new Error("Invalid dashboard sample");
     }
   }
-  if (frame.events.some(e => !e || !Number.isSafeInteger(e.id) || e.id < 1)) throw new Error("Invalid dashboard event");
+  for (const event of frame.events) {
+    // Reject before clearing a bootstrap or advancing its revision. Rendering
+    // uses string methods and Date.toISOString(), which throws outside this range.
+    if (!event || !Number.isSafeInteger(event.id) || event.id < 1 ||
+        !Number.isSafeInteger(event.t_ms) || event.t_ms < 0 || event.t_ms > 8640000000000000 ||
+        typeof event.kind !== "string" || event.kind.length === 0 ||
+        typeof event.message !== "string" || !["info", "warn", "error"].includes(event.level) ||
+        [event.listener, event.upstream].some(value => value != null && typeof value !== "string") ||
+        (event.session != null && (!Number.isSafeInteger(event.session) || event.session < 1))) {
+      throw new Error("Invalid dashboard event");
+    }
+  }
   if (frame.bootstrap) {
     store.series.clear();
     store.events = [];

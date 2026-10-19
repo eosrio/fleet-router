@@ -379,7 +379,7 @@ th {{ color:var(--ink-3); font-weight:500; }}
                 weight = upstream.weight,
                 sessions = upstream.sessions,
                 head = upstream
-                    .head_block
+                    .chain_head_block
                     .map_or_else(|| "&ndash;".to_string(), |b| b.to_string()),
                 trace = format_range(upstream.trace.as_ref()),
                 failovers = upstream.failovers_total,

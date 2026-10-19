@@ -168,6 +168,82 @@ async fn only_session(client: &reqwest::Client, router: &Router) -> Value {
     list[0].clone()
 }
 
+/// A restart offsets one monitor's polls. Comparing its old sample to a
+/// peer's newer one must not label either of two synchronized nodes lagged.
+#[tokio::test]
+async fn restarted_synced_nodes_do_not_alternate_dashboard_lag() {
+    let config = MockShipConfig {
+        block_delay: Some(Duration::from_millis(2)),
+        ..MockShipConfig::live(1, 10_000)
+    };
+    let a = MockShipServer::new(config.clone()).await;
+    let b = MockShipServer::new(config).await;
+    let (ep_a, ep_b) = (a.endpoint(), b.endpoint());
+    let (a, b) = (a.start(), b.start());
+    let router = Router::start(
+        &[ep_a.clone(), ep_b.clone()],
+        serde_json::json!({ "enabled": true }),
+    );
+    let http = reqwest::Client::new();
+    router.wait_until_all_up(&http, 2).await;
+
+    let (ws, _) = connect_async(format!("ws://127.0.0.1:{}", router.listen_port))
+        .await
+        .unwrap();
+    let (mut writer, mut reader) = ws.split();
+    let _abi = reader.next().await.unwrap().unwrap();
+    writer
+        .send(Message::Binary(blocks_request(100, 9_000).into()))
+        .await
+        .unwrap();
+    let before = read_blocks(&mut reader, 20).await;
+    assert_eq!(only_session(&http, &router).await["upstream"], ep_a);
+
+    // Restart off the original polling boundary. The existing client must
+    // fail over, and the returning node's monitor must resume polling.
+    sleep(Duration::from_millis(180)).await;
+    a.close_sessions();
+    let after = read_blocks(&mut reader, 200).await;
+    assert_consecutive(&[before, after].concat());
+    assert_eq!(only_session(&http, &router).await["upstream"], ep_b);
+    router.wait_until_all_up(&http, 2).await;
+
+    let mut saw_different_samples = false;
+    for step in 1..=40 {
+        let head = 10_000 + step * 2;
+        a.set_head(head, head - 10);
+        b.set_head(head, head - 10);
+        sleep(Duration::from_millis(40)).await;
+        let status: Value = http
+            .get(router.url("/api/v1/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let upstreams = status["listeners"][0]["upstreams"].as_array().unwrap();
+        let best = upstreams
+            .iter()
+            .filter_map(|u| u["head_block"].as_u64())
+            .max()
+            .unwrap();
+        saw_different_samples |= upstreams
+            .iter()
+            .any(|u| u["head_block"].as_u64() != Some(best));
+        for upstream in upstreams {
+            assert_eq!(
+                upstream["head_lag_blocks"], 0,
+                "synchronized nodes falsely appear lagged: {status}"
+            );
+        }
+    }
+    assert!(
+        saw_different_samples,
+        "fixture did not offset the polling schedules"
+    );
+}
+
 #[tokio::test]
 async fn drain_moves_a_live_session_without_a_reconnect_and_close_ends_it() {
     let mock1 = MockShipServer::new(mock_config(1_000_000)).await;

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The dashboard could alternate which synchronized upstream appeared behind
+  after a node restarted and its status polls shifted relative to its peers.
+  Head lag now compares each fresh reply with peer heads known before its
+  request, instead of comparing samples collected at different times. Real
+  lag is still reported; differences shorter than a polling interval may not
+  be observed. The JSON API adds `head_lag_blocks`.
+
 ## [0.7.0] - 2026-10-18
 
 ### Upgrade notes

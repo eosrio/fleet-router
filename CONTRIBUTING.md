@@ -53,6 +53,12 @@ Run the workspace test suite:
 cargo test --workspace
 ```
 
+The dashboard's JavaScript regression tests need Node.js 24 or later:
+
+```bash
+node --test tests/dashboard-head.test.mjs
+```
+
 These tests use the in-repo **mock-ship** test double, so they need **no
 external services** — no `nodeos`, no SHiP node, no network access.
 
@@ -69,6 +75,10 @@ cargo test --workspace -- --ignored
 You do **not** need these Docker tests to pass to contribute most changes; the
 default `cargo test --workspace` run is sufficient for the great majority of
 work.
+
+The separate opt-in `recovery_repro` fixture uses local SHiP doubles to capture
+multi-listener recovery, head lag and throughput. It needs no Docker stack;
+see [Reproduce the recovery report](docs/reproducing-recovery.md).
 
 ## Mandatory pre-PR checks
 

@@ -67,6 +67,7 @@ Full router state. This is the same object the [live stream](#live-stream) sends
           "chain_state": { "begin": 2, "end": 412345678 },
           "finality": null,
           "head_block": 412345677,
+          "head_lag_blocks": 0,
           "sessions": 8,
           "sessions_total": 210,
           "failovers_total": 3,
@@ -98,6 +99,14 @@ Full router state. This is the same object the [live stream](#live-stream) sends
 A listener's `ready` is what [`/ready/<listener>`](observability.md#readiness-and-coverage) answers: a stitched listener needs an online live upstream.
 
 `head_block` is the last block in its trace or chain-state range (`max(end) - 1`), or `null` before the first status reply.
+
+`head_lag_blocks` compares a fresh status reply with the highest online live
+peer range head already known before that request was sent. It is a conservative
+lower bound: differences smaller than one status polling interval may not be
+observed. It is `null` for offline or frozen upstreams and before a comparison
+is available. The dashboard uses it for the lag label; subtracting independently
+sampled `head_block` values can falsely alternate which synchronized node is
+behind after a restart. Exact reported range ends remain visible.
 
 ### `GET /api/v1/sessions`
 

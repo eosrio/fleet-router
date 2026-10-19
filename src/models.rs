@@ -2031,6 +2031,12 @@ pub struct ServerState {
     pub ranges_known: bool,
     /// When the last accepted status result arrived.
     pub status_at: Option<Instant>,
+    /// Highest live peer range head known before this status request was sent.
+    /// Never compare a reply against peer samples collected after its request.
+    pub status_head_reference: Option<u32>,
+    /// Conservative lag measured by the last accepted status reply. Differences
+    /// smaller than one polling interval may not be observed.
+    pub head_lag_blocks: Option<u32>,
     /// `Some(true)` after a `get_status_result_v1`; `Some(false)` after a
     /// `get_status_result_v0`, or once the monitor has fallen back to
     /// `get_status_request_v0` (the upstream speaks only status v0).
@@ -2108,6 +2114,8 @@ impl ServerState {
             lib: None,
             ranges_known: false,
             status_at: None,
+            status_head_reference: None,
+            head_lag_blocks: None,
             status_v1: None,
             abi: None,
             offline_since: None,
@@ -2123,6 +2131,8 @@ impl ServerState {
     /// instant of an outage. Going from online to offline wakes the sessions
     /// on this upstream (see [`UpstreamCounters::went_offline`]).
     pub fn mark_offline(&mut self, now: Instant) {
+        self.status_head_reference = None;
+        self.head_lag_blocks = None;
         if self.online {
             self.online = false;
             self.counters.went_offline.notify_waiters();

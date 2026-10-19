@@ -136,3 +136,9 @@ export function bestHead(listener) {
   }
   return best;
 }
+
+/** Lag measured at this node's own status request, never across sample ages. */
+export function headLag(upstream) {
+  const lag = upstream.head_lag_blocks;
+  return upstream.online && Number.isFinite(lag) && lag >= 0 ? lag : null;
+}

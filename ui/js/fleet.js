@@ -3,7 +3,7 @@
 // section break, then the last TIP_WINDOW blocks before the best head, so
 // both pruned history and head lag are visible at once.
 
-import { bestHead, currentRates, isFlashing, store } from "./store.js";
+import { bestHead, currentRates, headLag, isFlashing, store } from "./store.js";
 import {
   countdown,
   el,
@@ -282,16 +282,17 @@ class UpstreamRow {
     setText(this.throughput, rate(r.bps, "blk/s"));
     setText(this.bytesRate, byteRate(r.Bps));
 
-    const best = axis ? axis.best : null;
-    if (u.head_block === null || u.head_block === undefined || best === null) {
+    const lag = headLag(u);
+    if (u.head_block === null || u.head_block === undefined) {
       setText(this.lag, "–");
       this.lag.className = "big";
       setText(this.head, "no status yet");
     } else {
-      const lag = best - u.head_block;
-      setText(this.lag, lag <= 0 ? "at head" : `−${int(lag)}`);
-      this.lag.className = `big ${lag <= 0 ? "is-set" : lag > LAG_WARN ? "is-warn" : ""}`;
-      this.lag.title = lag <= 0 ? "At the best head in this listener" : `${int(lag)} blocks behind the best head`;
+      setText(this.lag, lag === null ? "sampled" : lag === 0 ? "at head" : `−${int(lag)}`);
+      this.lag.className = `big ${lag === 0 ? "is-set" : lag > LAG_WARN ? "is-warn" : ""}`;
+      this.lag.title = lag === null ? "Last reported block range; no live peer comparison available"
+        : lag === 0 ? "No lag observed against live peers at the last status request; differences within a polling interval may not be visible"
+        : `At least ${int(lag)} blocks behind the live peer head already known when this status request began`;
       setText(this.head, `#${int(u.head_block)}`);
     }
 
@@ -454,8 +455,8 @@ function trackLabel(u, axis) {
   else bits.push("no trace range reported yet");
   if (u.finality && u.finality.end > 0) bits.push(`finality blocks ${int(u.finality.begin)} to ${int(u.finality.end - 1)}`);
   if (axis && u.head_block !== null && u.head_block !== undefined) {
-    const lag = axis.best - u.head_block;
-    bits.push(lag <= 0 ? "at the best head" : `${int(lag)} blocks behind the best head`);
+    const lag = headLag(u);
+    bits.push(lag === null ? "last reported head" : lag === 0 ? "no lag observed at the last status check" : `at least ${int(lag)} blocks behind at the last status check`);
   }
   if (u.quarantines?.length) bits.push(`${u.quarantines.length} quarantined block range${u.quarantines.length === 1 ? "" : "s"}`);
   return bits.join(", ");

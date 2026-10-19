@@ -2,7 +2,7 @@
 // actions, confirmations and toasts. Everything is in-page; no browser dialogs.
 
 import { api, ApiError, getToken, setToken } from "./api.js";
-import { bestHead, findUpstream, store } from "./store.js";
+import { headLag, findUpstream, store } from "./store.js";
 import { announce, countdown, el, int, setText, shortHash, STATUS_LABEL } from "./util.js";
 
 const DOCS_URL = "https://github.com/eosrio/fleet-router/blob/main/docs/configuration.md#dashboard";
@@ -306,9 +306,7 @@ function range(r) {
 }
 
 function renderFacts(u) {
-  const listener = store.status.listeners.find((l) => l.name === open.listener);
-  const best = listener ? bestHead(listener) : null;
-  const lag = best !== null && u.head_block !== null ? best - u.head_block : null;
+  const lag = headLag(u);
   const overridden = u.config && (u.config.priority !== u.priority || u.config.weight !== u.weight);
   const rows = [
     ["Status", [STATUS_LABEL[u.status] || u.status, el("div.sub", null, STATUS_TEXT[u.status] || "")]],
@@ -323,7 +321,7 @@ function renderFacts(u) {
       "Head",
       u.head_block === null
         ? el("span.sub", null, "no status yet")
-        : [`#${int(u.head_block)}`, el("span.sub", null, lag === null ? "" : lag <= 0 ? "  at the best head" : `  ${int(lag)} behind the best head`)],
+        : [`#${int(u.head_block)}`, el("span.sub", null, lag === null ? "  last reported range" : lag === 0 ? "  no lag observed at last check" : `  at least ${int(lag)} behind at last check`)],
     ],
     ["Trace range", range(u.trace)],
     ["Chain state", range(u.chain_state)],

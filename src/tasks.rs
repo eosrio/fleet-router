@@ -314,7 +314,32 @@ async fn reconnect_pause(
     }
 }
 
-async fn send_status(sender: &mut WsSink, endpoint: &str, variant: u8) -> bool {
+/// Snapshot the comparison before writing the request: a peer's later reply
+/// must not turn an older sample into apparent lag after a reconnect.
+async fn capture_head_reference(db: &ServerStateDb, endpoint: &str) {
+    let mut states = db.lock().await;
+    let reference = states
+        .iter()
+        .filter(|(peer, state)| {
+            peer.as_str() != endpoint
+                && state.online
+                && !state.operator_disabled
+                && state.role == Role::Live
+        })
+        .filter_map(|(_, state)| {
+            state
+                .trace_end_block
+                .max(state.chain_state_end_block)
+                .checked_sub(1)
+        })
+        .max();
+    if let Some(state) = states.get_mut(endpoint) {
+        state.status_head_reference = reference;
+    }
+}
+
+async fn send_status(sender: &mut WsSink, endpoint: &str, variant: u8, db: &ServerStateDb) -> bool {
+    capture_head_reference(db, endpoint).await;
     if let Err(e) = sender.send(Message::Binary(vec![variant].into())).await {
         tracing::warn!(upstream = %endpoint, error = %e, "failed to send status request");
         return false;
@@ -505,7 +530,7 @@ async fn run_monitor_session(
                         Inbound::AbiAccepted => {
                             abi_ready = true;
                             let variant = *status_request;
-                            if !send_status(&mut sender, &server.endpoint, variant).await {
+                            if !send_status(&mut sender, &server.endpoint, variant, &hub.state).await {
                                 mark_offline_published(hub, &server.endpoint).await;
                                 return session_reconnect(sent_v1, saw_status);
                             }
@@ -573,7 +598,7 @@ async fn run_monitor_session(
                     return session_reconnect(sent_v1, saw_status);
                 }
                 let variant = *status_request;
-                if !send_status(&mut sender, &server.endpoint, variant).await {
+                if !send_status(&mut sender, &server.endpoint, variant, &hub.state).await {
                     mark_offline_published(hub, &server.endpoint).await;
                     return session_reconnect(sent_v1, saw_status);
                 }
@@ -816,6 +841,16 @@ pub(crate) async fn apply_status_update(
         state.lib = Some(lib);
         state.ranges_known = true;
         state.status_at = Some(now);
+        state.head_lag_blocks = if state.role == Role::Live {
+            trace_end.max(chain_end).checked_sub(1).map(|head| {
+                state
+                    .status_head_reference
+                    .unwrap_or(head)
+                    .saturating_sub(head)
+            })
+        } else {
+            None
+        };
         // The monitor keeps polling with the variant the upstream answers.
         state.status_v1 = Some(variant == 3);
         state.offline_since = None;
@@ -957,6 +992,80 @@ mod tests {
         let mut frame = vec![0u8];
         frame.extend_from_slice(body);
         frame
+    }
+
+    #[tokio::test]
+    async fn head_lag_compares_only_with_peers_known_before_the_request() {
+        let (server, _) = fixture();
+        let peer = Server {
+            endpoint: "127.0.0.1:28080".into(),
+            ..server.clone()
+        };
+        let db = build_state_db(vec![server.clone(), peer.clone()]);
+        {
+            let mut states = db.lock().await;
+            let p = states.get_mut(&peer.endpoint).unwrap();
+            p.online = true;
+            p.trace_end_block = 1001;
+        }
+        super::capture_head_reference(&db, &server.endpoint).await;
+        // The peer's newer reply arrives while our request is in flight.
+        db.lock()
+            .await
+            .get_mut(&peer.endpoint)
+            .unwrap()
+            .trace_end_block = 1201;
+        apply_status_update(&status_message(&status_body()), &db, &server)
+            .await
+            .unwrap();
+        assert_eq!(db.lock().await[&server.endpoint].head_lag_blocks, Some(0));
+        // Another fresh response that is still at 1000 really trails the
+        // peer head already known when this next request began.
+        super::capture_head_reference(&db, &server.endpoint).await;
+        apply_status_update(&status_message(&status_body()), &db, &server)
+            .await
+            .unwrap();
+        assert_eq!(db.lock().await[&server.endpoint].head_lag_blocks, Some(200));
+        super::mark_offline(&db, &server.endpoint).await;
+        assert_eq!(db.lock().await[&server.endpoint].head_lag_blocks, None);
+    }
+
+    #[tokio::test]
+    async fn head_lag_excludes_offline_disabled_and_frozen_peers() {
+        let (server, _) = fixture();
+        let peer = Server {
+            endpoint: "127.0.0.1:28080".into(),
+            ..server.clone()
+        };
+        let db = build_state_db(vec![server.clone(), peer.clone()]);
+        for (online, disabled, role) in [
+            (false, false, Role::Live),
+            (true, true, Role::Live),
+            (true, false, Role::Frozen),
+        ] {
+            {
+                let mut states = db.lock().await;
+                let p = states.get_mut(&peer.endpoint).unwrap();
+                p.online = online;
+                p.operator_disabled = disabled;
+                p.role = role;
+                p.trace_end_block = 9999;
+            }
+            super::capture_head_reference(&db, &server.endpoint).await;
+            assert_eq!(
+                db.lock().await[&server.endpoint].status_head_reference,
+                None
+            );
+            apply_status_update(&status_message(&status_body()), &db, &server)
+                .await
+                .unwrap();
+            assert_eq!(db.lock().await[&server.endpoint].head_lag_blocks, Some(0));
+        }
+        db.lock().await.get_mut(&server.endpoint).unwrap().role = Role::Frozen;
+        apply_status_update(&status_message(&status_body()), &db, &server)
+            .await
+            .unwrap();
+        assert_eq!(db.lock().await[&server.endpoint].head_lag_blocks, None);
     }
 
     fn status_body_v1(begin: u32, end: u32) -> Vec<u8> {

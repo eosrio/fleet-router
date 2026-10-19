@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 use std::io::Write;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -56,6 +57,11 @@ impl RouterProcess {
     /// relaunched on fresh ports. Panics unless the listen ports accept TCP
     /// within 10 s.
     pub async fn start(cfg: Value) -> Self {
+        Self::start_recording(cfg, None).await
+    }
+
+    /// Same fixture with optional router logs for a diagnostic reproduction.
+    pub async fn start_recording(cfg: Value, logs: Option<&Path>) -> Self {
         let mut last_error = String::new();
         for _ in 0..START_ATTEMPTS {
             let mut cfg = cfg.clone();
@@ -66,12 +72,22 @@ impl RouterProcess {
                 .expect("write temp config");
             file.flush().expect("flush temp config");
 
+            let output = |name: &str| match logs {
+                Some(dir) => Stdio::from(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(dir.join(name))
+                        .expect("open router log"),
+                ),
+                None => Stdio::null(),
+            };
             let child = Command::new(env!("CARGO_BIN_EXE_fleet-router"))
                 .arg("--config")
                 .arg(file.path())
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(output("router.stdout.log"))
+                .stderr(output("router.stderr.log"))
                 .spawn()
                 .expect("spawn fleet-router");
             let mut router = Self {
@@ -91,6 +107,10 @@ impl RouterProcess {
 
     pub fn ws_url(&self) -> String {
         format!("ws://127.0.0.1:{}", self.listen_port)
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// The metrics port; panics when the config has none.

@@ -53,6 +53,7 @@
         <a href="#install">Install</a>
         <a href="#config">Config</a>
         <a href="#metrics">Metrics</a>
+        <a href="frozen-ship.html">Deploy</a>
         <a href="#dashboard">Dashboard</a>
       </nav>
       <div class="mast-actions">
@@ -246,6 +247,7 @@
           </li>
         </ol>
         <p class="after-terminal">To keep it running across reboots, install the systemd unit from <code>deploy/</code>. See <a href="https://github.com/eosrio/fleet-router/blob/main/docs/operations.md#run-as-a-service">Run as a service</a> for systemd, Docker, launchd and Windows.</p>
+        <p class="after-terminal">Serving frozen history alongside live nodes? <a href="frozen-ship.html">Deploy frozen SHiP archives</a> with Hyperion Tools and fleet-router 0.7's single stitched endpoint.</p>
 
         <aside class="notice" aria-label="Security notice">
           <i class="key key-failover" aria-hidden="true"></i>
@@ -405,6 +407,7 @@ fleet_router_upstream_weight{endpoint,server}</code></pre>
       </div>
       <ul class="footer-links">
         <li><a href="https://github.com/eosrio/fleet-router">GitHub</a></li>
+        <li><a href="frozen-ship.html">Frozen SHiP guide</a></li>
         <li><a href="https://crates.io/crates/fleet-router">crates.io</a></li>
         <li><a href="https://github.com/eosrio/fleet-router#readme">README</a></li>
         <li><a href="https://github.com/eosrio/fleet-router/releases">Releases</a></li>

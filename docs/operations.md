@@ -1,5 +1,7 @@
 # Running in production
 
+For a step-by-step archive deployment, follow the [frozen SHiP guide](frozen-ship.md): prepare immutable logs, run Hyperion Tools archive servers, and configure one stitched endpoint with live nodes.
+
 - [How routing and failover work](#how-routing-and-failover-work)
 - [Range-split fleets](#range-split-fleets)
   - [What clients see](#what-clients-see)

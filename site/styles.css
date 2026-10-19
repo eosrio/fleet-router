@@ -1396,6 +1396,28 @@ pre code {
 
 /* ---------- responsive ---------- */
 
+@media (min-width: 720px) and (max-width: 1199.98px) {
+  :root {
+    --mast: 6.5rem;
+  }
+
+  .masthead-row {
+    flex-wrap: wrap;
+    gap: 0 1rem;
+    padding-block: 0.5rem;
+  }
+
+  .nav {
+    order: 3;
+    flex-basis: 100%;
+    justify-content: space-between;
+  }
+
+  .mast-actions {
+    margin-left: auto;
+  }
+}
+
 @media (max-width: 719.98px) {
   .masthead-row {
     flex-wrap: wrap;
@@ -1415,6 +1437,7 @@ pre code {
     margin-left: -0.4rem;
     margin-right: -0.4rem;
     padding-bottom: 0.2rem;
+    overflow-x: auto;
   }
 
   .nav a {

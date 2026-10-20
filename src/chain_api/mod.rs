@@ -55,8 +55,10 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
+#[cfg(test)]
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
+#[cfg(test)]
 use tokio::task::JoinHandle;
 use tokio::time::timeout_at;
 
@@ -87,6 +89,7 @@ const MAX_HEADERS: usize = 64;
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// The pause after an accept error other than a failed connection (out of
 /// file descriptors, say): retrying at once would spin.
+#[cfg(test)]
 const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 /// Idle connections kept per upstream API.
 const POOL_PER_UPSTREAM: usize = 32;
@@ -279,6 +282,7 @@ enum BodyError {
 
 /// Whether an accept error is about one connection only (it failed before
 /// the accept completed), so the next accept can follow at once.
+#[cfg(test)]
 fn connection_error(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -379,11 +383,17 @@ impl ChainApiCtx {
     /// Start one probe per upstream API and serve `listener` until the
     /// shutdown broadcast. The returned task ends once the listener stops
     /// accepting; open connections finish their request and close.
+    #[cfg(test)]
     pub fn spawn(
         self: &Arc<Self>,
         listener: TcpListener,
         shutdown: &broadcast::Sender<()>,
     ) -> JoinHandle<()> {
+        self.start_probes(shutdown);
+        tokio::spawn(self.clone().serve(listener, shutdown.subscribe()))
+    }
+
+    pub fn start_probes(self: &Arc<Self>, shutdown: &broadcast::Sender<()>) {
         let prober = Arc::new(probe::Prober {
             listener: self.listener.clone(),
             client: self.probe_client.clone(),
@@ -396,9 +406,27 @@ impl ChainApiCtx {
         for slot in self.directory.slots() {
             tokio::spawn(prober.clone().run(slot.clone(), shutdown.subscribe()));
         }
-        tokio::spawn(self.clone().serve(listener, shutdown.subscribe()))
     }
 
+    pub fn accept(
+        self: &Arc<Self>,
+        stream: tokio::net::TcpStream,
+        peer: std::net::SocketAddr,
+        shutdown: broadcast::Receiver<()>,
+    ) {
+        let Ok(permit) = self.connections.clone().try_acquire_owned() else {
+            self.stats.rejected.inc(Rejection::Connections);
+            tracing::debug!(%peer, max = self.cfg.max_connections, "chain API connection limit reached; closing");
+            return;
+        };
+        let ctx = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            ctx.connection(stream, shutdown).await;
+        });
+    }
+
+    #[cfg(test)]
     async fn serve(self: Arc<Self>, listener: TcpListener, mut shutdown: broadcast::Receiver<()>) {
         self.stats.set_bound(true);
         loop {
@@ -421,19 +449,7 @@ impl ChainApiCtx {
                             }
                         }
                     };
-                    // Excess connections are closed at once.
-                    let Ok(permit) = self.connections.clone().try_acquire_owned() else {
-                        self.stats.rejected.inc(Rejection::Connections);
-                        tracing::debug!(%peer, max = self.cfg.max_connections, "chain API connection limit reached; closing");
-                        drop(stream);
-                        continue;
-                    };
-                    let ctx = self.clone();
-                    let conn_shutdown = shutdown.resubscribe();
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        ctx.connection(stream, conn_shutdown).await;
-                    });
+                    self.accept(stream, peer, shutdown.resubscribe());
                 }
                 _ = shutdown.recv() => break,
             }

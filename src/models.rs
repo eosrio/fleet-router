@@ -508,7 +508,7 @@ pub struct ResolvedListener {
 /// 2. **Multi-listener mode**: top-level `listeners` array, where each entry
 ///    binds its own `listen_port` and load-balances across an isolated `servers`
 ///    pool (e.g. one ingress port per blockchain network).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ServerConfig {
     /// Address the proxy listens on for client connections (required in single-listener mode;
     /// acts as the default bind address for `listeners` and `metrics_address` in multi-listener mode).
@@ -1961,7 +1961,7 @@ pub struct UpstreamCounters {
 }
 
 /// Live state tracked per upstream by the monitoring loop and the proxy.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ServerState {
     /// Configured [`Server::name`], copied when the state map is built so
     /// `/metrics` can emit a `server` label.
@@ -2292,7 +2292,7 @@ impl Default for ServerState {
 }
 
 /// Interval settings shared with the background monitoring tasks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticConfig {
     pub upstream_reconnect_ms: u64,
     pub upstream_monitoring_ms: u64,
@@ -2305,7 +2305,7 @@ pub struct StaticConfig {
 }
 
 /// Per-connection limits applied by the proxy data path.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProxyLimits {
     pub handshake_timeout_ms: u64,
     pub idle_timeout_ms: u64,

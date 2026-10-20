@@ -14,7 +14,6 @@ use std::any::Any;
 use std::collections::HashSet;
 use std::fs::{read_to_string, write};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,28 +22,21 @@ use clap::{arg, value_parser, Command};
 use color_print::cprintln;
 use futures::{SinkExt, StreamExt};
 use serde_json::from_str;
-use tokio::net::TcpListener;
-use tokio::spawn;
-use tokio::sync::{broadcast, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout, timeout_at};
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::Instrument;
 
 use crate::config_sample::CONFIG_SAMPLE;
 use crate::fleet::view::uncovered;
 use crate::fleet::{FleetHub, FleetView, Log};
 use crate::models::{
     build_config_db, build_state_db_with_chain_id, format_bind_addr, ResolvedChainApi,
-    ResolvedListener, ResolvedTopology, Role, ServerConfig, ServerConfigDb, ServerStateDb,
-    StaticConfig,
+    ResolvedListener, ResolvedTopology, Role, ServerConfig,
 };
-use crate::session::{handle_client, ListenerCtx};
 use crate::ship::wire::{self, UpstreamMsg};
 use crate::ship::Range;
-use crate::tasks::{
-    apply_status_update, monitoring_connection, state_monitoring_loop, upstream_ws_config,
-};
+use crate::tasks::{apply_status_update, upstream_ws_config};
 
 mod abi;
 mod api;
@@ -55,6 +47,7 @@ mod functions;
 mod health;
 mod http;
 mod models;
+mod runtime;
 mod session;
 mod ship;
 mod tasks;
@@ -72,306 +65,21 @@ async fn main() -> Result<()> {
         .install_default()
         .ok();
 
-    let config: ServerConfig = match process_args() {
+    let path = match process_args() {
         Ok(Some((Action::Test { strict }, conf))) => {
             if !run_tests(&conf, strict).await {
                 std::process::exit(1);
             }
             return Ok(());
         }
-        Ok(Some((Action::Run, conf))) => conf,
+        Ok(Some((Action::Run { path }, _))) => path,
         Ok(None) => return Ok(()),
         Err(e) => bail!(e),
     };
-
     init_tracing();
-
-    // Validate the configuration up front with clear, actionable errors.
-    config.validate()?;
-    for warning in config.warnings() {
-        tracing::warn!("{warning}");
-    }
-    let control_token = if config.dashboard.enabled {
-        config.dashboard.resolve_control_token()?
-    } else {
-        if config.dashboard.control_token.is_some() || config.dashboard.control_token_file.is_some()
-        {
-            tracing::warn!("a control token is configured but dashboard.enabled is false; the control API stays off");
-        }
-        None
-    };
-
-    let static_config = StaticConfig {
-        upstream_status_ms: config.upstream_status_ms,
-        upstream_monitoring_ms: config.upstream_monitoring_ms,
-        upstream_reconnect_ms: config.upstream_reconnect_ms,
-        connect_timeout_ms: config.upstream_connect_timeout_ms(),
-        max_message_bytes: config.max_message_bytes,
-    };
-    let limits = config.proxy_limits();
-    let resolved_listeners = config.resolved_listeners();
-    let resolved_chain_apis = config.resolved_chain_apis();
-
-    // Bind all client TCP listeners up front so any port conflict fails fast.
-    let mut bound_listeners = Vec::with_capacity(resolved_listeners.len());
-    for (listener_cfg, chain_api) in resolved_listeners.into_iter().zip(resolved_chain_apis) {
-        let bind_addr = format_bind_addr(&listener_cfg.listen_address, listener_cfg.listen_port);
-        let tcp_listener = TcpListener::bind(&bind_addr)
-            .await
-            .map_err(|e| anyhow::anyhow!("error binding to {}: {}", bind_addr, e))?;
-        match &listener_cfg.name {
-            Some(name) => {
-                tracing::info!(
-                    listener = %name,
-                    address = %listener_cfg.listen_address,
-                    port = listener_cfg.listen_port,
-                    "listening for clients"
-                );
-                if listener_cfg.expected_chain_id.is_none() {
-                    tracing::warn!(
-                        listener = %name,
-                        port = listener_cfg.listen_port,
-                        "listener has no pinned chain_id; first online upstream will establish the pool chain_id (set chain_id in config to prevent cross-chain misconfiguration)"
-                    );
-                }
-            }
-            None => {
-                tracing::info!(
-                    address = %listener_cfg.listen_address,
-                    port = listener_cfg.listen_port,
-                    "listening for clients"
-                );
-            }
-        }
-        // The listener's chain API, bound with the SHiP listeners.
-        let chain_api = match chain_api {
-            Some(api) => {
-                let api_listener = TcpListener::bind(&api.bind).await.map_err(|e| {
-                    anyhow::anyhow!("error binding the chain API to {}: {}", api.bind, e)
-                })?;
-                tracing::info!(
-                    listener = listener_cfg.name.as_deref().unwrap_or("default"),
-                    address = %api.bind,
-                    upstreams = api.upstreams.len(),
-                    "chain API listening"
-                );
-                Some((api, api_listener))
-            }
-            None => None,
-        };
-        bound_listeners.push((listener_cfg, tcp_listener, chain_api));
-    }
-
-    // Graceful-shutdown broadcast: every long-lived task subscribes.
-    let (shutdown_tx, _) = broadcast::channel::<()>(64);
-
-    let mut health_states = Vec::with_capacity(bound_listeners.len());
-    let mut listener_contexts = Vec::with_capacity(bound_listeners.len());
-    let mut conn_limits = Vec::with_capacity(bound_listeners.len());
-    let mut accept_handles = Vec::with_capacity(bound_listeners.len());
-    let mut chain_apis = Vec::new();
-
-    for (listener_cfg, tcp_listener, chain_api) in bound_listeners {
-        let server_config_db: ServerConfigDb = build_config_db(listener_cfg.servers.clone());
-        let server_state_db: ServerStateDb = build_state_db_with_chain_id(
-            listener_cfg.servers.clone(),
-            listener_cfg.expected_chain_id,
-            listener_cfg.require_chain_id,
-        );
-        // The listener's fleet view: monitors publish into it, the metrics
-        // endpoint reads it.
-        let hub = FleetHub::new(
-            &listener_cfg,
-            server_state_db.clone(),
-            server_config_db.clone(),
-        );
-
-        // The listener's chain API, served further down; readiness, coverage
-        // and metrics read it.
-        let chain_api = chain_api.map(|(api, api_listener)| {
-            let api_ctx = chain_api::ChainApiCtx::new(
-                &api,
-                hub.clone(),
-                Duration::from_millis(limits.connect_timeout_ms),
-                limits.handshake_timeout_ms,
-                config.live_lag_blocks,
-            );
-            (api_ctx, api_listener)
-        });
-
-        let health_state = health::ListenerHealthState {
-            name: listener_cfg.name.clone(),
-            state_db: server_state_db.clone(),
-            hub: Some(hub.clone()),
-            chain_api: chain_api.as_ref().map(|(api_ctx, _)| api_ctx.clone()),
-        };
-        let listener_stats = Arc::new(telemetry::ListenerStats::default());
-        listener_contexts.push(api::ListenerContext {
-            health: health_state.clone(),
-            config_db: server_config_db.clone(),
-            order: listener_cfg
-                .servers
-                .iter()
-                .filter(|s| s.enabled)
-                .map(|s| s.endpoint.clone())
-                .collect(),
-            port: listener_cfg.listen_port,
-            chain_id: listener_cfg.expected_chain_id,
-            max_connections: listener_cfg.max_connections,
-            stats: listener_stats.clone(),
-        });
-        health_states.push(health_state);
-
-        // Per-upstream monitoring loops for this listener's pool.
-        for server in listener_cfg.servers.iter().filter(|s| s.enabled).cloned() {
-            match &listener_cfg.name {
-                Some(listener_name) => {
-                    tracing::info!(
-                        listener = %listener_name,
-                        name = %server.name,
-                        upstream = %server.endpoint,
-                        "starting upstream monitor"
-                    );
-                }
-                None => {
-                    tracing::info!(
-                        name = %server.name,
-                        upstream = %server.endpoint,
-                        "starting upstream monitor"
-                    );
-                }
-            }
-            spawn(monitoring_connection(
-                server,
-                static_config.clone(),
-                hub.clone(),
-                shutdown_tx.subscribe(),
-            ));
-        }
-
-        // What every client session of this listener shares.
-        let ctx = ListenerCtx::new(&listener_cfg, limits, config.live_lag_blocks, hub.clone());
-
-        // The chain API: its probes and its accept loop. Its connections
-        // drain with the SHiP ones. `chain_apis` lines up with the
-        // listeners.
-        let api_ctx = chain_api.map(|(api_ctx, api_listener)| {
-            conn_limits.push((api_ctx.connections.clone(), api_ctx.max_connections()));
-            accept_handles.push(api_ctx.spawn(api_listener, &shutdown_tx));
-            api_ctx
-        });
-        chain_apis.push(api_ctx);
-
-        // Periodic block-progress / staleness monitor for this listener's pool.
-        spawn(state_monitoring_loop(
-            hub,
-            static_config.upstream_monitoring_ms,
-            shutdown_tx.subscribe(),
-        ));
-
-        // Connection backpressure: at most `max_connections` concurrent clients on this listener.
-        let conn_limit = Arc::new(Semaphore::new(listener_cfg.max_connections));
-        let max_connections = listener_cfg.max_connections;
-        conn_limits.push((conn_limit.clone(), max_connections));
-
-        let listener_name = listener_cfg.name.clone();
-        let listener_shutdown_tx = shutdown_tx.clone();
-        let mut accept_shutdown_rx = shutdown_tx.subscribe();
-
-        accept_handles.push(spawn(async move {
-            loop {
-                tokio::select! {
-                    result = tcp_listener.accept() => {
-                        let (client_stream, client_addr) = match result {
-                            Ok(pair) => pair,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "error accepting incoming connection");
-                                continue;
-                            }
-                        };
-
-                        // Reject immediately when at capacity (backpressure, not queueing).
-                        let permit = match conn_limit.clone().try_acquire_owned() {
-                            Ok(p) => p,
-                            Err(_) => {
-                                listener_stats.rejected_total.fetch_add(1, Ordering::Relaxed);
-                                tracing::warn!(%client_addr, max = max_connections, "connection limit reached; rejecting");
-                                drop(client_stream);
-                                continue;
-                            }
-                        };
-
-                        listener_stats.accepted_total.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(%client_addr, "accepted tcp connection");
-
-                        let ctx = ctx.clone();
-                        let shutdown_rx = listener_shutdown_tx.subscribe();
-                        let span = match &listener_name {
-                            Some(name) => tracing::info_span!("client", listener = %name, addr = %client_addr),
-                            None => tracing::info_span!("client", addr = %client_addr),
-                        };
-
-                        spawn(
-                            async move {
-                                let _permit = permit; // released when this task ends
-                                handle_client(client_stream, client_addr, ctx, shutdown_rx).await;
-                            }
-                            .instrument(span),
-                        );
-                    }
-                    _ = accept_shutdown_rx.recv() => {
-                        break;
-                    }
-                }
-            }
-        }));
-    }
-
-    // Optional health/metrics HTTP endpoint, with the opt-in dashboard.
-    if let Some((host, port)) = config.resolved_metrics_host_port() {
-        let addr = format_bind_addr(&host, port);
-        if control_token.is_some() && !is_loopback_host(&host) {
-            tracing::warn!(
-                %addr,
-                "the control API is enabled on a non-loopback address; restrict access to this port"
-            );
-        }
-        let app = Arc::new(api::AppState {
-            listeners: listener_contexts,
-            health: health_states,
-            dashboard: config.dashboard.enabled,
-            control_token,
-            allowed_hosts: config
-                .dashboard
-                .allowed_hosts
-                .iter()
-                .map(|host| host.trim().to_ascii_lowercase())
-                .collect(),
-            streams: Arc::new(tokio::sync::Semaphore::new(api::MAX_STREAMS)),
-            dashboard_feed: Arc::default(),
-        });
-        if app.dashboard {
-            spawn(api::run_dashboard(app.clone(), shutdown_tx.subscribe()));
-        }
-        spawn(http::run_http_server(addr, app, shutdown_tx.subscribe()));
-    }
-    telemetry::global().emit(telemetry::Event::new(
-        telemetry::Level::Info,
-        telemetry::EventKind::Started,
-        format!("fleet-router {} started", env!("CARGO_PKG_VERSION")),
-    ));
-
+    let runtime = runtime::Runtime::start(path).await?;
     shutdown_signal().await;
-    tracing::info!(
-        chain_apis = chain_apis.iter().flatten().count(),
-        "shutdown signal received; draining connections"
-    );
-    let _ = shutdown_tx.send(());
-    for handle in accept_handles {
-        let _ = handle.await;
-    }
-    drain_connections(&conn_limits, config.shutdown_grace_ms).await;
-    tracing::info!("shutdown complete");
+    runtime.shutdown().await;
     Ok(())
 }
 
@@ -847,7 +555,9 @@ async fn run_tests(config: &ServerConfig, strict: bool) -> bool {
 
 /// What the command line asks for.
 enum Action {
-    Run,
+    Run {
+        path: PathBuf,
+    },
     /// `config test`; `strict` makes coverage problems fail the run.
     Test {
         strict: bool,
@@ -956,7 +666,12 @@ fn process_args() -> Result<Option<(Action, ServerConfig)>> {
         Err(e) => bail!("failed to parse configuration file: {}", e),
     };
 
-    Ok(Some((Action::Run, config)))
+    Ok(Some((
+        Action::Run {
+            path: config_path.canonicalize()?,
+        },
+        config,
+    )))
 }
 
 /// TCP liveness probe used by the container `HEALTHCHECK`.

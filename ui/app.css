@@ -1769,3 +1769,20 @@ main {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* Configuration uses the existing control and typography system. */
+.config-path { overflow-wrap: anywhere; margin: 0 0 1rem; }
+.config-note { color: var(--ink-2); max-width: 75ch; }
+.config-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 1.5rem 0 1rem; }
+.config-draft { color: var(--ink-2); margin-inline: auto 1rem; }
+.config-label { display: block; font-weight: 600; margin-bottom: 0.5rem; }
+#config-source { display: block; width: 100%; min-height: 24rem; height: 48vh; resize: vertical; padding: 1rem; font: 0.875rem/1.6 var(--mono); color: var(--ink); background: var(--inset); border: 1px solid var(--rule-strong); border-radius: var(--radius); tab-size: 2; caret-color: var(--accent); white-space: pre; overflow: auto; }
+#config-source[aria-invalid="true"] { border-color: var(--warn); }
+.config-warning, .config-feedback[data-state="error"] { color: var(--warn); }
+.config-feedback { min-height: 1.6em; max-width: 75ch; overflow-wrap: anywhere; }
+.config-drains { padding: 0; list-style: none; }
+.config-drains li { padding: 0.75rem 0; border-bottom: 1px solid var(--rule); }
+@media (max-width: 560px) {
+  .config-draft { flex-basis: 100%; order: 1; margin: 0.5rem 0 0; }
+  #config-source { min-height: 20rem; padding: 0.75rem; }
+}

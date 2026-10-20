@@ -166,6 +166,7 @@ const BLOCKLESS_RECHECK: Duration = Duration::from_secs(1);
 
 /// What every session of one listener shares.
 pub struct ListenerCtx {
+    pub config_generation: u64,
     /// `None` in single-listener mode.
     pub name: Option<Arc<str>>,
     /// The listener's name in the session registry and events: its name, or
@@ -186,13 +187,25 @@ pub struct ListenerCtx {
 }
 
 impl ListenerCtx {
+    #[cfg(test)]
     pub fn new(
         listener: &ResolvedListener,
         limits: ProxyLimits,
         live_lag_blocks: u32,
         hub: Arc<FleetHub>,
     ) -> Arc<Self> {
+        Self::with_generation(listener, limits, live_lag_blocks, hub, 0)
+    }
+
+    pub fn with_generation(
+        listener: &ResolvedListener,
+        limits: ProxyLimits,
+        live_lag_blocks: u32,
+        hub: Arc<FleetHub>,
+        config_generation: u64,
+    ) -> Arc<Self> {
         Arc::new(ListenerCtx {
+            config_generation,
             name: listener.name.as_deref().map(Arc::from),
             label: Arc::from(listener.name.as_deref().unwrap_or("default")),
             topology: listener.topology,
@@ -531,7 +544,12 @@ impl Session {
         let view_rx = ctx.hub.subscribe();
         let view = view_rx.borrow().clone();
         let now = Instant::now();
-        let registry = telemetry::global().register_session(ctx.label.clone(), client, "");
+        let registry = telemetry::global().register_generation(
+            ctx.label.clone(),
+            client,
+            "",
+            ctx.config_generation,
+        );
         Session {
             ctx,
             id,

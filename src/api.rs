@@ -30,7 +30,9 @@ mod dashboard;
 pub use dashboard::{run as run_dashboard, Feed};
 
 /// Everything the HTTP endpoint knows about one client listener.
+#[derive(Clone)]
 pub struct ListenerContext {
+    pub config_generation: u64,
     pub health: ListenerHealthState,
     pub config_db: ServerConfigDb,
     /// Enabled endpoints in config order, for stable display order.
@@ -69,6 +71,9 @@ impl ListenerContext {
 
 /// Shared state of the HTTP endpoint.
 pub struct AppState {
+    pub runtime: std::sync::Weak<crate::runtime::Runtime>,
+    pub config_revision: u64,
+    pub draining: Vec<ListenerContext>,
     pub listeners: Vec<ListenerContext>,
     pub health: Vec<ListenerHealthState>,
     pub dashboard: bool,
@@ -86,11 +91,43 @@ pub struct AppState {
 /// Concurrent SSE connections across both stream routes.
 pub const MAX_STREAMS: usize = 32;
 
+/// Long-lived HTTP connections and publishers resolve state without retaining
+/// a retired listener's upstream clients and configuration for their lifetime.
+pub struct StateHandle {
+    runtime: std::sync::Weak<crate::runtime::Runtime>,
+    fallback: Option<SharedState>,
+}
+
+impl StateHandle {
+    pub fn current(&self) -> Option<SharedState> {
+        self.runtime
+            .upgrade()
+            .map(|r| r.app())
+            .or_else(|| self.fallback.clone())
+    }
+}
+
 impl AppState {
+    pub fn handle(self: &Arc<Self>) -> StateHandle {
+        StateHandle {
+            runtime: self.runtime.clone(),
+            fallback: (self.runtime.strong_count() == 0).then(|| self.clone()),
+        }
+    }
+
+    pub fn current(self: &Arc<Self>) -> SharedState {
+        self.runtime
+            .upgrade()
+            .map_or_else(|| self.clone(), |r| r.app())
+    }
+
     /// An endpoint with health, readiness, coverage and metrics only.
     #[cfg(test)]
     pub fn health_only(health: Vec<ListenerHealthState>) -> SharedState {
         Arc::new(AppState {
+            runtime: Default::default(),
+            config_revision: 0,
+            draining: Vec::new(),
             listeners: Vec::new(),
             health,
             dashboard: false,
@@ -196,6 +233,7 @@ pub struct StatusView {
     pub control: ControlView,
     pub totals: TotalsView,
     pub listeners: Vec<ListenerView>,
+    pub config: crate::runtime::ConfigStatus,
 }
 
 /// One word for display. See the `status` table in `docs/api.md`.
@@ -312,23 +350,44 @@ async fn listener_view(ctx: &ListenerContext, now: Instant, sessions: usize) -> 
 pub async fn status_view(app: &AppState) -> StatusView {
     let mut counts = HashMap::new();
     for session in telemetry::global().sessions() {
-        *counts.entry(session.listener.to_string()).or_default() += 1;
+        *counts
+            .entry((session.listener.to_string(), session.config_generation))
+            .or_default() += 1;
     }
     status_with_session_counts(app, counts).await
 }
 
 async fn status_with_session_counts(
     app: &AppState,
-    mut counts: HashMap<String, usize>,
+    mut counts: HashMap<(String, u64), usize>,
 ) -> StatusView {
     let now = Instant::now();
     let mut listeners = Vec::with_capacity(app.listeners.len());
     for ctx in &app.listeners {
-        listeners.push(listener_view(ctx, now, counts.remove(ctx.name()).unwrap_or(0)).await);
+        listeners.push(
+            listener_view(
+                ctx,
+                now,
+                counts
+                    .remove(&(ctx.name().to_string(), ctx.config_generation))
+                    .unwrap_or(0),
+            )
+            .await,
+        );
     }
     let upstreams = listeners.iter().flat_map(|l| &l.upstreams);
     let totals = TotalsView {
-        sessions: listeners.iter().map(|l| l.sessions).sum(),
+        sessions: listeners.iter().map(|l| l.sessions).sum::<usize>()
+            + app
+                .draining
+                .iter()
+                .map(|ctx| {
+                    counts
+                        .get(&(ctx.name().to_string(), ctx.config_generation))
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .sum::<usize>(),
         upstreams: upstreams.clone().count(),
         upstreams_up: upstreams
             .filter(|u| u.online && !u.operator_disabled)
@@ -337,6 +396,7 @@ async fn status_with_session_counts(
     let telemetry = telemetry::global();
     let now_ms = telemetry::now_ms();
     StatusView {
+        config: crate::runtime::ConfigStatus::from_app(app, &counts),
         version: env!("CARGO_PKG_VERSION"),
         now_ms,
         started_ms: telemetry.started_ms,
@@ -353,6 +413,8 @@ async fn status_with_session_counts(
 struct SessionView {
     id: u64,
     listener: String,
+    config_generation: u64,
+    draining: bool,
     client: String,
     upstream: String,
     upstream_name: String,
@@ -373,7 +435,7 @@ struct SessionView {
 pub struct ApiError(StatusCode, String);
 
 impl ApiError {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         ApiError(status, message.into())
     }
 }
@@ -399,7 +461,7 @@ fn token_matches(expected: &str, given: &str) -> bool {
             == 0
 }
 
-fn authorize(app: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+pub(crate) fn authorize(app: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     let Some(expected) = &app.control_token else {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -455,10 +517,17 @@ async fn get_sessions(
 }
 
 async fn session_views(app: &AppState) -> Vec<SessionView> {
-    let mut names: HashMap<(String, String), String> = HashMap::new();
-    for ctx in &app.listeners {
+    let mut names: HashMap<(String, u64, String), String> = HashMap::new();
+    for ctx in app.listeners.iter().chain(&app.draining) {
         for (endpoint, cfg) in ctx.config_db.lock().await.iter() {
-            names.insert((ctx.name().to_string(), endpoint.clone()), cfg.name.clone());
+            names.insert(
+                (
+                    ctx.name().to_string(),
+                    ctx.config_generation,
+                    endpoint.clone(),
+                ),
+                cfg.name.clone(),
+            );
         }
     }
     telemetry::global()
@@ -467,11 +536,19 @@ async fn session_views(app: &AppState) -> Vec<SessionView> {
         .map(|s| {
             let upstream = s.upstream();
             let upstream_name = names
-                .get(&(s.listener.to_string(), upstream.clone()))
+                .get(&(
+                    s.listener.to_string(),
+                    s.config_generation,
+                    upstream.clone(),
+                ))
                 .cloned()
                 .unwrap_or_default();
             SessionView {
                 id: s.id,
+                config_generation: s.config_generation,
+                draining: app.draining.iter().any(|ctx| {
+                    ctx.config_generation == s.config_generation && ctx.name() == &*s.listener
+                }),
                 listener: s.listener.to_string(),
                 client: s.client.to_string(),
                 upstream,
@@ -510,6 +587,7 @@ async fn get_events(Query(query): Query<EventsQuery>) -> Json<serde_json::Value>
 /// At most [`MAX_STREAMS`] at once; further requests get 503.
 async fn get_stream(
     State(app): State<SharedState>,
+    headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
     let Ok(permit) = app.streams.clone().try_acquire_owned() else {
         return Err(ApiError::new(
@@ -520,15 +598,16 @@ async fn get_stream(
     let events = telemetry::global().subscribe();
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let state = app.handle();
 
     // The permit lives in the stream state and is released when it drops.
     let stream = futures::stream::unfold(
-        (app, events, ticker, permit),
-        |(app, mut events, mut ticker, permit)| async move {
+        (state, events, ticker, permit, headers),
+        |(state, mut events, mut ticker, permit, headers)| async move {
             loop {
                 let next = tokio::select! {
                     _ = ticker.tick() => {
-                        SseEvent::default().event("snapshot").json_data(status_view(&app).await)
+                        SseEvent::default().event("snapshot").json_data(status_view(state.current()?.as_ref()).await)
                     }
                     received = events.recv() => match received {
                         Ok(event) => SseEvent::default().event("event").json_data(&event),
@@ -537,8 +616,11 @@ async fn get_stream(
                         Err(RecvError::Closed) => return None,
                     },
                 };
+                if !stream_allowed(state.current()?.as_ref(), &headers) {
+                    return None;
+                }
                 match next {
-                    Ok(sse) => return Some((Ok(sse), (app, events, ticker, permit))),
+                    Ok(sse) => return Some((Ok(sse), (state, events, ticker, permit, headers))),
                     Err(e) => {
                         tracing::debug!(error = %e, "failed to encode SSE payload");
                         continue;
@@ -552,6 +634,15 @@ async fn get_stream(
             .interval(Duration::from_secs(15))
             .text("keepalive"),
     ))
+}
+
+/// Open streams must obey access policy changes as well as new HTTP requests.
+fn stream_allowed(app: &AppState, headers: &HeaderMap) -> bool {
+    app.dashboard
+        && headers
+            .get(axum::http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .is_none_or(|host| crate::http::host_allowed(host, &app.allowed_hosts))
 }
 
 // ---------------------------------------------------------------------------
@@ -617,7 +708,10 @@ async fn update_upstream(
     let (mut movable, mut stranded) = (Vec::new(), 0usize);
     if matches!(action, Some(UpstreamAction::Drain)) {
         for session in telemetry::global().sessions() {
-            if &*session.listener == listener && session.upstream() == endpoint {
+            if &*session.listener == listener
+                && session.config_generation == ctx.config_generation
+                && session.upstream() == endpoint
+            {
                 if ctx.has_alternative_for(endpoint, session.next_block()) {
                     movable.push(session);
                 } else {
@@ -762,7 +856,15 @@ async fn session_action(
     let upstream = session.upstream();
     match action {
         SessionAction::Move => {
-            let ctx = find_listener(app, &session.listener)?;
+            let ctx = app
+                .listeners
+                .iter()
+                .chain(&app.draining)
+                .find(|ctx| {
+                    ctx.name() == &*session.listener
+                        && ctx.config_generation == session.config_generation
+                })
+                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "listener has drained"))?;
             let next_block = session.next_block();
             if !ctx.has_alternative_for(&upstream, next_block) {
                 return Err(ApiError::new(
@@ -830,6 +932,7 @@ pub fn router() -> Router<SharedState> {
         .route("/stream", get(get_stream))
         .route("/dashboard/stream", get(dashboard::get_stream))
         .route("/auth", get(get_auth))
+        .merge(crate::runtime::routes())
         .route(upstream, axum::routing::patch(patch_upstream))
         .route(&format!("{upstream}/disable"), post(post_disable))
         .route(&format!("{upstream}/drain"), post(post_drain))
@@ -956,6 +1059,7 @@ mod tests {
             build_config_db(servers.clone()),
         );
         let ctx = ListenerContext {
+            config_generation: 0,
             health: ListenerHealthState {
                 name: None,
                 state_db: hub.state.clone(),
@@ -1013,6 +1117,7 @@ mod tests {
                 .store(1, Ordering::Relaxed);
         }
         let ctx = ListenerContext {
+            config_generation: 0,
             health: ListenerHealthState {
                 name: Some("slot-count".to_string()),
                 state_db,

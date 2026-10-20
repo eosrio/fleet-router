@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Configuration reload and JSON editing in the dashboard. Authenticated API
+  endpoints validate drafts, apply external file edits, or atomically save and
+  apply changes, with runtime and file revision checks. Listener and upstream
+  topology, chain API ports and dashboard settings can change without restarting.
+  Established connections retain their previous configuration and failover pool
+  until they close; pending drains appear in Configuration and Sessions.
+
 ### Changed
 
 - The dashboard now reads status, sessions, events and chart samples through one

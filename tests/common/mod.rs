@@ -44,7 +44,7 @@ pub struct RouterProcess {
     /// Every listener's port, in config order.
     pub listener_ports: Vec<u16>,
     pub metrics_port: Option<u16>,
-    _cfg: NamedTempFile,
+    _cfg: tempfile::TempPath,
 }
 
 impl RouterProcess {
@@ -95,7 +95,7 @@ impl RouterProcess {
                 listen_port: listener_ports[0],
                 listener_ports,
                 metrics_port,
-                _cfg: file,
+                _cfg: file.into_temp_path(),
             };
             match router.wait_ready().await {
                 Ok(()) => return router,

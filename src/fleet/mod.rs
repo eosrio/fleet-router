@@ -454,7 +454,7 @@ impl FleetHub {
         let statics: Vec<UpstreamStatic> = resolved
             .servers
             .iter()
-            .filter(|s| s.enabled)
+            .filter(|s| s.enabled && s.has_ship_endpoint())
             .map(|s| UpstreamStatic {
                 endpoint: Arc::from(s.endpoint.as_str()),
                 name: Arc::from(s.name.as_str()),

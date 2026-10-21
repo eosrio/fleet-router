@@ -56,7 +56,8 @@ All `*_ms` fields are in **milliseconds**.
 - **`listeners`** *(array, required in multi-listener mode, `≥ 1` entry)* — Named ingress listeners mapping distinct ports to isolated SHiP pools (see [Multiple networks](#multiple-networks)).
 - **`topology`** *(string, optional, default `"auto"`)* — How the listener presents its upstreams. See [Topology and stitching](#topology-and-stitching). Cannot be combined with `listeners`; set it on each listener instead.
 - **`stitching`** *(object, optional)* — Session policy of a stitched listener. See [Topology and stitching](#topology-and-stitching). Cannot be combined with `listeners`; set it on each listener instead.
-- **`chain_api`** *(object, optional, off when omitted)* — An HTTP chain API port in front of the listener's servers. See [Chain API](#chain-api). Cannot be combined with `listeners`; set it on each listener instead.
+- **`chain_api`** *(object, optional, off when omitted)* — An HTTP/HTTPS chain API port in front of the listener's servers. See [Chain API](#chain-api). Cannot be combined with `listeners`; set it on each listener instead.
+- **`tls`** *(object, optional, off when omitted)* — Client-facing TLS termination (`wss://` on the SHiP listener, and inherited as `https://` by `chain_api` unless overridden by `chain_api.tls`). See [Client TLS termination](#client-tls-termination).
 
 ### Polling intervals
 
@@ -124,14 +125,14 @@ Read endpoints and the dashboard need no token, and they show client IP addresse
 Each entry in `servers` is an object:
 
 - **`name`** *(string, required)* — Human-readable name used in logs and as the `server` label on each `/metrics` series for this upstream.
-- **`endpoint`** *(string, required)* — Upstream as `host:port`, `ws://host:port`, or `wss://host:port`. A bare `host:port` is dialed as `ws://`. Endpoints must be unique within a listener's pool.
+- **`endpoint`** *(string, required unless `role: "live"` has `api_endpoint`)* — Upstream as `host:port`, `ws://host:port`, or `wss://host:port`. A bare `host:port` is dialed as `ws://`. Endpoints must be unique within a listener's pool. May be omitted on a live server that only serves the HTTP chain API via `api_endpoint`.
 - **`enabled`** *(bool, required)* — Whether the router may use this upstream. At least one enabled server is required.
 - **`priority`** *(u32, optional, default `0`)* — Preference tier. Lower is preferred. See [Upstream preference](#upstream-preference).
 - **`weight`** *(u32, optional, default `1`, `≥ 1`)* — Relative share of sessions within the same priority tier. See [Upstream preference](#upstream-preference).
 - **`role`** *(string, optional, default `"live"`, one of `"live"`, `"frozen"`)* — `"live"` is a node at the chain head. `"frozen"` is a frozen range server: an archive upstream that serves a fixed block range from archived logs and never advances. An enabled frozen server makes its listener stitched (see [Topology and stitching](#topology-and-stitching)). The role is never inferred, because a stuck live node looks like a frozen one. When a live upstream stops advancing with its head, LIB and last block equal, the router only logs a hint to set the role.
 - **`range`** *(object, optional, `role: "frozen"` only)* — The frozen server's coverage, `{"begin": n, "end": m}` with `end` exclusive and `1 ≤ begin < end`. It stands in for the reported ranges until the server first reports them, and while it is down, so a listener can answer status at startup and its coverage does not shrink when an archive restarts. A reported trace or chain-state range that differs from it is logged once and exported as `fleet_router_upstream_range_mismatch`. A log that starts at block 2 when `begin` is 1, or ends one block before `end` while the other log reaches `end`, is not a mismatch.
 - **`max_sessions`** *(u32, optional, `> 0`, no limit when omitted)* — Most connections the router's sessions hold to this upstream at once: session links, pre-dialed standby links and dials in progress. The upstream monitor's connection is not counted. A full upstream is skipped. Set it at or below a frozen range server's own session limit, so sessions wait in the router instead of being refused.
-- **`api_endpoint`** *(string, optional)* — The server's HTTP chain API, as `http://host[:port]` (port 80 by default) or `host:port`. For a live server, its nodeos `http-server-address`; for a frozen range server, its chain API address. Used only by a listener with [`chain_api`](#chain-api), and ignored with a warning otherwise. `https://` is rejected (not supported yet), and so are a path (a trailing `/` is allowed), a query, a fragment, user info, port `0` and a port that does not parse. It must be unique among the listener's enabled servers; hosts are compared without case. The host is sent as written in the `Host` header, which nodeos checks by default.
+- **`api_endpoint`** *(string, optional; alias `http_endpoint`)* — The server's HTTP chain API, as `http://host[:port]` (port 80 by default) or `host:port`. For a live server, its nodeos `http-server-address`; for a frozen range server, its chain API address. Used only by a listener with [`chain_api`](#chain-api), and ignored with a warning otherwise. `https://` is rejected (not supported yet), and so are a path (a trailing `/` is allowed), a query, a fragment, user info, port `0` and a port that does not parse. It must be unique among the listener's enabled servers; hosts are compared without case. The host is sent as written in the `Host` header, which nodeos checks by default.
 
 Uniqueness is the dial target: `127.0.0.1:8080` and `ws://127.0.0.1:8080` are the same upstream, and so are `ws://host` and `ws://host:80`. `ws://` and `wss://` to the same host are different. Unknown schemes (`https://`, `http://`, …) are rejected.
 
@@ -263,6 +264,7 @@ Set it on each listener, or at the top level in single-port mode. An older fleet
     - **`allow_headers`** *(string, optional)* — `Access-Control-Allow-Headers`. Not empty, and a valid header value.
     - **`max_age`** *(u32, optional)* — `Access-Control-Max-Age`, in seconds.
     - **`allow_credentials`** *(bool, default `false`)* — Also send `Access-Control-Allow-Credentials: true`.
+  - **`tls`** *(object, optional)* — Client-facing TLS termination (`https://`) for this chain API port. When omitted, inherits the listener's or top-level `tls` config if set. See [Client TLS termination](#client-tls-termination).
 
 A `chain_api` needs at least one enabled server with `api_endpoint`. Three more settings apply to it: `handshake_timeout_ms` bounds a client's request head and body (10 s when `0`) and closes idle keep-alive connections; `live_lag_blocks` drops laggards from state calls; and an upstream connect is bounded like a session's upstream connect.
 
@@ -280,7 +282,29 @@ These are warnings, logged at startup and printed by `config test`:
 
 `wss://` is dialed with rustls (not OpenSSL). The router verifies the upstream certificate against the operating-system trust store. The published container image installs CA certificates, so public CAs work there. For a private CA, install it into that store, or set `SSL_CERT_FILE` / `SSL_CERT_DIR` to PEM certificates. When either variable is set, those paths replace the OS store.
 
-The client-facing listener stays plaintext `ws://`. Put TLS for clients on a reverse proxy in front of fleet-router (see [Security](operations.md#security)).
+## Client TLS termination
+
+Client-facing listeners default to plaintext (`ws://` for SHiP and `http://` for `chain_api`). Set `tls` at the top level, on a listener in `listeners`, or on `chain_api` to terminate TLS directly in `fleet-router` (`wss://` and `https://`) using `tokio-rustls`:
+
+```json
+"tls": {
+  "cert_file": "/etc/fleet-router/tls/fullchain.pem",
+  "key_file": "/etc/fleet-router/tls/privkey.pem",
+  "sni": [
+    {
+      "server_names": ["api.wax.example.com", "*.wax.example.com"],
+      "cert_file": "/etc/fleet-router/tls/wax-fullchain.pem",
+      "key_file": "/etc/fleet-router/tls/wax-privkey.pem"
+    }
+  ]
+}
+```
+
+- **`cert_file`** *(string, required)* — Path to a PEM certificate chain (leaf certificate first, followed by any intermediates).
+- **`key_file`** *(string, required)* — Path to a PEM private key (PKCS#8, PKCS#1 RSA, or SEC1 EC).
+- **`sni`** *(array of objects, optional)* — Additional certificate/key pairs selected by the client's TLS Server Name Indication (SNI). Each entry has `server_names` (exact hostnames or single-label wildcards such as `*.wax.example.com`), `cert_file`, and `key_file`. Connections whose SNI does not match any entry (or that omit SNI) receive the default `cert_file` / `key_file`.
+
+All configured PEM files are validated at startup (and by `fleet-router config test`) and monitored every 5 seconds in the background. When a certificate or private key file is renewed on disk, `fleet-router` atomically reloads it without dropping active connections. Each certificate/key pair reloads independently: if one fails (for example while a renewal script is mid-write), its previous valid certificate stays active and a warning is logged, while valid renewals for other domains still take effect. Failed pairs are retried on the next poll.
 
 ## Client message limits
 

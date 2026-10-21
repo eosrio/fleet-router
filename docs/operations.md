@@ -147,13 +147,13 @@ The flag covers the whole archive and is kept per listener: an archive with a pa
 
 > **Do not expose `fleet-router` directly to the public internet.**
 
-- The client listener is **plaintext `ws://`** and **unauthenticated**. Anyone who can reach the port can stream data.
+- The client listener is **unauthenticated** and defaults to plaintext `ws://`. Configure [client TLS termination](configuration.md#client-tls-termination) for `wss://`. Anyone who can reach the port can stream data, including when TLS is enabled.
 - Upstream connections default to plaintext `ws://`. Set `endpoint` to `wss://host:port` to dial that node with TLS; the certificate is verified with rustls against the OS trust store (see [Upstream TLS](configuration.md#upstream-tls-wss)).
 - `rs_abieos` (pure Rust) parses untrusted upstream data; treat your upstreams as part of the trust boundary.
-- The optional [chain API](chain-api.md) port is **plaintext HTTP** and **unauthenticated**, like a nodeos HTTP port. It serves read-only calls by default. With `"push"` in `chain_api.allow`, anyone who can reach it can relay transactions through your live nodes, and `"exec"` lets them run read-only transactions on them. The router warns at startup when push is allowed or the port listens on every interface.
+- The optional [chain API](chain-api.md) port is **unauthenticated**, like a nodeos HTTP port. It defaults to plaintext HTTP; an effective `tls` configuration enables HTTPS. It serves read-only calls by default. With `"push"` in `chain_api.allow`, anyone who can reach it can relay transactions through your live nodes, and `"exec"` lets them run read-only transactions on them. The router warns at startup when push is allowed or the port listens on every interface.
 - Upstream chain APIs (`api_endpoint`) are dialed over plain `http://`, with no authentication. Keep them on a private network.
 
-Deploy on a trusted or internal network, and/or behind a TLS-terminating reverse proxy (nginx, Caddy, Envoy) that adds access control.
+Deploy on a trusted or internal network, and/or behind a reverse proxy (nginx, Caddy, Envoy) that adds access control. Terminate TLS in fleet-router or at the reverse proxy for encrypted client connections; TLS alone does not add access control.
 
 The optional [dashboard](api.md) is off by default. When you enable it, it is served on `metrics_port` with no login for reading, and it shows client IP addresses. Its control actions need a bearer token. Keep `metrics_address` on a private interface (for example `127.0.0.1` behind an SSH tunnel or an authenticating reverse proxy).
 

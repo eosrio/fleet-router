@@ -129,7 +129,7 @@ fleet-router --help                 Print help.
 
 ## Security
 
-The client listener is **plaintext `ws://` and unauthenticated**, and so is the optional chain API port (plain HTTP). Run fleet-router on a trusted network or behind a TLS-terminating reverse proxy that adds access control. **Do not expose it directly to the public internet.** See [Security](docs/operations.md#security) for details.
+The client listener and optional chain API port are **unauthenticated**. They default to plaintext `ws://` and HTTP; configure [client TLS termination](docs/configuration.md#client-tls-termination) for `wss://` and HTTPS. TLS encrypts connections but does not add access control. Run fleet-router on a trusted network or behind a reverse proxy that adds access control. **Do not expose it directly to the public internet.** See [Security](docs/operations.md#security) for details.
 
 To report a vulnerability, follow [SECURITY.md](SECURITY.md). Please do not open public issues for security reports.
 

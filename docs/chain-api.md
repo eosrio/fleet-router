@@ -21,8 +21,8 @@ The port is off unless the listener has [`chain_api`](configuration.md#chain-api
 
 ## Setup
 
-1. Give each server its HTTP API address as [`api_endpoint`](configuration.md#upstream-servers): a live server's nodeos `http-server-address`, a frozen range server's chain API address.
-2. Add `chain_api` to the listener:
+1. Give each server its HTTP API address as [`api_endpoint`](configuration.md#upstream-servers) (or `http_endpoint`): a live server's nodeos `http-server-address`, a frozen range server's chain API address. A live server that only serves HTTP RPC may omit `endpoint` when `api_endpoint` is set.
+2. Add `chain_api` to the listener (and optionally [`tls`](configuration.md#client-tls-termination) for `https://`):
 
 ```json
 "chain_api": { "listen_port": 18888, "listen_address": "10.0.0.5" },

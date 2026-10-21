@@ -1,10 +1,9 @@
 //! JSON API behind the dashboard: status views, sessions, history, events, the
-//! live SSE stream, the control actions, and the once-per-second sampler that
-//! feeds history and upstream state-change events.
+//! push streams, control actions, and the shared dashboard publisher.
 //!
 //! See `docs/api.md` for the contract.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -19,13 +18,16 @@ use axum::{Json, Router};
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{broadcast, Semaphore};
+use tokio::sync::Semaphore;
 
 use crate::fleet::planner::can_take_over;
 use crate::health::ListenerHealthState;
 use crate::models::{Server, ServerConfigDb, ServerState};
 use crate::tasks::hex_32;
-use crate::telemetry::{self, Event, EventKind, Level, ListenerStats, Sample, UpstreamSample};
+use crate::telemetry::{self, Event, EventKind, Level, ListenerStats};
+
+mod dashboard;
+pub use dashboard::{run as run_dashboard, Feed};
 
 /// Everything the HTTP endpoint knows about one client listener.
 pub struct ListenerContext {
@@ -74,12 +76,14 @@ pub struct AppState {
     /// Extra `Host` names the dashboard answers to, lowercased. IP literals
     /// and `localhost` are always accepted.
     pub allowed_hosts: Vec<String>,
-    /// Open `/api/v1/stream` connections. Bounded well below the HTTP
+    /// Open dashboard and compatibility stream connections. Bounded well below the HTTP
     /// connection cap so streams cannot starve health and readiness probes.
     pub streams: Arc<Semaphore>,
+    /// One publisher shared by all dashboard viewers.
+    pub dashboard_feed: Arc<Feed>,
 }
 
-/// Concurrent `/api/v1/stream` connections.
+/// Concurrent SSE connections across both stream routes.
 pub const MAX_STREAMS: usize = 32;
 
 impl AppState {
@@ -93,6 +97,7 @@ impl AppState {
             control_token: None,
             allowed_hosts: Vec::new(),
             streams: Arc::new(Semaphore::new(MAX_STREAMS)),
+            dashboard_feed: Arc::default(),
         })
     }
 }
@@ -270,7 +275,7 @@ fn upstream_view(
     }
 }
 
-async fn listener_view(ctx: &ListenerContext, now: Instant) -> ListenerView {
+async fn listener_view(ctx: &ListenerContext, now: Instant, sessions: usize) -> ListenerView {
     let configs = ctx.config_db.lock().await.clone();
     let mut db = ctx.health.state_db.lock().await;
     let mut upstreams = Vec::with_capacity(db.len());
@@ -297,11 +302,7 @@ async fn listener_view(ctx: &ListenerContext, now: Instant) -> ListenerView {
         // Client sessions, as `max_connections` counts them. An upstream's
         // `sessions` are its connection slots: a stitched session can hold
         // two (a standby link, a pre-dial) or none (holding, waiting).
-        sessions: telemetry::global()
-            .sessions()
-            .iter()
-            .filter(|session| &*session.listener == ctx.name())
-            .count(),
+        sessions,
         accepted_total: ctx.stats.accepted_total.load(Ordering::Relaxed),
         rejected_total: ctx.stats.rejected_total.load(Ordering::Relaxed),
         upstreams,
@@ -309,10 +310,21 @@ async fn listener_view(ctx: &ListenerContext, now: Instant) -> ListenerView {
 }
 
 pub async fn status_view(app: &AppState) -> StatusView {
+    let mut counts = HashMap::new();
+    for session in telemetry::global().sessions() {
+        *counts.entry(session.listener.to_string()).or_default() += 1;
+    }
+    status_with_session_counts(app, counts).await
+}
+
+async fn status_with_session_counts(
+    app: &AppState,
+    mut counts: HashMap<String, usize>,
+) -> StatusView {
     let now = Instant::now();
     let mut listeners = Vec::with_capacity(app.listeners.len());
     for ctx in &app.listeners {
-        listeners.push(listener_view(ctx, now).await);
+        listeners.push(listener_view(ctx, now, counts.remove(ctx.name()).unwrap_or(0)).await);
     }
     let upstreams = listeners.iter().flat_map(|l| &l.upstreams);
     let totals = TotalsView {
@@ -433,16 +445,25 @@ async fn get_sessions(
     State(app): State<SharedState>,
     Query(query): Query<SessionsQuery>,
 ) -> Json<serde_json::Value> {
+    let sessions: Vec<_> = session_views(&app)
+        .await
+        .into_iter()
+        .filter(|s| query.listener.as_deref().is_none_or(|l| s.listener == l))
+        .filter(|s| query.upstream.as_deref().is_none_or(|u| s.upstream == u))
+        .collect();
+    Json(serde_json::json!({ "sessions": sessions }))
+}
+
+async fn session_views(app: &AppState) -> Vec<SessionView> {
     let mut names: HashMap<(String, String), String> = HashMap::new();
     for ctx in &app.listeners {
         for (endpoint, cfg) in ctx.config_db.lock().await.iter() {
             names.insert((ctx.name().to_string(), endpoint.clone()), cfg.name.clone());
         }
     }
-    let sessions: Vec<SessionView> = telemetry::global()
+    telemetry::global()
         .sessions()
         .into_iter()
-        .filter(|s| query.listener.as_deref().is_none_or(|l| &*s.listener == l))
         .map(|s| {
             let upstream = s.upstream();
             let upstream_name = names
@@ -464,9 +485,7 @@ async fn get_sessions(
                 failovers: s.failovers(),
             }
         })
-        .filter(|s| query.upstream.as_deref().is_none_or(|u| s.upstream == u))
-        .collect();
-    Json(serde_json::json!({ "sessions": sessions }))
+        .collect()
 }
 
 async fn get_history() -> Json<serde_json::Value> {
@@ -614,6 +633,7 @@ async fn update_upstream(
         ));
     };
     let name = state.name.clone();
+    let _change = telemetry::global().begin_change();
     let message = match action {
         Some(UpstreamAction::Disable) => {
             state.operator_disabled = true;
@@ -676,8 +696,8 @@ async fn update_upstream(
     let view = upstream_view(listener, endpoint, state, config.as_ref(), Instant::now());
     // Sessions plan with the new settings from the next view on.
     ctx.publish(&db);
-    drop(db);
     audit(listener, Some(endpoint), None, message);
+    drop(db);
     Ok(view)
 }
 
@@ -732,6 +752,7 @@ async fn session_action(
     id: u64,
     action: SessionAction,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let _change = telemetry::global().begin_change();
     let Some(session) = telemetry::global().session(id) else {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -807,6 +828,7 @@ pub fn router() -> Router<SharedState> {
         .route("/history", get(get_history))
         .route("/events", get(get_events))
         .route("/stream", get(get_stream))
+        .route("/dashboard/stream", get(dashboard::get_stream))
         .route("/auth", get(get_auth))
         .route(upstream, axum::routing::patch(patch_upstream))
         .route(&format!("{upstream}/disable"), post(post_disable))
@@ -820,54 +842,6 @@ pub fn router() -> Router<SharedState> {
         .route("/sessions/{id}/move", post(post_session_move))
         .route("/sessions/{id}/close", post(post_session_close))
         .fallback(api_not_found)
-}
-
-// ---------------------------------------------------------------------------
-// Sampler
-// ---------------------------------------------------------------------------
-
-/// Record one history sample per second and turn upstream state changes into
-/// events. Runs only when the dashboard is enabled.
-pub async fn run_sampler(app: SharedState, mut shutdown: broadcast::Receiver<()>) {
-    let telemetry = telemetry::global();
-    let mut previous: HashMap<String, &'static str> = HashMap::new();
-    let mut ticker = tokio::time::interval(Duration::from_secs(1));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            _ = shutdown.recv() => break,
-            _ = ticker.tick() => {}
-        }
-        let now = Instant::now();
-        let mut upstreams = BTreeMap::new();
-        for ctx in &app.listeners {
-            let listener = ctx.name();
-            let mut db = ctx.health.state_db.lock().await;
-            for (endpoint, state) in db.iter_mut() {
-                let status = upstream_status(state, now);
-                let key = format!("{listener}|{endpoint}");
-                if let Some(before) = previous.insert(key.clone(), status) {
-                    if let Some(event) = transition_event(&state.name, before, status) {
-                        telemetry.emit(event.listener(listener).upstream(endpoint));
-                    }
-                }
-                upstreams.insert(
-                    key,
-                    UpstreamSample {
-                        sessions: state.connections.load(Ordering::Relaxed),
-                        head_block: head_block(state),
-                        blocks_total: state.counters.blocks_total.load(Ordering::Relaxed),
-                        bytes_total: state.counters.bytes_total.load(Ordering::Relaxed),
-                        status,
-                    },
-                );
-            }
-        }
-        telemetry.record_sample(Sample {
-            t_ms: telemetry::now_ms(),
-            upstreams,
-        });
-    }
 }
 
 /// The event for a status change, if it is one worth reporting. Operator
@@ -1004,9 +978,9 @@ mod tests {
             }
         };
         set_online(archive).await;
-        assert!(!listener_view(&ctx, Instant::now()).await.ready);
+        assert!(!listener_view(&ctx, Instant::now(), 0).await.ready);
         set_online(live).await;
-        assert!(listener_view(&ctx, Instant::now()).await.ready);
+        assert!(listener_view(&ctx, Instant::now(), 0).await.ready);
     }
 
     /// A listener's session count is its client sessions, not the slots its
@@ -1059,7 +1033,10 @@ mod tests {
             client,
             "127.0.0.1:18083",
         );
-        let view = listener_view(&ctx, Instant::now()).await;
+        let mut app = AppState::health_only(Vec::new());
+        Arc::get_mut(&mut app).unwrap().listeners.push(ctx);
+        let status = status_view(&app).await;
+        let view = &status.listeners[0];
         assert_eq!(view.sessions, 1);
         assert_eq!(
             view.upstreams
@@ -1069,7 +1046,7 @@ mod tests {
             [1, 1]
         );
         drop(session);
-        assert_eq!(listener_view(&ctx, Instant::now()).await.sessions, 0);
+        assert_eq!(status_view(&app).await.listeners[0].sessions, 0);
     }
 
     #[test]

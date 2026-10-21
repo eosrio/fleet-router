@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Client-facing TLS termination (`tls` at the top level, per listener, or on `chain_api`) for both SHiP WebSocket listeners (`wss://`) and the `/v1/chain/*` HTTP chain API (`https://`). Supports PEM certificate chains (`cert_file`) and PKCS#8/PKCS#1/SEC1 private keys (`key_file`), multi-domain SNI (`sni: [{ server_names, cert_file, key_file }]`) with exact and `*.domain` wildcard matching, and automatic zero-downtime certificate hot-reload when files change on disk.
 - HTTP-only live upstream support for `chain_api`: live servers (`role: "live"`) may omit `endpoint` when `api_endpoint` (or its alias `http_endpoint`) is set, allowing dedicated `/v1/chain/*` RPC nodes without a SHiP socket to participate in `get_info` polling, state reads, block lookups, and transaction pushes.
 
+### Changed
+
+- The dashboard now reads status, sessions, events and chart samples through one
+  revisioned push stream. It no longer polls sessions or fetches history and
+  event backfill separately. All panels apply each revision together; reconnects
+  and slow clients receive a complete resync. One shared publisher coalesces
+  lifecycle updates and samples counters once per second. Existing REST read
+  endpoints and the original SSE stream remain available for API consumers.
+
 ### Fixed
 
 - An invalid or missing TLS certificate/key file no longer blocks valid renewals for other domains on the same listener. Failed pairs retain their previous certificate and retry on the next poll.

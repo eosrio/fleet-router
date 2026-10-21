@@ -1,6 +1,6 @@
 // Dashboard entry point: theme, view routing, live stream, and wiring.
 
-import { api, openStream } from "./api.js";
+import { openStream } from "./api.js";
 import {
   controlMode,
   initControls,
@@ -9,15 +9,14 @@ import {
   sessionAction,
   syncControlState,
 } from "./controls.js";
-import { initEvents, markEventsSeen, renderAll, renderRecent, syncEventListenerOptions, updateBadge } from "./events.js";
+import { initEvents, resetEventsSeen, markEventsSeen, renderAll, renderRecent, syncEventListenerOptions, updateBadge } from "./events.js";
 import { initFleet, renderFleet, setControlMode } from "./fleet.js";
-import { initSessions, refreshSessions, setSessionsActive, setSessionsControlMode, syncSessionFilters } from "./sessions.js";
-import { addEvents, ingestHistory, ingestStatus, on, store } from "./store.js";
+import { initSessions, renderSessions, setSessionsActive, setSessionsControlMode, syncSessionFilters } from "./sessions.js";
+import { applyDashboardFrame, on, store } from "./store.js";
 import { announce, duration, setText, storageSet } from "./util.js";
 
 const VIEWS = ["fleet", "sessions", "events"];
 let view = "fleet";
-let hadStream = false;
 
 /* ---------- theme ---------- */
 
@@ -94,51 +93,31 @@ function setLinkState(state) {
   if (before === "reconnecting" && state === "live") announce("Live connection restored.");
 }
 
-async function backfillEvents() {
-  try {
-    const data = await api.events(store.lastEventId || undefined);
-    addEvents(data.events || []);
-  } catch {
-    /* the stream will deliver new events; the log just has a gap */
-  }
-}
-
 function startStream() {
-  openStream({
-    onState(state) {
-      setLinkState(state);
-      if (state === "live") {
-        if (hadStream) backfillEvents();
-        hadStream = true;
-      }
-    },
-    onSnapshot(status) {
-      ingestStatus(status);
-    },
-    onEvent(ev) {
-      addEvents([ev], { fresh: true });
-    },
-  });
+  openStream({ onState: setLinkState, onFrame: applyDashboardFrame });
 }
 
 on((kind, payload) => {
-  if (kind === "status") {
-    const status = payload;
+  if (kind === "dashboard") {
+    const status = store.status;
     syncControlState(status);
     renderFleet(status);
     syncSessionFilters(status);
+    renderSessions();
     syncEventListenerOptions(status.listeners.map((l) => l.name));
     refreshUpstreamDialog();
     setText(document.getElementById("meta-version"), `v${status.version}`);
     setText(document.getElementById("meta-uptime"), `up ${duration(status.uptime_secs)}`);
-  } else if (kind === "events") {
-    const fresh = new Set(payload.fresh ? payload.added.map((e) => e.id) : []);
-    renderRecent(fresh);
-    if (view === "events") {
-      renderAll(fresh);
-      markEventsSeen();
-    } else {
-      updateBadge();
+    if (payload.restarted) resetEventsSeen();
+    if (payload.reset || payload.added.length) {
+      const fresh = new Set(payload.fresh ? payload.added.map((e) => e.id) : []);
+      renderRecent(fresh);
+      if (view === "events") {
+        renderAll(fresh);
+        markEventsSeen();
+      } else {
+        updateBadge();
+      }
     }
     if (payload.fresh) {
       const loud = payload.added.filter((e) => e.level === "error" || e.kind === "upstream_down");
@@ -147,43 +126,22 @@ on((kind, payload) => {
   }
 });
 
-function applyUpstream(fresh) {
-  const status = store.status;
-  if (!status) return;
-  const listener = status.listeners.find((l) => l.name === fresh.listener);
-  if (!listener) return;
-  const i = listener.upstreams.findIndex((u) => u.endpoint === fresh.endpoint);
-  if (i >= 0) listener.upstreams[i] = fresh;
-  renderFleet(status);
-}
-
-async function main() {
+function main() {
   initTheme();
   injectDefs();
   initFleet({ openUpstream });
   initEvents();
-  initSessions({
-    sessionAction: async (session, action) => {
-      await sessionAction(session, action);
-      refreshSessions();
-    },
-  });
+  initSessions({ sessionAction });
   initControls({
     onModeChange(mode) {
       setControlMode(mode);
       setSessionsControlMode(mode);
     },
-    onUpstreamChanged: applyUpstream,
   });
   setControlMode(controlMode());
   initRouting();
   renderRecent();
 
-  // History and events seed the charts and the log; the stream's first
-  // snapshot draws the fleet.
-  const [history, events] = await Promise.allSettled([api.history(), api.events()]);
-  if (history.status === "fulfilled") ingestHistory(history.value);
-  if (events.status === "fulfilled") addEvents(events.value.events || []);
   startStream();
 }
 

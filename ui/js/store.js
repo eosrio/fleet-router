@@ -1,5 +1,5 @@
-// Shared dashboard state: the latest status snapshot, per-upstream time
-// series (seeded from /history, extended by each snapshot), and events.
+// Dashboard state commits once per server revision. Every panel observes the
+// same status, sessions, events and sampled history before rendering.
 
 import { upstreamKey } from "./util.js";
 
@@ -10,6 +10,9 @@ const FLASH_MS = 1600;
 
 export const store = {
   status: null,
+  sessions: [],
+  instance: null,
+  revision: 0,
   series: new Map(),
   events: [],
   lastEventId: 0,
@@ -17,7 +20,7 @@ export const store = {
   listeners: new Set(),
 };
 
-/** Subscribe to "status", "event", "events", "control" notifications. */
+/** Subscribe to complete "dashboard" publications. */
 export function on(fn) {
   store.listeners.add(fn);
   return () => store.listeners.delete(fn);
@@ -75,14 +78,57 @@ export function ingestHistory(history) {
   }
 }
 
-export function ingestStatus(status) {
-  store.status = status;
-  for (const l of status.listeners) {
-    for (const u of l.upstreams) {
-      ingest(upstreamKey(l.name, u.endpoint), status.now_ms, u.sessions, u.blocks_total, u.bytes_total);
+/** Apply a complete publication before notifying any view. A new stream starts
+ * with a bootstrap, including retained history and events. A gap cannot be
+ * patched safely: the transport must reconnect for another bootstrap. */
+export function applyDashboardFrame(frame) {
+  if (!frame || !Number.isSafeInteger(frame.revision) || frame.revision < 1 ||
+      typeof frame.bootstrap !== "boolean" || !Number.isSafeInteger(frame.status?.started_ms) ||
+      !Array.isArray(frame.status.listeners) || !Array.isArray(frame.sessions) || !Array.isArray(frame.events) ||
+      (frame.bootstrap && !Array.isArray(frame.history?.samples))) {
+    throw new Error("Invalid dashboard frame");
+  }
+  const instance = frame.status.started_ms;
+  const restarted = store.instance !== null && store.instance !== instance;
+  if (store.instance === instance && frame.revision <= store.revision) return false;
+  if (!frame.bootstrap && (store.instance !== instance || frame.revision !== store.revision + 1)) {
+    throw new Error("Dashboard resync required");
+  }
+  // Validate nested samples before changing the last usable state.
+  const samples = [...(frame.bootstrap ? frame.history.samples : []), ...(frame.sample ? [frame.sample] : [])];
+  for (const sample of samples) {
+    if (!sample || !Number.isFinite(sample.t_ms) || !sample.upstreams || typeof sample.upstreams !== "object" ||
+        Object.values(sample.upstreams).some(u => !u || ![u.sessions, u.blocks_total, u.bytes_total].every(n => Number.isFinite(n) && n >= 0))) {
+      throw new Error("Invalid dashboard sample");
     }
   }
-  notify("status", status);
+  for (const event of frame.events) {
+    // Reject before clearing a bootstrap or advancing its revision. Rendering
+    // uses string methods and Date.toISOString(), which throws outside this range.
+    if (!event || !Number.isSafeInteger(event.id) || event.id < 1 ||
+        !Number.isSafeInteger(event.t_ms) || event.t_ms < 0 || event.t_ms > 8640000000000000 ||
+        typeof event.kind !== "string" || event.kind.length === 0 ||
+        typeof event.message !== "string" || !["info", "warn", "error"].includes(event.level) ||
+        [event.listener, event.upstream].some(value => value != null && typeof value !== "string") ||
+        (event.session != null && (!Number.isSafeInteger(event.session) || event.session < 1))) {
+      throw new Error("Invalid dashboard event");
+    }
+  }
+  if (frame.bootstrap) {
+    store.series.clear();
+    store.events = [];
+    store.lastEventId = 0;
+    store.flashes.clear();
+    ingestHistory(frame.history);
+  }
+  if (frame.sample) ingestHistory({ samples: [frame.sample] });
+  const added = addEvents(frame.events, { fresh: !frame.bootstrap });
+  store.status = frame.status;
+  store.sessions = frame.sessions;
+  store.instance = instance;
+  store.revision = frame.revision;
+  notify("dashboard", { added, fresh: !frame.bootstrap, reset: frame.bootstrap, restarted });
+  return true;
 }
 
 /** Average of the last few rate samples, so the number does not jitter. */
@@ -96,7 +142,7 @@ export function currentRates(key) {
   return { bps: avg(s.bps), Bps: avg(s.Bps) };
 }
 
-export function addEvents(events, { fresh = false } = {}) {
+function addEvents(events, { fresh = false } = {}) {
   const added = [];
   for (const ev of events) {
     if (ev.id <= store.lastEventId) continue;
@@ -108,7 +154,7 @@ export function addEvents(events, { fresh = false } = {}) {
     }
   }
   if (store.events.length > MAX_EVENTS) store.events.splice(0, store.events.length - MAX_EVENTS);
-  if (added.length) notify("events", { added, fresh });
+  return added;
 }
 
 export function isFlashing(key) {

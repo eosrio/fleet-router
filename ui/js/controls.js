@@ -11,7 +11,6 @@ let mode = "off"; // "off" | "locked" | "unlocked"
 let enabled = false;
 let verified = false;
 let modeListeners = [];
-let applyUpstream = () => {};
 let open = null; // { listener, endpoint }
 let controlsSignature = "";
 
@@ -23,9 +22,8 @@ const STATUS_TEXT = {
   disabled: "Disabled by an operator. New sessions are not routed here.",
 };
 
-export function initControls({ onModeChange, onUpstreamChanged }) {
+export function initControls({ onModeChange }) {
   modeListeners.push(onModeChange);
-  applyUpstream = onUpstreamChanged;
 
   const button = document.getElementById("control-button");
   button.addEventListener("click", () => {
@@ -472,12 +470,11 @@ async function run(button, call, message) {
   button.setAttribute("aria-busy", "true");
   try {
     const fresh = await call();
-    if (fresh && fresh.endpoint) applyUpstream(fresh);
+    // The response acknowledges the command; only the push stream commits state.
     const text = message(fresh || {});
     toast(text);
     announce(text);
     controlsSignature = "";
-    if (open) renderUpstreamDialog(true);
   } catch (err) {
     if (!handleAuthError(err)) toast(`${label} failed: ${err.message}`, "error");
   } finally {

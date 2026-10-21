@@ -63,6 +63,29 @@ async fn status(http: &reqwest::Client, base: &str, check: impl Fn(&Value) -> bo
     .expect("configuration did not converge")
 }
 
+async fn assigned_sessions(http: &reqwest::Client, base: &str) -> Value {
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let sessions: Value = http
+                .get(format!("{base}/api/v1/sessions"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if sessions["sessions"].as_array().unwrap().iter().any(|s| {
+                s["draining"] == false && s["upstream"].as_str().is_some_and(|u| !u.is_empty())
+            }) {
+                return sessions;
+            }
+            sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("new session never adopted an upstream")
+}
+
 async fn fixture() -> (
     RouterProcess,
     mock_ship::MockShipHandle,
@@ -75,7 +98,10 @@ async fn fixture() -> (
     let mock = mock.start();
     let router = RouterProcess::start(cfg).await;
     let base = format!("http://127.0.0.1:{}", router.metrics());
-    (router, mock, reqwest::Client::new(), base)
+    let http = reqwest::Client::new();
+    // Listening TCP sockets do not imply that an upstream can serve an ABI yet.
+    status(&http, &base, |s| s["listeners"][0]["ready"] == true).await;
+    (router, mock, http, base)
 }
 
 fn tls_config(dir: &std::path::Path, label: &str) -> (Value, Vec<u8>) {
@@ -564,14 +590,7 @@ async fn same_port_upstream_replacement_preserves_connections_and_honors_the_new
     .await;
     let (mut new, _) = connect_async(router.ws_url()).await.unwrap();
     assert!(new.next().await.unwrap().unwrap().is_text());
-    let sessions: Value = http
-        .get(format!("{base}/api/v1/sessions"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let sessions = assigned_sessions(&http, &base).await;
     assert_eq!(sessions["sessions"][0]["upstream"], endpoint);
     new.close(None).await.unwrap();
 }
@@ -642,26 +661,7 @@ async fn removing_and_readding_an_upstream_keeps_its_occupied_capacity() {
     assert!(new.next().await.unwrap().unwrap().is_text());
     // ABI delivery precedes publication of the session's adopted upstream.
     // Wait for assignment, then assert the actual capacity-driven choice.
-    let sessions: Value = timeout(Duration::from_secs(8), async {
-        loop {
-            let sessions: Value = http
-                .get(format!("{base}/api/v1/sessions"))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-            if sessions["sessions"].as_array().unwrap().iter().any(|s| {
-                s["draining"] == false && s["upstream"].as_str().is_some_and(|u| !u.is_empty())
-            }) {
-                return sessions;
-            }
-            sleep(Duration::from_millis(30)).await;
-        }
-    })
-    .await
-    .expect("new session never adopted an upstream");
+    let sessions = assigned_sessions(&http, &base).await;
     let current = sessions["sessions"]
         .as_array()
         .unwrap()

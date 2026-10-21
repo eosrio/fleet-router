@@ -11,6 +11,7 @@ use tokio::sync::Notify;
 
 use crate::abi::{accept_upstream_abi, AbiEntry};
 use crate::ship::{BlockPos, Range};
+use crate::tls::TlsConfig;
 
 pub type ServerStateDb = Arc<Mutex<HashMap<String, ServerState>>>;
 pub type ServerConfigDb = Arc<Mutex<HashMap<String, Server>>>;
@@ -286,7 +287,9 @@ pub struct Server {
     ///
     /// `host:port` is dialed as plaintext `ws://`. An explicit `ws://` or
     /// `wss://` scheme is preserved (`wss://` is TLS, verified against the OS
-    /// trust store).
+    /// trust store). May be omitted or empty for an HTTP-only live upstream
+    /// that sets [`Self::api_endpoint`].
+    #[serde(default)]
     pub endpoint: String,
     /// Whether the router is allowed to use this upstream.
     pub enabled: bool,
@@ -323,7 +326,11 @@ pub struct Server {
     /// or `host:port`. For a live server, its nodeos `http-server-address`;
     /// for a frozen range server, its chain API address. Used only by a
     /// listener with [`ChainApiConfig`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "http_endpoint"
+    )]
     pub api_endpoint: Option<String>,
 }
 
@@ -335,6 +342,11 @@ impl Server {
     /// or `wss`.
     pub fn ws_url(&self) -> String {
         dial_url(&self.endpoint)
+    }
+
+    /// Whether this server has a SHiP WebSocket endpoint configured.
+    pub fn has_ship_endpoint(&self) -> bool {
+        !self.endpoint.trim().is_empty()
     }
 }
 
@@ -476,6 +488,10 @@ pub struct ListenerConfig {
     /// servers. See [`ChainApiConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_api: Option<ChainApiConfig>,
+    /// Optional client-facing TLS termination configuration for this listener.
+    /// Overrides top-level [`ServerConfig::tls`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
 }
 
 /// A validated, normalized listener ready to be bound and monitored at runtime.
@@ -555,6 +571,11 @@ pub struct ServerConfig {
     /// set it on each listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_api: Option<ChainApiConfig>,
+    /// Optional client-facing TLS termination configuration (`wss://` on SHiP
+    /// ports and `https://` on `chain_api` ports). In multi-listener mode, acts
+    /// as the default TLS config for listeners that omit their own `tls`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
     /// Named ingress listeners for multi-port / multi-network deployments.
     #[serde(default)]
     pub listeners: Vec<ListenerConfig>,
@@ -738,6 +759,21 @@ fn validate_servers(servers: &[Server], listener_ctx: Option<&str>) -> Result<()
     let mut seen: HashMap<String, String> = HashMap::new();
     for s in servers {
         if s.endpoint.trim().is_empty() {
+            if s.api_endpoint.is_some() {
+                if s.role == Role::Frozen {
+                    bail!(
+                        "{prefix}server '{}': frozen server requires a SHiP endpoint",
+                        s.name
+                    );
+                }
+                if s.weight == 0 {
+                    bail!(
+                        "{prefix}server '{}': weight must be at least 1 (set enabled: false to stop using it)",
+                        s.name
+                    );
+                }
+                continue;
+            }
             if s.enabled {
                 bail!("{prefix}server '{}' has an empty endpoint", s.name);
             }
@@ -1084,6 +1120,10 @@ pub struct ChainApiConfig {
     /// See [`ChainApiCors`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors: Option<ChainApiCors>,
+    /// Optional client-facing TLS termination (`https://`) for this chain API
+    /// port. When omitted, inherits the listener's or top-level `tls` config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
 }
 
 /// A server's chain API address, parsed from [`Server::api_endpoint`].
@@ -1206,12 +1246,16 @@ pub struct ResolvedChainApi {
     pub push: Vec<usize>,
     /// Every enabled server with an `api_endpoint`, in config order.
     pub upstreams: Vec<ApiUpstream>,
+    /// Effective TLS termination configuration (`chain_api.tls`, falling back
+    /// to the listener's or top-level `tls`).
+    pub tls: Option<TlsConfig>,
 }
 
 /// One server's chain API as the router routes to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiUpstream {
-    /// `ServerState::index` of the server.
+    /// `ServerState::index` of the server (or a synthetic index above the
+    /// SHiP servers for an HTTP-only server).
     pub index: usize,
     pub name: String,
     /// The server's SHiP endpoint, the key of its `ServerState`.
@@ -1231,6 +1275,7 @@ fn resolve_chain_api(
     listener: Option<&str>,
     listener_address: &str,
     servers: &[Server],
+    listener_tls: Option<&TlsConfig>,
 ) -> Option<ResolvedChainApi> {
     let cfg = api?.clone();
     let listen_address = cfg
@@ -1239,11 +1284,25 @@ fn resolve_chain_api(
         .map(str::trim)
         .unwrap_or(listener_address)
         .to_string();
+    let ship_count = servers
+        .iter()
+        .filter(|s| s.enabled && s.has_ship_endpoint())
+        .count();
+    let mut next_ship_idx = 0usize;
+    let mut next_http_only_idx = ship_count;
     let upstreams: Vec<ApiUpstream> = servers
         .iter()
         .filter(|s| s.enabled)
-        .enumerate()
-        .filter_map(|(index, s)| {
+        .filter_map(|s| {
+            let index = if s.has_ship_endpoint() {
+                let i = next_ship_idx;
+                next_ship_idx += 1;
+                i
+            } else {
+                let i = next_http_only_idx;
+                next_http_only_idx += 1;
+                i
+            };
             let api = ApiEndpoint::parse(s.api_endpoint.as_deref()?).ok()?;
             Some(ApiUpstream {
                 index,
@@ -1267,6 +1326,7 @@ fn resolve_chain_api(
                 .map(|u| u.index)
         })
         .collect();
+    let tls = cfg.tls.clone().or_else(|| listener_tls.cloned());
     Some(ResolvedChainApi {
         listener: listener.map(str::to_string),
         bind: format_bind_addr(&listen_address, cfg.listen_port),
@@ -1274,6 +1334,7 @@ fn resolve_chain_api(
         cfg,
         push,
         upstreams,
+        tls,
     })
 }
 
@@ -1427,6 +1488,9 @@ fn validate_chain_api(
             bail!("{prefix}chain_api.cors.allow_headers is invalid");
         }
     }
+    if let Some(tls) = &api.tls {
+        tls.validate(&format!("{prefix}chain_api."))?;
+    }
     Ok(())
 }
 
@@ -1516,6 +1580,9 @@ impl ServerConfig {
                     "dashboard.control_token must be at least {MIN_CONTROL_TOKEN_LEN} characters"
                 );
             }
+        }
+        if let Some(tls) = &self.tls {
+            tls.validate("")?;
         }
 
         if !self.servers.is_empty() && !self.listeners.is_empty() {
@@ -1640,6 +1707,9 @@ impl ServerConfig {
                 if let Some(policy) = &listener.block_failure_quarantine {
                     validate_block_failure_quarantine(policy, Some(name))?;
                 }
+                if let Some(tls) = &listener.tls {
+                    tls.validate(&format!("listener '{name}': "))?;
+                }
 
                 for (prev_name, prev_addr, prev_port) in &bound_listeners {
                     if *prev_port == listener.listen_port && addresses_conflict(prev_addr, &addr) {
@@ -1731,14 +1801,34 @@ impl ServerConfig {
                 None,
                 self.listen_address.trim(),
                 &self.servers,
+                self.tls.as_ref(),
             )]
         } else {
             self.listeners
                 .iter()
                 .zip(self.listener_binds())
                 .map(|(l, (name, address, _))| {
-                    resolve_chain_api(l.chain_api.as_ref(), name.as_deref(), &address, &l.servers)
+                    resolve_chain_api(
+                        l.chain_api.as_ref(),
+                        name.as_deref(),
+                        &address,
+                        &l.servers,
+                        l.tls.as_ref().or(self.tls.as_ref()),
+                    )
                 })
+                .collect()
+        }
+    }
+
+    /// Effective TLS termination configuration for each SHiP listener, in the
+    /// order of [`Self::resolved_listeners`].
+    pub fn resolved_listener_tls(&self) -> Vec<Option<TlsConfig>> {
+        if self.listeners.is_empty() {
+            vec![self.tls.clone()]
+        } else {
+            self.listeners
+                .iter()
+                .map(|l| l.tls.clone().or_else(|| self.tls.clone()))
                 .collect()
         }
     }
@@ -2335,7 +2425,7 @@ pub fn build_state_db_with_chain_id(
     Arc::new(Mutex::new(
         servers
             .iter()
-            .filter(|s| s.enabled)
+            .filter(|s| s.enabled && s.has_ship_endpoint())
             .enumerate()
             .map(|(index, s)| {
                 let mut state = ServerState::with_chain_policy(expected_chain_id, require_chain_id);
@@ -2356,7 +2446,7 @@ pub fn build_config_db(servers: Vec<Server>) -> ServerConfigDb {
     Arc::new(Mutex::new(
         servers
             .into_iter()
-            .filter(|s| s.enabled)
+            .filter(|s| s.enabled && s.has_ship_endpoint())
             .map(|s| (s.endpoint.clone(), s))
             .collect::<HashMap<String, Server>>(),
     ))
@@ -4808,5 +4898,176 @@ mod tests {
             multi_api(serde_json::json!({ "listen_port": 18888, "listen_address": "10.0.0.5" }));
         quiet.validate().unwrap();
         assert!(quiet.warnings().is_empty(), "{:?}", quiet.warnings());
+    }
+
+    #[test]
+    fn tls_config_validation_and_inheritance() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_cert = |name: &str| {
+            let c = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            let cert_p = dir.path().join(format!("{name}.pem"));
+            let key_p = dir.path().join(format!("{name}.key"));
+            std::fs::write(&cert_p, c.cert.pem()).unwrap();
+            std::fs::write(&key_p, c.key_pair.serialize_pem()).unwrap();
+            (cert_p, key_p)
+        };
+        let (def_cert, def_key) = make_cert("default");
+        let (sni_cert, sni_key) = make_cert("sni");
+        let (api_cert, api_key) = make_cert("api");
+
+        let valid_tls = serde_json::json!({
+            "cert_file": def_cert,
+            "key_file": def_key,
+            "sni": [
+                {
+                    "server_names": ["eos.example.com", "*.wax.example.com"],
+                    "cert_file": sni_cert,
+                    "key_file": sni_key
+                }
+            ]
+        });
+        let override_tls = serde_json::json!({
+            "cert_file": api_cert,
+            "key_file": api_key
+        });
+
+        // Single-listener: chain_api inherits top-level tls when chain_api.tls is omitted.
+        let cfg = single(
+            serde_json::json!([with_api(live("a", 18080), "10.0.1.10:8888")]),
+            serde_json::json!({
+                "tls": valid_tls,
+                "chain_api": { "listen_port": 18888 }
+            }),
+        );
+        cfg.validate().unwrap();
+        let listener_tls = cfg.resolved_listener_tls();
+        assert_eq!(listener_tls.len(), 1);
+        assert!(listener_tls[0].is_some());
+        let apis = cfg.resolved_chain_apis();
+        assert_eq!(apis[0].as_ref().unwrap().tls, listener_tls[0]);
+
+        // chain_api.tls overrides listener/top-level tls.
+        let cfg_override = single(
+            serde_json::json!([with_api(live("a", 18080), "10.0.1.10:8888")]),
+            serde_json::json!({
+                "tls": valid_tls,
+                "chain_api": { "listen_port": 18888, "tls": override_tls }
+            }),
+        );
+        cfg_override.validate().unwrap();
+        let resolved_api_tls = cfg_override.resolved_chain_apis()[0]
+            .as_ref()
+            .unwrap()
+            .tls
+            .clone()
+            .unwrap();
+        assert_eq!(resolved_api_tls.cert_file, api_cert);
+
+        // Validation errors on bad cert/key or SNI patterns.
+        let bad_cases = [
+            (
+                serde_json::json!({ "cert_file": "  ", "key_file": "/k.pem" }),
+                "tls.cert_file must not be empty",
+            ),
+            (
+                serde_json::json!({ "cert_file": "/c.pem", "key_file": "" }),
+                "tls.key_file must not be empty",
+            ),
+            (
+                serde_json::json!({
+                    "cert_file": "/c.pem",
+                    "key_file": "/k.pem",
+                    "sni": [{ "server_names": [], "cert_file": "/c2.pem", "key_file": "/k2.pem" }]
+                }),
+                "tls.sni[0].server_names must not be empty",
+            ),
+            (
+                serde_json::json!({
+                    "cert_file": "/c.pem",
+                    "key_file": "/k.pem",
+                    "sni": [{ "server_names": ["*.singlelabel"], "cert_file": "/c2.pem", "key_file": "/k2.pem" }]
+                }),
+                "tls.sni[0]: invalid server_name '*.singlelabel' (expected hostname or '*.domain')",
+            ),
+            (
+                serde_json::json!({
+                    "cert_file": "/c.pem",
+                    "key_file": "/k.pem",
+                    "sni": [
+                        { "server_names": ["api.example.com"], "cert_file": "/c2.pem", "key_file": "/k2.pem" },
+                        { "server_names": ["API.EXAMPLE.COM"], "cert_file": "/c3.pem", "key_file": "/k3.pem" }
+                    ]
+                }),
+                "tls.sni[1]: duplicate server_name 'API.EXAMPLE.COM'",
+            ),
+        ];
+        for (bad_tls, expected) in bad_cases {
+            let cfg = single(
+                serde_json::json!([live("a", 18080)]),
+                serde_json::json!({ "tls": bad_tls }),
+            );
+            assert_eq!(validation_error(&cfg), expected);
+        }
+    }
+
+    #[test]
+    fn http_only_live_server_and_http_endpoint_alias() {
+        let cfg = single(
+            serde_json::json!([
+                {
+                    "name": "ship-and-http",
+                    "endpoint": "10.0.1.10:18080",
+                    "http_endpoint": "http://10.0.1.10:8888",
+                    "enabled": true
+                },
+                {
+                    "name": "http-only-live",
+                    "http_endpoint": "10.0.1.11:8888",
+                    "enabled": true
+                }
+            ]),
+            serde_json::json!({
+                "chain_api": {
+                    "listen_port": 18888,
+                    "allow": ["block", "info", "state", "push"],
+                    "push_servers": ["http-only-live"]
+                }
+            }),
+        );
+        cfg.validate().unwrap();
+        let state_db = build_state_db(cfg.servers.clone());
+        let states = state_db.try_lock().unwrap();
+        assert_eq!(states.len(), 1);
+        assert!(states.contains_key("10.0.1.10:18080"));
+        drop(states);
+
+        let api = cfg
+            .resolved_chain_apis()
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(api.upstreams.len(), 2);
+        assert_eq!(api.upstreams[0].index, 0);
+        assert_eq!(api.upstreams[1].index, 1);
+        assert_eq!(api.push, vec![1]);
+
+        // Frozen server without SHiP endpoint is still rejected.
+        let bad_frozen = single(
+            serde_json::json!([
+                {
+                    "name": "http-only-frozen",
+                    "role": "frozen",
+                    "range": { "begin": 2, "end": 1000 },
+                    "http_endpoint": "10.0.3.10:8890",
+                    "enabled": true
+                }
+            ]),
+            serde_json::json!({ "chain_id": CHAIN_ID }),
+        );
+        assert_eq!(
+            validation_error(&bad_frozen),
+            "server 'http-only-frozen': frozen server requires a SHiP endpoint"
+        );
     }
 }

@@ -54,6 +54,7 @@ mod tasks;
 mod telemetry;
 #[cfg(test)]
 mod test_log;
+mod tls;
 mod zcd;
 
 #[tokio::main]
@@ -445,6 +446,18 @@ async fn run_tests(config: &ServerConfig, strict: bool) -> bool {
         // Stitched: the status of every server that answered with an ABI.
         let mut statuses: Vec<(String, Option<Vec<u8>>)> = Vec::new();
         for server in &listener.servers {
+            if !server.has_ship_endpoint() {
+                if let Some(api_ep) = &server.api_endpoint {
+                    cprintln!(
+                        "\n 🌐 HTTP-only server <bright-cyan>{}</> ({})",
+                        server.name,
+                        api_ep
+                    );
+                    listener_valid += 1;
+                    total_valid += 1;
+                }
+                continue;
+            }
             let endpoint = server.ws_url();
             cprintln!("\n 🧪 Testing <bright-cyan>{}</>", endpoint);
             match probe_upstream(&endpoint, config.max_message_bytes, bound).await {

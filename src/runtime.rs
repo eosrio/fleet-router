@@ -24,6 +24,7 @@ use crate::models::{
     ResolvedListener, ServerConfig, StaticConfig,
 };
 use crate::session::{handle_client, ListenerCtx};
+use crate::tls::{TlsAcceptorHandle, TlsConfig, DEFAULT_TLS_RELOAD_INTERVAL};
 use crate::{api, fleet::FleetHub, tasks, telemetry};
 
 mod config;
@@ -32,6 +33,7 @@ pub use config::routes;
 struct Generation {
     resolved: ResolvedListener,
     chain_config: Option<ResolvedChainApi>,
+    tls_config: Option<TlsConfig>,
     static_config: StaticConfig,
     ctx: Arc<ListenerCtx>,
     api: Option<Arc<ChainApiCtx>>,
@@ -48,7 +50,12 @@ impl Generation {
         limits: ProxyLimits,
         live_lag: u32,
         revision: u64,
-    ) -> Arc<Self> {
+        tls_config: Option<TlsConfig>,
+    ) -> Result<Arc<Self>> {
+        let tls = tls_config
+            .as_ref()
+            .map(TlsAcceptorHandle::from_config)
+            .transpose()?;
         let config_db = build_config_db(resolved.servers.clone());
         let state = build_state_db_with_chain_id(
             resolved.servers.clone(),
@@ -56,16 +63,32 @@ impl Generation {
             resolved.require_chain_id,
         );
         let hub = FleetHub::new(&resolved, state.clone(), config_db.clone());
-        let ctx = ListenerCtx::with_generation(&resolved, limits, live_lag, hub.clone(), revision);
-        let api = chain_config.as_ref().map(|cfg| {
-            ChainApiCtx::new(
-                cfg,
-                hub.clone(),
-                Duration::from_millis(limits.connect_timeout_ms),
-                limits.handshake_timeout_ms,
-                live_lag,
-            )
-        });
+        let ctx = ListenerCtx::with_generation_and_tls(
+            &resolved,
+            limits,
+            live_lag,
+            hub.clone(),
+            revision,
+            tls,
+        );
+        let api = chain_config
+            .as_ref()
+            .map(|cfg| -> Result<_> {
+                let tls = cfg
+                    .tls
+                    .as_ref()
+                    .map(TlsAcceptorHandle::from_config)
+                    .transpose()?;
+                Ok(ChainApiCtx::with_tls(
+                    cfg,
+                    hub.clone(),
+                    Duration::from_millis(limits.connect_timeout_ms),
+                    limits.handshake_timeout_ms,
+                    live_lag,
+                    tls,
+                ))
+            })
+            .transpose()?;
         let info = ListenerContext {
             config_generation: revision,
             health: ListenerHealthState {
@@ -78,7 +101,7 @@ impl Generation {
             order: resolved
                 .servers
                 .iter()
-                .filter(|s| s.enabled)
+                .filter(|s| s.enabled && s.has_ship_endpoint())
                 .map(|s| s.endpoint.clone())
                 .collect(),
             port: resolved.listen_port,
@@ -86,16 +109,17 @@ impl Generation {
             max_connections: resolved.max_connections,
             stats: Arc::default(),
         };
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             connections: Arc::new(Semaphore::new(resolved.max_connections)),
             resolved,
             chain_config,
+            tls_config,
             static_config,
             ctx,
             api,
             info,
             stop: broadcast::channel(16).0,
-        })
+        }))
     }
 
     /// Keep samples and shared capacity/counters for the same upstream identity.
@@ -126,7 +150,12 @@ impl Generation {
         if self.resolved.name.is_some() && self.resolved.expected_chain_id.is_none() {
             tracing::warn!(listener = self.info.name(), "listener has no pinned chain_id; first online upstream will establish the pool chain_id (set chain_id in config to prevent cross-chain misconfiguration)");
         }
-        for server in self.resolved.servers.iter().filter(|s| s.enabled) {
+        for server in self
+            .resolved
+            .servers
+            .iter()
+            .filter(|s| s.enabled && s.has_ship_endpoint())
+        {
             tracing::info!(listener = self.info.name(), name = %server.name,
                 upstream = %server.endpoint, "starting upstream monitor");
             tokio::spawn(tasks::monitoring_connection(
@@ -141,6 +170,13 @@ impl Generation {
             self.static_config.upstream_monitoring_ms,
             self.stop.subscribe(),
         ));
+        if let Some(tls) = &self.ctx.tls {
+            tls.spawn_reload_task(
+                self.info.name().to_string(),
+                DEFAULT_TLS_RELOAD_INTERVAL,
+                self.stop.subscribe(),
+            );
+        }
         if let Some(api) = &self.api {
             tracing::info!(listener = self.info.name(), address = %api.bind, "chain API listening");
             api.start_probes(&self.stop);
@@ -336,10 +372,11 @@ impl Runtime {
             bindings: HashMap::new(),
             sockets: Vec::new(),
         };
-        for (resolved, chain) in prepared
+        for ((resolved, tls_config), chain) in prepared
             .config
             .resolved_listeners()
             .into_iter()
+            .zip(prepared.config.resolved_listener_tls())
             .zip(prepared.config.resolved_chain_apis())
         {
             let reused = engine
@@ -347,6 +384,7 @@ impl Runtime {
                 .iter()
                 .find(|g| {
                     g.resolved == resolved
+                        && g.tls_config == tls_config
                         && g.chain_config == chain
                         && g.static_config == statics
                         && g.ctx.limits == limits
@@ -363,7 +401,8 @@ impl Runtime {
                         limits,
                         prepared.config.live_lag_blocks,
                         engine.revision + 1,
-                    );
+                        tls_config,
+                    )?;
                     // An upstream can disappear and return while an older pool
                     // still serves streams. Retain its shared capacity too;
                     // newer observations take precedence over retired samples.

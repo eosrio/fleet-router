@@ -6,7 +6,7 @@ A reverse proxy and load balancer for the Antelope **SHiP** (State History Plugi
 [![Crates.io](https://img.shields.io/crates/v/fleet-router.svg)](https://crates.io/crates/fleet-router)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[Homepage](https://eosrio.github.io/fleet-router/) · [Configuration](docs/configuration.md) · [Operations](docs/operations.md) · [Observability](docs/observability.md) · [Chain API](docs/chain-api.md) · [Dashboard & API](docs/api.md) · [Changelog](CHANGELOG.md)
+[Homepage](https://eosrio.github.io/fleet-router/) · [Frozen SHiP deployment](docs/frozen-ship.md) · [Configuration](docs/configuration.md) · [Operations](docs/operations.md) · [Observability](docs/observability.md) · [Chain API](docs/chain-api.md) · [Dashboard & API](docs/api.md) · [Changelog](CHANGELOG.md)
 
 Run more than one SHiP node? Put fleet-router in front of them and give your clients (Hyperion, other indexers, custom consumers) **one resilient endpoint** instead of pinning each consumer to one node.
 
@@ -118,6 +118,7 @@ fleet-router --help                 Print help.
 
 ## Documentation
 
+- **[Frozen SHiP deployment](docs/frozen-ship.md)**: deploy Hyperion Tools archive servers and live nodes behind one stitched endpoint. Includes log preparation, configuration, snapshot cut-over and rollout checks. Also available as a [site guide](https://eosrio.github.io/fleet-router/frozen-ship.html).
 - **[Configuration reference](docs/configuration.md)**: every field and default, topology and stitching, the chain API, upstream TLS, and multi-network `listeners`.
 - **[Running in production](docs/operations.md)**: routing and failover, range-split fleets with frozen range servers, security, running as a service (systemd, Docker, launchd, Windows), graceful shutdown, corrupted SHiP logs, and tuning.
 - **[Observability](docs/observability.md)**: logging, health and readiness endpoints, `/coverage`, the Prometheus metrics, and alerts.
@@ -128,7 +129,7 @@ fleet-router --help                 Print help.
 
 ## Security
 
-The client listener is **plaintext `ws://` and unauthenticated**, and so is the optional chain API port (plain HTTP). Run fleet-router on a trusted network or behind a TLS-terminating reverse proxy that adds access control. **Do not expose it directly to the public internet.** See [Security](docs/operations.md#security) for details.
+The client listener and optional chain API port are **unauthenticated**. They default to plaintext `ws://` and HTTP; configure [client TLS termination](docs/configuration.md#client-tls-termination) for `wss://` and HTTPS. TLS encrypts connections but does not add access control. Run fleet-router on a trusted network or behind a reverse proxy that adds access control. **Do not expose it directly to the public internet.** See [Security](docs/operations.md#security) for details.
 
 To report a vulnerability, follow [SECURITY.md](SECURITY.md). Please do not open public issues for security reports.
 

@@ -78,6 +78,213 @@ async fn fixture() -> (
     (router, mock, reqwest::Client::new(), base)
 }
 
+fn tls_config(dir: &std::path::Path, label: &str) -> (Value, Vec<u8>) {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec![
+        "localhost".to_string(),
+        format!("{label}.example.com"),
+    ])
+    .unwrap()
+    .self_signed(&key)
+    .unwrap();
+    let cert_path = dir.join(format!("{label}.pem"));
+    let key_path = dir.join(format!("{label}.key"));
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+    (
+        json!({"cert_file":cert_path,"key_file":key_path}),
+        cert.der().to_vec(),
+    )
+}
+
+async fn tls_connection(
+    port: u16,
+    certificates: &[Vec<u8>],
+) -> (
+    tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    Vec<u8>,
+) {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certificates {
+        roots
+            .add(rustls::pki_types::CertificateDer::from(cert.clone()))
+            .unwrap();
+    }
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let stream = connector
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            tcp,
+        )
+        .await
+        .unwrap();
+    let peer = stream.get_ref().1.peer_certificates().unwrap()[0].to_vec();
+    (stream, peer)
+}
+
+#[tokio::test]
+async fn tls_only_reload_replaces_new_connections_and_preserves_existing_streams() {
+    let (router, _mock, http, base) = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (first, first_der) = tls_config(dir.path(), "first");
+    let (second, second_der) = tls_config(dir.path(), "second");
+    let (third, third_der) = tls_config(dir.path(), "third-with-longer-name");
+    let roots = vec![first_der.clone(), second_der.clone(), third_der.clone()];
+    let port = reqwest::Url::parse(&router.ws_url())
+        .unwrap()
+        .port()
+        .unwrap();
+    let (mut old, _) = connect_async(router.ws_url()).await.unwrap();
+    old.next().await.unwrap().unwrap();
+    let doc = document(&http, &base).await;
+    let mut cfg: Value = serde_json::from_str(doc["source"].as_str().unwrap()).unwrap();
+    cfg["tls"] = first;
+    save(&http, &base, &doc, &cfg).await;
+    let (stream, peer) = tls_connection(port, &roots).await;
+    assert_eq!(peer, first_der);
+    let (mut first_client, _) =
+        tokio_tungstenite::client_async(format!("wss://localhost:{port}"), stream)
+            .await
+            .unwrap();
+    first_client.next().await.unwrap().unwrap();
+
+    // Only the TLS paths change: generation reuse must still notice the edit.
+    let doc = document(&http, &base).await;
+    cfg["tls"] = second.clone();
+    save(&http, &base, &doc, &cfg).await;
+    let (stream, peer) = tls_connection(port, &roots).await;
+    assert_eq!(peer, second_der);
+    drop(stream);
+    let request = || {
+        Message::Binary(
+            blocks(&BlocksReq {
+                start: 1,
+                end: 4,
+                max_in_flight: 10,
+                ..Default::default()
+            })
+            .into(),
+        )
+    };
+    old.send(request()).await.unwrap();
+    first_client.send(request()).await.unwrap();
+    let (plain_blocks, closed) = common::read_blocks(&mut old, 3, Duration::from_secs(5)).await;
+    assert!(closed.is_none());
+    assert_eq!(plain_blocks.len(), 3);
+    let (tls_blocks, closed) =
+        common::read_blocks(&mut first_client, 3, Duration::from_secs(5)).await;
+    assert!(closed.is_none());
+    assert_eq!(tls_blocks.len(), 3);
+
+    // Failed TLS preparation must preserve both the running config and its file.
+    let doc = document(&http, &base).await;
+    let disk = std::fs::read_to_string(doc["path"].as_str().unwrap()).unwrap();
+    cfg["tls"]["cert_file"] = json!(dir.path().join("missing.pem"));
+    let response = http
+        .put(format!("{base}/api/v1/config"))
+        .bearer_auth(TOKEN)
+        .json(&change(&doc, Some(&cfg)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert_eq!(document(&http, &base).await["revision"], doc["revision"]);
+    assert_eq!(
+        std::fs::read_to_string(doc["path"].as_str().unwrap()).unwrap(),
+        disk
+    );
+
+    // The real generation's background watcher must rotate the active pair.
+    std::fs::copy(
+        third["cert_file"].as_str().unwrap(),
+        second["cert_file"].as_str().unwrap(),
+    )
+    .unwrap();
+    std::fs::copy(
+        third["key_file"].as_str().unwrap(),
+        second["key_file"].as_str().unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(9), async {
+        loop {
+            let (stream, peer) = tls_connection(port, &roots).await;
+            drop(stream);
+            if peer == third_der {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("generation did not reload its certificate");
+    old.close(None).await.unwrap();
+    first_client.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn https_http_only_upstream_keeps_tls_across_configuration_reload() {
+    let (_router, _mock, http, base) = fixture().await;
+    let api = mock_ship::chain_api::MockChainApi::live(
+        "http-only",
+        [0x5a; 32],
+        2000,
+        1990,
+        Some(1),
+        "v1.2.2",
+    )
+    .start()
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (tls, der) = tls_config(dir.path(), "api");
+    let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let doc = document(&http, &base).await;
+    let mut cfg: Value = serde_json::from_str(doc["source"].as_str().unwrap()).unwrap();
+    cfg["servers"] = json!([{"name":"http-only","api_endpoint":api.endpoint(),"enabled":true}]);
+    cfg["chain_id"] = json!("5a".repeat(32));
+    cfg["tls"] = tls;
+    cfg["chain_api"] = json!({"listen_port":port,"probe_ms":100});
+    save(&http, &base, &doc, &cfg).await;
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_der(&der).unwrap())
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
+    for _ in 0..2 {
+        timeout(Duration::from_secs(8), async {
+            loop {
+                let response = client
+                    .post(format!("https://localhost:{port}/v1/chain/get_info"))
+                    .send()
+                    .await
+                    .unwrap();
+                if response.status().is_success() {
+                    let value: Value = response.json().await.unwrap();
+                    assert_eq!(value["served_by"], "http-only");
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("HTTP-only API never became ready over HTTPS");
+        let doc = document(&http, &base).await;
+        cfg["live_lag_blocks"] = json!(cfg["live_lag_blocks"].as_u64().unwrap_or(1200) + 1);
+        save(&http, &base, &doc, &cfg).await;
+    }
+}
+
 #[tokio::test]
 async fn config_is_authenticated_conflict_checked_and_saved_only_after_prepare() {
     let (_router, _mock, http, base) = fixture().await;
@@ -433,14 +640,28 @@ async fn removing_and_readding_an_upstream_keeps_its_occupied_capacity() {
     save(&http, &base, &doc, &cfg).await;
     let (mut new, _) = connect_async(router.ws_url()).await.unwrap();
     assert!(new.next().await.unwrap().unwrap().is_text());
-    let sessions: Value = http
-        .get(format!("{base}/api/v1/sessions"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    // ABI delivery precedes publication of the session's adopted upstream.
+    // Wait for assignment, then assert the actual capacity-driven choice.
+    let sessions: Value = timeout(Duration::from_secs(8), async {
+        loop {
+            let sessions: Value = http
+                .get(format!("{base}/api/v1/sessions"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if sessions["sessions"].as_array().unwrap().iter().any(|s| {
+                s["draining"] == false && s["upstream"].as_str().is_some_and(|u| !u.is_empty())
+            }) {
+                return sessions;
+            }
+            sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .expect("new session never adopted an upstream");
     let current = sessions["sessions"]
         .as_array()
         .unwrap()

@@ -95,6 +95,7 @@ use crate::models::{
 use crate::ship::wire::{self, BlocksRequest, ClientMsg, DecodeError, ResultHead, UpstreamMsg};
 use crate::ship::BlockPos;
 use crate::telemetry::{self, Event, EventKind, Level, SessionRegistration};
+use crate::tls::{ClientStream, TlsAcceptorHandle};
 
 use client::{
     commit, head_lib_for, judge, request_is_empty, ClientSide, Forward, Judgement, Lacks,
@@ -113,7 +114,7 @@ use link::{
 };
 use status::{router_status, status_ready, StatusFlow, StatusStep};
 
-type ClientWs = WebSocketStream<TcpStream>;
+type ClientWs = WebSocketStream<ClientStream>;
 
 /// A link whose upstream the monitor marked offline is failed over after
 /// this much silence while it owes blocks.
@@ -178,6 +179,7 @@ pub struct ListenerCtx {
     pub quarantine: Option<BlockFailureQuarantine>,
     pub live_lag_blocks: u32,
     pub hub: Arc<FleetHub>,
+    pub tls: Option<TlsAcceptorHandle>,
     pub next_session_id: AtomicU64,
     /// Set once a status v1 reply went out with a zeroed `chain_id`.
     zero_chain_id_warned: AtomicBool,
@@ -194,15 +196,27 @@ impl ListenerCtx {
         live_lag_blocks: u32,
         hub: Arc<FleetHub>,
     ) -> Arc<Self> {
-        Self::with_generation(listener, limits, live_lag_blocks, hub, 0)
+        Self::with_generation_and_tls(listener, limits, live_lag_blocks, hub, 0, None)
     }
 
-    pub fn with_generation(
+    #[cfg(test)]
+    pub fn with_tls(
+        listener: &ResolvedListener,
+        limits: ProxyLimits,
+        live_lag_blocks: u32,
+        hub: Arc<FleetHub>,
+        tls: Option<TlsAcceptorHandle>,
+    ) -> Arc<Self> {
+        Self::with_generation_and_tls(listener, limits, live_lag_blocks, hub, 0, tls)
+    }
+
+    pub fn with_generation_and_tls(
         listener: &ResolvedListener,
         limits: ProxyLimits,
         live_lag_blocks: u32,
         hub: Arc<FleetHub>,
         config_generation: u64,
+        tls: Option<TlsAcceptorHandle>,
     ) -> Arc<Self> {
         Arc::new(ListenerCtx {
             config_generation,
@@ -214,6 +228,7 @@ impl ListenerCtx {
             quarantine: listener.block_failure_quarantine,
             live_lag_blocks,
             hub,
+            tls,
             next_session_id: AtomicU64::new(1),
             zero_chain_id_warned: AtomicBool::new(false),
             abi_warned: Mutex::new(HashSet::new()),
@@ -346,7 +361,8 @@ pub async fn handle_client(
     ctx: Arc<ListenerCtx>,
     shutdown: broadcast::Receiver<()>,
 ) {
-    let Some(client_websocket) = accept_client(client_stream, ctx.limits).await else {
+    let Some(client_websocket) = accept_client(client_stream, ctx.limits, ctx.tls.as_ref()).await
+    else {
         return;
     };
     tracing::info!("client connected");
@@ -365,15 +381,36 @@ pub async fn handle_client(
     session.finish();
 }
 
-/// Complete the client WebSocket handshake, bounded in time and message size.
-/// Client frames use the smaller client cap; upstream links keep
-/// `max_message_bytes`.
-async fn accept_client(client_stream: TcpStream, limits: ProxyLimits) -> Option<ClientWs> {
+/// Complete the client TLS (when enabled) and WebSocket handshake, bounded in
+/// time and message size. Client frames use the smaller client cap; upstream
+/// links keep `max_message_bytes`.
+async fn accept_client(
+    client_stream: TcpStream,
+    limits: ProxyLimits,
+    tls: Option<&TlsAcceptorHandle>,
+) -> Option<ClientWs> {
+    let stream = match tls {
+        Some(acceptor) => {
+            let hs_timeout = if limits.handshake_timeout_ms > 0 {
+                Duration::from_millis(limits.handshake_timeout_ms)
+            } else {
+                Duration::from_secs(10)
+            };
+            match acceptor.accept(client_stream, hs_timeout).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing::warn!(error = %e, "client TLS handshake failed");
+                    return None;
+                }
+            }
+        }
+        None => ClientStream::Plain(client_stream),
+    };
     let mut client_config = WebSocketConfig::default();
     client_config.max_message_size = Some(limits.max_client_message_bytes);
     client_config.max_frame_size = Some(limits.max_client_message_bytes);
 
-    let accept_fut = accept_async_with_config(client_stream, Some(client_config));
+    let accept_fut = accept_async_with_config(stream, Some(client_config));
     if limits.handshake_timeout_ms > 0 {
         match timeout(
             Duration::from_millis(limits.handshake_timeout_ms),
@@ -7590,5 +7627,111 @@ mod tests {
         assert_eq!(info.upstream(), a);
         assert_eq!(mock_a.sessions_accepted(), 2, "re-dialed after the move");
         refusing.abort();
+    }
+
+    #[tokio::test]
+    async fn wss_ship_session_serves_client_over_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_path = dir.path().join("ship.pem");
+        let key_path = dir.path().join("ship.key");
+        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+        std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+
+        let tls_cfg = crate::tls::TlsConfig {
+            cert_file: cert_path,
+            key_file: key_path,
+            sni: Vec::new(),
+        };
+        let acceptor = TlsAcceptorHandle::from_config(&tls_cfg).unwrap();
+
+        let (up, _mock) = start_mock(MockShipConfig {
+            blocks_to_stream: 5,
+            ..Default::default()
+        })
+        .await;
+        let servers = vec![Server {
+            name: "upstream-0".to_string(),
+            endpoint: up.clone(),
+            enabled: true,
+            ..Default::default()
+        }];
+        let resolved = listener(servers.clone());
+        let hub = FleetHub::new(
+            &resolved,
+            build_state_db(servers.clone()),
+            build_config_db(servers),
+        );
+        set_online(&hub, &up).await;
+
+        let ctx = ListenerCtx::with_tls(&resolved, limits(0), 1200, hub, Some(acceptor));
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let (_shutdown, shutdown_rx) = broadcast::channel(1);
+        tokio::spawn(async move {
+            let (stream, peer) = tcp.accept().await.unwrap();
+            handle_client(stream, peer, ctx, shutdown_rx).await;
+        });
+
+        #[derive(Debug)]
+        struct NoVerify;
+        impl rustls::client::danger::ServerCertVerifier for NoVerify {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &rustls::pki_types::CertificateDer<'_>,
+                _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+                _server_name: &rustls::pki_types::ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: rustls::pki_types::UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &rustls::pki_types::CertificateDer<'_>,
+                _dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &rustls::pki_types::CertificateDer<'_>,
+                _dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                rustls::crypto::aws_lc_rs::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        let client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+        let connector = tokio_tungstenite::Connector::Rustls(Arc::new(client_cfg));
+        let tcp_conn = TcpStream::connect(addr).await.unwrap();
+        let url = format!("wss://localhost:{}", addr.port());
+        let (mut ws, _) =
+            tokio_tungstenite::client_async_tls_with_config(url, tcp_conn, None, Some(connector))
+                .await
+                .unwrap();
+
+        // First frame is the SHiP ABI text message over WSS.
+        let first = timeout(WAIT, ws.next()).await.unwrap().unwrap().unwrap();
+        assert!(matches!(first, Message::Text(ref t) if t.contains("eosio::abi")));
+        ws.send(blocks_request(100, 105, 10)).await.unwrap();
+        let blocks = read_block_nums(&mut ws, 5).await;
+        assert_eq!(blocks, vec![100, 101, 102, 103, 104]);
     }
 }

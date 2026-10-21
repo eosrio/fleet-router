@@ -56,8 +56,10 @@ be treated as such.**
 - **Unauthenticated listener.** The client-facing WebSocket listener performs no
   authentication or authorization. Anyone able to reach the listen address can
   open connections.
-- **Plaintext client listener.** The client-facing WebSocket listener is
-  plaintext `ws://`. TLS for clients is not terminated by fleet-router.
+- **Client TLS is opt-in.** The client-facing WebSocket listener defaults to
+  plaintext `ws://`. Configure `tls` to terminate `wss://` connections with
+  PEM certificates, SNI selection, and automatic certificate reloads. TLS
+  encrypts the connection but does not authenticate or authorize clients.
 - **Upstream TLS is opt-in.** A bare `host:port` (and an explicit `ws://` URL)
   is still plaintext. `wss://` encrypts that upstream hop and verifies the
   server certificate with rustls against the OS trust store. It does not
@@ -67,7 +69,8 @@ be treated as such.**
   endpoints are served over plaintext HTTP with no authentication.
 - **Optional chain API is unauthenticated.** When a listener sets
   `chain_api`, its port answers nodeos-style chain API requests over
-  plaintext HTTP with no authentication, like a nodeos HTTP port. Transaction
+  HTTP by default, or HTTPS when its effective `tls` configuration is set,
+  with no authentication, like a nodeos HTTP port. Transaction
   push (`"push"` in `chain_api.allow`) and read-only transaction execution
   (`"exec"`) are off by default. With `"push"` allowed, anyone who can reach
   the port can relay transactions through your live nodes; the router writes
@@ -77,8 +80,8 @@ be treated as such.**
 
 Because of the above, fleet-router **must not be exposed directly to the public
 internet**. Deploy it on a trusted/internal network and/or place it behind a
-TLS-terminating reverse proxy (for example nginx, Caddy, or Envoy) that provides
-encryption and access control.
+reverse proxy (for example nginx, Caddy, or Envoy) that provides access control
+and terminates TLS when it is not configured in fleet-router.
 
 ### Trust boundary
 
@@ -107,9 +110,9 @@ scope, including (non-exhaustively):
 
 ### Out of scope
 
-- The absence of TLS, client authentication, or authorization on the listener,
-  the chain API port, and the metrics endpoint (see the design limitations
-  above).
+- Plaintext transport when client TLS is not configured, plaintext metrics,
+  and the absence of client authentication or authorization on the listener,
+  the chain API port, and the metrics endpoint (see the design limitations above).
 - Issues that require a malicious or compromised upstream that you have
   explicitly configured and trusted, beyond the memory-safety expectations
   noted above.

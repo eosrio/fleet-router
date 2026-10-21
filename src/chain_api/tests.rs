@@ -1104,3 +1104,170 @@ async fn control_api_changes_apply_to_the_chain_api() {
     }
     let _ = served.shutdown.send(());
 }
+
+#[tokio::test]
+async fn https_chain_api_serves_requests_with_sni_and_hot_reload() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let write_cert =
+        |prefix: &str, names: &[&str]| -> (std::path::PathBuf, std::path::PathBuf, Vec<u8>) {
+            let certified = rcgen::generate_simple_self_signed(
+                names.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let cert_path = dir.path().join(format!("{prefix}.pem"));
+            let key_path = dir.path().join(format!("{prefix}.key"));
+            let der = certified.cert.der().to_vec();
+            std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+            std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+            (cert_path, key_path, der)
+        };
+
+    let (def_cert, def_key, def_der) = write_cert("default", &["localhost", "default.example.com"]);
+    let (sni_cert, sni_key, sni_der) = write_cert("wax", &["*.wax.example.com"]);
+
+    let live = live_api().await;
+    let served = serve_servers(
+        json!([
+            {
+                "name": "http-only-live",
+                "http_endpoint": live.url(),
+                "enabled": true
+            }
+        ]),
+        json!({
+            "listen_port": 1,
+            "probe_ms": 100,
+            "tls": {
+                "cert_file": def_cert,
+                "key_file": def_key,
+                "sni": [
+                    {
+                        "server_names": ["*.wax.example.com"],
+                        "cert_file": sni_cert,
+                        "key_file": sni_key
+                    }
+                ]
+            }
+        }),
+    )
+    .await;
+    wait_up(&served, 0).await;
+
+    #[derive(Debug)]
+    struct NoVerify;
+    impl rustls::client::danger::ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    let mut client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(NoVerify))
+    .with_no_client_auth();
+    client_cfg.resumption = rustls::client::Resumption::disabled();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+
+    let https_post = |sni_host: &str, path: &str, body: &[u8]| {
+        let connector = connector.clone();
+        let addr = served.addr;
+        let sni_host = sni_host.to_string();
+        let path = path.to_string();
+        let body = body.to_vec();
+        async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let sni = rustls::pki_types::ServerName::try_from(sni_host.clone()).unwrap();
+            let mut tls = connector.connect(sni, tcp).await.unwrap();
+            let peer_der = tls.get_ref().1.peer_certificates().unwrap()[0]
+                .as_ref()
+                .to_vec();
+            let req = format!(
+                "POST {path} HTTP/1.1\r\nHost: {sni_host}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            tls.write_all(req.as_bytes()).await.unwrap();
+            tls.write_all(&body).await.unwrap();
+            let mut raw = Vec::new();
+            tls.read_to_end(&mut raw).await.unwrap();
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            (peer_der, text)
+        }
+    };
+
+    // Default cert + HTTP-only live upstream routing for /v1/chain/get_info.
+    let (peer_der, resp) = https_post("default.example.com", "/v1/chain/get_info", b"").await;
+    assert_eq!(peer_der, def_der);
+    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+    assert!(resp.contains("\"served_by\":\"live-1\""), "{resp}");
+
+    // SNI wildcard match (*.wax.example.com) + /v1/chain/get_account routing.
+    let (peer_der_sni, resp_sni) =
+        https_post("api.wax.example.com", "/v1/chain/get_account", b"{}").await;
+    assert_eq!(peer_der_sni, sni_der);
+    assert!(resp_sni.starts_with("HTTP/1.1 200 OK\r\n"), "{resp_sni}");
+
+    // Hot-reload default certificate on disk and verify new connections use it.
+    let rotated = rcgen::generate_simple_self_signed(vec![
+        "default.example.com".to_string(),
+        "rotated-extra-san.example.com".to_string(),
+    ])
+    .unwrap();
+    let rotated_der = rotated.cert.der().to_vec();
+    std::fs::write(&def_cert, format!("{}\n", rotated.cert.pem())).unwrap();
+    std::fs::write(&def_key, rotated.key_pair.serialize_pem()).unwrap();
+
+    let reloaded = served
+        .ctx
+        .tls
+        .as_ref()
+        .unwrap()
+        .resolver()
+        .reload_if_changed()
+        .unwrap();
+    assert_eq!(reloaded, 1);
+
+    let (peer_der_after, resp_after) =
+        https_post("default.example.com", "/v1/chain/get_info", b"").await;
+    assert_eq!(peer_der_after, rotated_der);
+    assert!(
+        resp_after.starts_with("HTTP/1.1 200 OK\r\n"),
+        "{resp_after}"
+    );
+
+    let _ = served.shutdown.send(());
+    let _ = served.task.await;
+}

@@ -16,8 +16,9 @@ use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 use tokio::time::{sleep, Sleep};
+
+use crate::tls::ClientStream;
 
 use super::stats::{ApiStats, Rejection};
 
@@ -33,10 +34,10 @@ impl std::fmt::Display for Stalled {
 
 impl std::error::Error for Stalled {}
 
-/// A client's TCP stream whose writes fail once they have waited `stall`
-/// with no progress. A cut counts as `rejected{reason="timeout"}`.
+/// A client's stream (plain TCP or TLS) whose writes fail once they have waited
+/// `stall` with no progress. A cut counts as `rejected{reason="timeout"}`.
 pub struct Socket {
-    tcp: TcpStream,
+    stream: ClientStream,
     stall: Duration,
     stats: Arc<ApiStats>,
     timer: Option<Pin<Box<Sleep>>>,
@@ -45,9 +46,9 @@ pub struct Socket {
 }
 
 impl Socket {
-    pub fn new(tcp: TcpStream, stall: Duration, stats: Arc<ApiStats>) -> Socket {
+    pub fn new(stream: ClientStream, stall: Duration, stats: Arc<ApiStats>) -> Socket {
         Socket {
-            tcp,
+            stream,
             stall,
             stats,
             timer: None,
@@ -75,7 +76,7 @@ impl Socket {
         ready!(timer.as_mut().poll(cx));
         self.stats.rejected.inc(Rejection::Timeout);
         tracing::debug!(
-            peer = ?self.tcp.peer_addr().ok(),
+            peer = ?self.stream.peer_addr().ok(),
             "chain API client took none of its answer in time; closing"
         );
         Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, Stalled)))
@@ -88,7 +89,7 @@ impl AsyncRead for Socket {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().tcp).poll_read(cx, buf)
+        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
     }
 }
 
@@ -99,7 +100,7 @@ impl AsyncWrite for Socket {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        let write = Pin::new(&mut this.tcp).poll_write(cx, buf);
+        let write = Pin::new(&mut this.stream).poll_write(cx, buf);
         this.progress(cx, write)
     }
 
@@ -109,21 +110,21 @@ impl AsyncWrite for Socket {
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        let write = Pin::new(&mut this.tcp).poll_write_vectored(cx, bufs);
+        let write = Pin::new(&mut this.stream).poll_write_vectored(cx, bufs);
         this.progress(cx, write)
     }
 
     fn is_write_vectored(&self) -> bool {
-        self.tcp.is_write_vectored()
+        self.stream.is_write_vectored()
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        let flush = Pin::new(&mut this.tcp).poll_flush(cx);
+        let flush = Pin::new(&mut this.stream).poll_flush(cx);
         this.progress(cx, flush)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().tcp).poll_shutdown(cx)
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
     }
 }

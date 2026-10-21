@@ -1,0 +1,160 @@
+/* Read-mode extension of the existing fleet-router theme. */
+.guide-layout {
+  display: grid;
+  grid-template-columns: 14rem minmax(0, 1fr);
+  gap: 0 4rem;
+  align-items: start;
+  padding-block: 3.5rem 5rem;
+}
+
+.guide-toc {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  position: sticky;
+  top: calc(var(--mast) + 2rem);
+  border-top: 1px solid var(--rule-strong);
+  padding-top: 1rem;
+  font-size: 0.875rem;
+}
+
+.guide-toc h2 {
+  font-size: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.guide-toc ol {
+  list-style: none;
+  padding: 0;
+}
+
+.guide-toc li + li {
+  margin-top: 0.65rem;
+}
+
+.guide-toc a {
+  color: var(--ink-2);
+}
+
+.guide-body {
+  grid-column: 2;
+  min-width: 0;
+  max-width: 75ch;
+  overflow-wrap: anywhere;
+}
+
+.guide-intro {
+  grid-row: 1;
+}
+
+.guide-body h1 {
+  font-size: 2.75rem;
+  line-height: 1.12;
+  margin-bottom: 1.5rem;
+}
+
+.guide-body h2 {
+  font-size: 1.6rem;
+  line-height: 1.25;
+  border-top: 1px solid var(--rule-strong);
+  padding-top: 1.5rem;
+  margin-top: 3.5rem;
+  margin-bottom: 1.25rem;
+  scroll-margin-top: calc(var(--mast) + 2rem);
+}
+
+.guide-body p,
+.guide-body ul,
+.guide-body ol {
+  margin-bottom: 1.25rem;
+  color: var(--ink-2);
+}
+
+.guide-body strong {
+  color: var(--ink);
+}
+
+.guide-body ul,
+.guide-body ol {
+  padding-left: 1.4rem;
+}
+
+.guide-body li + li {
+  margin-top: 0.65rem;
+}
+
+.guide-body .codeblock {
+  margin-block: 1.5rem;
+}
+
+.guide-body pre {
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.guide-table {
+  overflow-x: auto;
+  margin-block: 1.5rem;
+}
+
+.guide-table table {
+  width: 100%;
+  min-width: 38rem;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+  overflow-wrap: normal;
+}
+
+.guide-table th,
+.guide-table td {
+  text-align: left;
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: top;
+}
+
+.guide-table th {
+  font-weight: 600;
+}
+
+.guide-table td code {
+  white-space: nowrap;
+}
+
+@media (max-width: 979.98px) {
+  .guide-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2rem;
+    padding-top: 2rem;
+  }
+
+  .guide-toc {
+    position: static;
+    grid-column: auto;
+    grid-row: auto;
+  }
+
+  .guide-toc ol {
+    columns: 2;
+    column-gap: 2rem;
+  }
+
+  .guide-toc li {
+    break-inside: avoid;
+  }
+
+  .guide-body {
+    grid-column: auto;
+    grid-row: auto;
+    max-width: 100%;
+  }
+}
+
+@media (max-width: 559.98px) {
+  .guide-body h1 {
+    font-size: 2rem;
+  }
+
+  .guide-toc ol {
+    columns: 1;
+  }
+}

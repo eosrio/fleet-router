@@ -1,0 +1,40 @@
+{
+  "listen_address": "10.0.0.10",
+  "upstream_reconnect_ms": 3000,
+  "upstream_monitoring_ms": 5000,
+  "upstream_status_ms": 1000,
+  "metrics_address": "127.0.0.1",
+  "metrics_port": 9090,
+  "dashboard": { "enabled": true },
+  "listeners": [
+    {
+      "name": "main",
+      "listen_port": 17000,
+      "chain_id": "aca376f206b8fc25a6ed44dbdc66547c36c6c33e3a119ffbeaef943642f0e906",
+      "require_chain_id": true,
+      "topology": "stitched",
+      "stitching": {
+        "history_preference": "frozen",
+        "predial_blocks": 2000,
+        "gap_wait_ms": 30000,
+        "patch_head_lib": true
+      },
+      "servers": [
+        {
+          "name": "archive-a", "endpoint": "10.0.0.21:8080", "enabled": true,
+          "role": "frozen", "range": { "begin": 1000001, "end": 2000001 },
+          "max_sessions": 24
+        },
+        {
+          "name": "archive-b", "endpoint": "10.0.0.22:8080", "enabled": true,
+          "role": "frozen", "range": { "begin": 2000001, "end": 3000001 },
+          "max_sessions": 24
+        },
+        {
+          "name": "live-1", "endpoint": "10.0.0.31:8080", "enabled": true,
+          "role": "live"
+        }
+      ]
+    }
+  ]
+}

@@ -62,6 +62,7 @@ use tokio::time::timeout_at;
 
 use crate::fleet::{FleetHub, MetricLabel};
 use crate::models::{ApiClass, ChainApiConfig, ChainApiCors, ResolvedChainApi, Role};
+use crate::tls::{ClientStream, TlsAcceptorHandle, DEFAULT_TLS_RELOAD_INTERVAL};
 
 use directory::{ApiDirectory, ApiSlot, Snapshot};
 use errors::{Busy, RouterError, OPTIONS_BODY};
@@ -322,6 +323,7 @@ pub struct ChainApiCtx {
     in_flight: Arc<Semaphore>,
     /// One permit per open client connection.
     pub connections: Arc<Semaphore>,
+    pub tls: Option<TlsAcceptorHandle>,
     cors: Option<CorsHeaders>,
     /// `ServerState::index` of each `push_servers` entry.
     push: Vec<usize>,
@@ -338,12 +340,35 @@ pub struct ChainApiCtx {
 impl ChainApiCtx {
     /// `connect_timeout` bounds upstream connects; `handshake_timeout_ms`
     /// (10 s when 0) bounds a client's request head and body.
+    #[cfg(test)]
     pub fn new(
         api: &ResolvedChainApi,
         hub: Arc<FleetHub>,
         connect_timeout: Duration,
         handshake_timeout_ms: u64,
         live_lag_blocks: u32,
+    ) -> Arc<ChainApiCtx> {
+        let tls = api
+            .tls
+            .as_ref()
+            .and_then(|cfg| TlsAcceptorHandle::from_config(cfg).ok());
+        Self::with_tls(
+            api,
+            hub,
+            connect_timeout,
+            handshake_timeout_ms,
+            live_lag_blocks,
+            tls,
+        )
+    }
+
+    pub fn with_tls(
+        api: &ResolvedChainApi,
+        hub: Arc<FleetHub>,
+        connect_timeout: Duration,
+        handshake_timeout_ms: u64,
+        live_lag_blocks: u32,
+        tls: Option<TlsAcceptorHandle>,
     ) -> Arc<ChainApiCtx> {
         let cfg = api.cfg.clone();
         Arc::new(ChainApiCtx {
@@ -359,6 +384,7 @@ impl ChainApiCtx {
             probe_client: UpstreamClient::new(connect_timeout, PROBE_POOL_PER_UPSTREAM),
             in_flight: Arc::new(Semaphore::new(cfg.max_in_flight)),
             connections: Arc::new(Semaphore::new(cfg.max_connections)),
+            tls,
             cors: cfg.cors.as_ref().and_then(CorsHeaders::new),
             push: api.push.clone(),
             live_lag_blocks,
@@ -395,6 +421,13 @@ impl ChainApiCtx {
         });
         for slot in self.directory.slots() {
             tokio::spawn(prober.clone().run(slot.clone(), shutdown.subscribe()));
+        }
+        if let Some(tls) = &self.tls {
+            let label = match &self.listener {
+                Some(name) => format!("chain_api:{name}"),
+                None => "chain_api".to_string(),
+            };
+            tls.spawn_reload_task(label, DEFAULT_TLS_RELOAD_INTERVAL, shutdown.subscribe());
         }
         tokio::spawn(self.clone().serve(listener, shutdown.subscribe()))
     }
@@ -452,6 +485,16 @@ impl ChainApiCtx {
         mut shutdown: broadcast::Receiver<()>,
     ) {
         let _ = stream.set_nodelay(true);
+        let stream = match &self.tls {
+            Some(acceptor) => match acceptor.accept(stream, self.read_timeout).await {
+                Ok(tls_stream) => tls_stream,
+                Err(e) => {
+                    tracing::debug!(error = %e, "chain API TLS handshake failed");
+                    return;
+                }
+            },
+            None => ClientStream::Plain(stream),
+        };
         let stream = Socket::new(stream, self.read_timeout, self.stats.clone());
         let ctx = self.clone();
         let service = service_fn(move |request| {

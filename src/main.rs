@@ -45,6 +45,7 @@ use crate::ship::Range;
 use crate::tasks::{
     apply_status_update, monitoring_connection, state_monitoring_loop, upstream_ws_config,
 };
+use crate::tls::{TlsAcceptorHandle, DEFAULT_TLS_RELOAD_INTERVAL};
 
 mod abi;
 mod api;
@@ -61,6 +62,7 @@ mod tasks;
 mod telemetry;
 #[cfg(test)]
 mod test_log;
+mod tls;
 mod zcd;
 
 #[tokio::main]
@@ -110,11 +112,21 @@ async fn main() -> Result<()> {
     };
     let limits = config.proxy_limits();
     let resolved_listeners = config.resolved_listeners();
+    let resolved_listener_tls = config.resolved_listener_tls();
     let resolved_chain_apis = config.resolved_chain_apis();
 
-    // Bind all client TCP listeners up front so any port conflict fails fast.
+    // Bind all client TCP listeners and load TLS certificates up front so any
+    // port conflict or bad PEM file fails fast.
     let mut bound_listeners = Vec::with_capacity(resolved_listeners.len());
-    for (listener_cfg, chain_api) in resolved_listeners.into_iter().zip(resolved_chain_apis) {
+    for ((listener_cfg, listener_tls_cfg), chain_api) in resolved_listeners
+        .into_iter()
+        .zip(resolved_listener_tls)
+        .zip(resolved_chain_apis)
+    {
+        let listener_tls = match &listener_tls_cfg {
+            Some(tls_cfg) => Some(TlsAcceptorHandle::from_config(tls_cfg)?),
+            None => None,
+        };
         let bind_addr = format_bind_addr(&listener_cfg.listen_address, listener_cfg.listen_port);
         let tcp_listener = TcpListener::bind(&bind_addr)
             .await
@@ -125,6 +137,7 @@ async fn main() -> Result<()> {
                     listener = %name,
                     address = %listener_cfg.listen_address,
                     port = listener_cfg.listen_port,
+                    tls = listener_tls.is_some(),
                     "listening for clients"
                 );
                 if listener_cfg.expected_chain_id.is_none() {
@@ -139,6 +152,7 @@ async fn main() -> Result<()> {
                 tracing::info!(
                     address = %listener_cfg.listen_address,
                     port = listener_cfg.listen_port,
+                    tls = listener_tls.is_some(),
                     "listening for clients"
                 );
             }
@@ -146,6 +160,10 @@ async fn main() -> Result<()> {
         // The listener's chain API, bound with the SHiP listeners.
         let chain_api = match chain_api {
             Some(api) => {
+                let api_tls = match &api.tls {
+                    Some(tls_cfg) => Some(TlsAcceptorHandle::from_config(tls_cfg)?),
+                    None => None,
+                };
                 let api_listener = TcpListener::bind(&api.bind).await.map_err(|e| {
                     anyhow::anyhow!("error binding the chain API to {}: {}", api.bind, e)
                 })?;
@@ -153,13 +171,14 @@ async fn main() -> Result<()> {
                     listener = listener_cfg.name.as_deref().unwrap_or("default"),
                     address = %api.bind,
                     upstreams = api.upstreams.len(),
+                    tls = api_tls.is_some(),
                     "chain API listening"
                 );
-                Some((api, api_listener))
+                Some((api, api_listener, api_tls))
             }
             None => None,
         };
-        bound_listeners.push((listener_cfg, tcp_listener, chain_api));
+        bound_listeners.push((listener_cfg, listener_tls, tcp_listener, chain_api));
     }
 
     // Graceful-shutdown broadcast: every long-lived task subscribes.
@@ -171,7 +190,7 @@ async fn main() -> Result<()> {
     let mut accept_handles = Vec::with_capacity(bound_listeners.len());
     let mut chain_apis = Vec::new();
 
-    for (listener_cfg, tcp_listener, chain_api) in bound_listeners {
+    for (listener_cfg, listener_tls, tcp_listener, chain_api) in bound_listeners {
         let server_config_db: ServerConfigDb = build_config_db(listener_cfg.servers.clone());
         let server_state_db: ServerStateDb = build_state_db_with_chain_id(
             listener_cfg.servers.clone(),
@@ -188,13 +207,14 @@ async fn main() -> Result<()> {
 
         // The listener's chain API, served further down; readiness, coverage
         // and metrics read it.
-        let chain_api = chain_api.map(|(api, api_listener)| {
-            let api_ctx = chain_api::ChainApiCtx::new(
+        let chain_api = chain_api.map(|(api, api_listener, api_tls)| {
+            let api_ctx = chain_api::ChainApiCtx::with_tls(
                 &api,
                 hub.clone(),
                 Duration::from_millis(limits.connect_timeout_ms),
                 limits.handshake_timeout_ms,
                 config.live_lag_blocks,
+                api_tls,
             );
             (api_ctx, api_listener)
         });
@@ -212,7 +232,7 @@ async fn main() -> Result<()> {
             order: listener_cfg
                 .servers
                 .iter()
-                .filter(|s| s.enabled)
+                .filter(|s| s.enabled && s.has_ship_endpoint())
                 .map(|s| s.endpoint.clone())
                 .collect(),
             port: listener_cfg.listen_port,
@@ -222,8 +242,13 @@ async fn main() -> Result<()> {
         });
         health_states.push(health_state);
 
-        // Per-upstream monitoring loops for this listener's pool.
-        for server in listener_cfg.servers.iter().filter(|s| s.enabled).cloned() {
+        // Per-upstream monitoring loops for this listener's SHiP pool.
+        for server in listener_cfg
+            .servers
+            .iter()
+            .filter(|s| s.enabled && s.has_ship_endpoint())
+            .cloned()
+        {
             match &listener_cfg.name {
                 Some(listener_name) => {
                     tracing::info!(
@@ -249,8 +274,23 @@ async fn main() -> Result<()> {
             ));
         }
 
+        if let Some(tls) = &listener_tls {
+            let label = listener_cfg
+                .name
+                .as_deref()
+                .unwrap_or("default")
+                .to_string();
+            tls.spawn_reload_task(label, DEFAULT_TLS_RELOAD_INTERVAL, shutdown_tx.subscribe());
+        }
+
         // What every client session of this listener shares.
-        let ctx = ListenerCtx::new(&listener_cfg, limits, config.live_lag_blocks, hub.clone());
+        let ctx = ListenerCtx::with_tls(
+            &listener_cfg,
+            limits,
+            config.live_lag_blocks,
+            hub.clone(),
+            listener_tls,
+        );
 
         // The chain API: its probes and its accept loop. Its connections
         // drain with the SHiP ones. `chain_apis` lines up with the
@@ -737,6 +777,18 @@ async fn run_tests(config: &ServerConfig, strict: bool) -> bool {
         // Stitched: the status of every server that answered with an ABI.
         let mut statuses: Vec<(String, Option<Vec<u8>>)> = Vec::new();
         for server in &listener.servers {
+            if !server.has_ship_endpoint() {
+                if let Some(api_ep) = &server.api_endpoint {
+                    cprintln!(
+                        "\n 🌐 HTTP-only server <bright-cyan>{}</> ({})",
+                        server.name,
+                        api_ep
+                    );
+                    listener_valid += 1;
+                    total_valid += 1;
+                }
+                continue;
+            }
             let endpoint = server.ws_url();
             cprintln!("\n 🧪 Testing <bright-cyan>{}</>", endpoint);
             match probe_upstream(&endpoint, config.max_message_bytes, bound).await {

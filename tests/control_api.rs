@@ -177,7 +177,12 @@ async fn restarted_synced_nodes_do_not_alternate_dashboard_lag() {
         ..MockShipConfig::live(1, 10_000)
     };
     let a = MockShipServer::new(config.clone()).await;
-    let b = MockShipServer::new(config).await;
+    let peer_polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let b = MockShipServer::new(MockShipConfig {
+        status_requests: Some(peer_polls.clone()),
+        ..config
+    })
+    .await;
     let (ep_a, ep_b) = (a.endpoint(), b.endpoint());
     let (a, b) = (a.start(), b.start());
     let router = Router::start(
@@ -208,6 +213,28 @@ async fn restarted_synced_nodes_do_not_alternate_dashboard_lag() {
     assert_eq!(only_session(&http, &router).await["upstream"], ep_b);
     router.wait_until_all_up(&http, 2).await;
 
+    // Anchor the returning monitor halfway between observed peer polls.
+    // A delay measured from client reads can accidentally realign both polls.
+    let previous_poll = peer_polls.load(std::sync::atomic::Ordering::Relaxed);
+    timeout(Duration::from_secs(5), async {
+        while peer_polls.load(std::sync::atomic::Ordering::Relaxed) == previous_poll {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("peer monitor stopped polling");
+    sleep(Duration::from_millis(250)).await;
+    let accepted = a.sessions_accepted();
+    a.close_sessions();
+    timeout(Duration::from_secs(5), async {
+        while a.sessions_accepted() == accepted {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("restarted monitor did not reconnect");
+    router.wait_until_all_up(&http, 2).await;
+
     let mut saw_different_samples = false;
     for step in 1..=40 {
         let head = 10_000 + step * 2;
@@ -225,12 +252,12 @@ async fn restarted_synced_nodes_do_not_alternate_dashboard_lag() {
         let upstreams = status["listeners"][0]["upstreams"].as_array().unwrap();
         let best = upstreams
             .iter()
-            .filter_map(|u| u["head_block"].as_u64())
+            .filter_map(|u| u["chain_head_block"].as_u64())
             .max()
             .unwrap();
         saw_different_samples |= upstreams
             .iter()
-            .any(|u| u["head_block"].as_u64() != Some(best));
+            .any(|u| u["chain_head_block"].as_u64() != Some(best));
         for upstream in upstreams {
             assert_eq!(
                 upstream["head_lag_blocks"], 0,

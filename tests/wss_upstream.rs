@@ -75,7 +75,10 @@ fn test_server_config(ca_pem: &mut impl Write) -> Arc<ServerConfig> {
     server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
+        .signed_by(
+            &server_key,
+            &rcgen::Issuer::from_params(&ca_params, &ca_key),
+        )
         .expect("server cert");
 
     let certs = vec![CertificateDer::from(server_cert.der().to_vec())];

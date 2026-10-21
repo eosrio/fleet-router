@@ -4908,7 +4908,7 @@ mod tests {
             let cert_p = dir.path().join(format!("{name}.pem"));
             let key_p = dir.path().join(format!("{name}.key"));
             std::fs::write(&cert_p, c.cert.pem()).unwrap();
-            std::fs::write(&key_p, c.key_pair.serialize_pem()).unwrap();
+            std::fs::write(&key_p, c.signing_key.serialize_pem()).unwrap();
             (cert_p, key_p)
         };
         let (def_cert, def_key) = make_cert("default");

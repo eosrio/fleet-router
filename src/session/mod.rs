@@ -7616,7 +7616,7 @@ mod tests {
         let cert_path = dir.path().join("ship.pem");
         let key_path = dir.path().join("ship.key");
         std::fs::write(&cert_path, certified.cert.pem()).unwrap();
-        std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&key_path, certified.signing_key.serialize_pem()).unwrap();
 
         let tls_cfg = crate::tls::TlsConfig {
             cert_file: cert_path,

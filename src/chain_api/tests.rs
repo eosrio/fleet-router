@@ -1120,7 +1120,7 @@ async fn https_chain_api_serves_requests_with_sni_and_hot_reload() {
             let key_path = dir.path().join(format!("{prefix}.key"));
             let der = certified.cert.der().to_vec();
             std::fs::write(&cert_path, certified.cert.pem()).unwrap();
-            std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+            std::fs::write(&key_path, certified.signing_key.serialize_pem()).unwrap();
             (cert_path, key_path, der)
         };
 
@@ -1248,7 +1248,7 @@ async fn https_chain_api_serves_requests_with_sni_and_hot_reload() {
     .unwrap();
     let rotated_der = rotated.cert.der().to_vec();
     std::fs::write(&def_cert, format!("{}\n", rotated.cert.pem())).unwrap();
-    std::fs::write(&def_key, rotated.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&def_key, rotated.signing_key.serialize_pem()).unwrap();
 
     let reloaded = served
         .ctx

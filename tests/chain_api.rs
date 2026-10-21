@@ -1308,6 +1308,11 @@ async fn priority_and_weight_steer_the_choice_within_a_tier() {
         json!({}),
     ))
     .await;
+    // Startup probes can verify the backup before the preferred archive.
+    // Measure priority only after the preferred archive is eligible.
+    wait_served(port, RAW_BLOCK, &raw(5), "archive-preferred").await;
+    backup.api.clear_requests();
+    preferred.api.clear_requests();
     // Priority within the archive tier, whatever the block.
     for n in [5, 4096 * 3, 16_000] {
         let answer = wait_served(port, RAW_BLOCK, &raw(n), "archive-preferred").await;
@@ -1317,6 +1322,7 @@ async fn priority_and_weight_steer_the_choice_within_a_tier() {
     // Equal priority and load: the higher weight first; a worse priority
     // never, whatever its weight.
     wait_served(port, GET_ACCOUNT, "{}", "live-heavy").await;
+    low.api.clear_requests();
     for _ in 0..5 {
         assert_eq!(
             served_by(&post(port, GET_ACCOUNT, "{}").await).as_deref(),

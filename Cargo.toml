@@ -63,7 +63,7 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "json
 
 [dev-dependencies]
 mock-ship = { path = "mock-ship" }
-rcgen = { version = "0.13.2", default-features = false, features = ["pem", "ring"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 reqwest = { version = "0.13", features = ["json"] }
 tempfile = "3"
 serde_json = "1"

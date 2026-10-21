@@ -132,6 +132,7 @@ pub struct ListenerStats {
 pub struct SessionInfo {
     pub id: u64,
     pub listener: Arc<str>,
+    pub config_generation: u64,
     pub client: SocketAddr,
     pub started_ms: u64,
     upstream: Mutex<String>,
@@ -397,14 +398,26 @@ impl Telemetry {
     }
 
     /// Add a session to the registry. It is removed when the returned guard drops.
+    #[cfg(test)]
     pub fn register_session(
         &self,
         listener: Arc<str>,
         client: SocketAddr,
         upstream: &str,
     ) -> SessionRegistration {
+        self.register_generation(listener, client, upstream, 0)
+    }
+
+    pub fn register_generation(
+        &self,
+        listener: Arc<str>,
+        client: SocketAddr,
+        upstream: &str,
+        config_generation: u64,
+    ) -> SessionRegistration {
         let _change = self.begin_change();
         let info = Arc::new(SessionInfo {
+            config_generation,
             id: self.next_session_id.fetch_add(1, Ordering::Relaxed),
             listener,
             client,

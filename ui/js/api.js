@@ -61,6 +61,10 @@ async function request(method, path, { body, token, auth = false } = {}) {
 }
 
 export const api = {
+  config: () => request("GET", "config", { auth: true }),
+  validateConfig: (body) => request("POST", "config/validate", { auth: true, body }),
+  saveConfig: (body) => request("PUT", "config", { auth: true, body }),
+  reloadConfig: (body) => request("POST", "config/reload", { auth: true, body }),
   checkToken: (token) => request("GET", "auth", { auth: true, token }),
 
   upstreamAction(listener, endpoint, action) {

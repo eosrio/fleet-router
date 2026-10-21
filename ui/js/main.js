@@ -1,5 +1,6 @@
 // Dashboard entry point: theme, view routing, live stream, and wiring.
 
+import { initConfig, renderConfig, setConfigActive, syncConfigMode } from "./config.js";
 import { openStream } from "./api.js";
 import {
   controlMode,
@@ -15,7 +16,7 @@ import { initSessions, renderSessions, setSessionsActive, setSessionsControlMode
 import { applyDashboardFrame, on, store } from "./store.js";
 import { announce, duration, setText, storageSet } from "./util.js";
 
-const VIEWS = ["fleet", "sessions", "events"];
+const VIEWS = ["fleet", "sessions", "events", "config"];
 let view = "fleet";
 
 /* ---------- theme ---------- */
@@ -53,6 +54,7 @@ function showView(name, { focus = false } = {}) {
     else link.removeAttribute("aria-current");
   }
   setSessionsActive(view === "sessions");
+  setConfigActive(view === "config");
   if (view === "events") {
     renderAll();
     markEventsSeen();
@@ -102,6 +104,7 @@ on((kind, payload) => {
     const status = store.status;
     syncControlState(status);
     renderFleet(status);
+    renderConfig(status);
     syncSessionFilters(status);
     renderSessions();
     syncEventListenerOptions(status.listeners.map((l) => l.name));
@@ -136,9 +139,11 @@ function main() {
     onModeChange(mode) {
       setControlMode(mode);
       setSessionsControlMode(mode);
+      syncConfigMode();
     },
   });
   setControlMode(controlMode());
+  initConfig();
   initRouting();
   renderRecent();
 

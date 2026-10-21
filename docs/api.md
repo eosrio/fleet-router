@@ -6,7 +6,7 @@ The dashboard is **off by default**. Turn it on with [`dashboard.enabled`](confi
 | --- | --- |
 | `/ui/` | Live dashboard (browser). `/` redirects here. |
 | `/status` | Plain status page: server-rendered HTML, no JavaScript. |
-| `/api/v1/...` | JSON API used by both pages. Read endpoints are open; control endpoints need a token. |
+| `/api/v1/...` | JSON API used by both pages. Status reads are open; control and configuration endpoints need a token. |
 | `/health`, `/ready`, `/ready/<listener>`, `/coverage`, `/metrics` | Unchanged. See [Observability](observability.md). |
 
 The endpoint has the same exposure as `/metrics`: keep it on a trusted network. The API shows upstream addresses and client IP addresses. See [Security](#security).
@@ -15,6 +15,7 @@ The endpoint has the same exposure as `/metrics`: keep it on a trusted network. 
 - [Read endpoints](#read-endpoints)
 - [Live stream](#live-stream)
 - [Control endpoints](#control-endpoints)
+- [Configuration endpoints](#configuration-endpoints)
 - [Security](#security)
 
 ## Conventions
@@ -33,11 +34,12 @@ Full router state. The [dashboard stream](#get-apiv1dashboardstream) includes th
 
 ```json
 {
-  "version": "0.7.0",
+  "version": "0.8.0",
   "now_ms": 1760700000000,
   "started_ms": 1760690000000,
   "uptime_secs": 10000,
   "control": { "enabled": true },
+  "config": { "revision": 1, "draining": [] },
   "totals": { "sessions": 12, "upstreams": 3, "upstreams_up": 2 },
   "listeners": [
     {
@@ -85,6 +87,8 @@ Full router state. The [dashboard stream](#get-apiv1dashboardstream) includes th
   ]
 }
 ```
+
+`config.revision` increases on each configuration apply and starts at 1 on process startup. `config.draining` lists retired listener generations as `{listener, generation, sessions, chain_api_connections}` until their established connections finish. `totals.sessions` includes those SHiP sessions; `listeners` describes the currently accepting topology. Session objects add `config_generation` and `draining`; moving a draining session uses its retained upstream pool. Listener/upstream controls target the current generation. Health, readiness and Prometheus topology describe the current generation; use the draining list and session API to inspect retired connections.
 
 `status` is one word for display, chosen in this order:
 
@@ -266,7 +270,7 @@ A `: keepalive` comment is sent every 15 seconds. On reconnect, call `GET /api/v
 
 ## Control endpoints
 
-Control endpoints change routing at runtime. **Changes are not written to the config file** and are lost on restart; the next start uses the config again.
+These routing controls change runtime state. **They do not write the config file** and are lost on restart. Configuration save/reload is a separate operation below. Unchanged listener generations retain routing overrides on reload; replacements take configured priority and weight while retaining operator-disabled state for matching SHiP endpoints under the same chain policy.
 
 Every control request needs `Authorization: Bearer <token>`. The token comes from `dashboard.control_token_file`, `dashboard.control_token`, or the `FLEET_ROUTER_CONTROL_TOKEN` environment variable (see [Dashboard](configuration.md#dashboard)). Without a configured token, the control API is off: these endpoints return `403` and `status.control.enabled` is `false`. A wrong or missing token returns `401`.
 
@@ -288,12 +292,41 @@ Upstream actions return the updated upstream object (same shape as in `status`).
 
 A moved session avoids the upstream it left until its next link is up. If no other upstream can take it after all (the target filled up or failed meanwhile), it returns to the upstream it left instead of closing. A session whose dial lands on an upstream an operator disabled meanwhile goes to another upstream when one can take it. Disabling, draining and changing `priority` or `weight` also apply to the listener's [chain API](chain-api.md).
 
-Upstreams disabled in the config file (`"enabled": false`) are not monitored and cannot be enabled at runtime.
+Upstreams disabled in the config file (`"enabled": false`) are not monitored and cannot be enabled by the routing controls. Change the file or use the configuration editor and apply it to enable them.
+
+## Configuration endpoints
+
+All four endpoints require the same Bearer token as the routing controls, including the configuration read. They operate only on the file selected at startup; the client cannot choose a filesystem path.
+
+| Method and path | Body | Effect |
+| --- | --- | --- |
+| `GET /api/v1/config` | | Read the file, with its inline control token redacted. |
+| `POST /api/v1/config/validate` | Revision checks, optional `source` | Validate a draft or the current file, including reservation of new listening ports. Does not write or apply. |
+| `POST /api/v1/config/reload` | Revision checks, no `source` | Apply the current file without writing it. |
+| `PUT /api/v1/config` | Revision checks and `source` | Validate, atomically replace the file, and apply. |
+
+The read response is `{path, revision, disk_revision, source, disk_error, disk_matches_running, warnings}`. `source` is a JSON string; `disk_revision` is an opaque file-content version. If the file is malformed JSON, `disk_error` explains the error and `source` shows the running configuration so the editor can repair it. The inline token is replaced with `__FLEET_ROUTER_KEEP_SECRET__`; submitting that marker preserves the token. Token files and environment values are never returned.
+
+Send both versions from the read response with every mutation or validation:
+
+```json
+{
+  "expected_revision": 3,
+  "expected_disk_revision": "opaque value from GET",
+  "source": "{\"listen_address\":\"127.0.0.1\", ...}"
+}
+```
+
+The abbreviated `source` above represents the complete configuration JSON, not a patch. Omit it for reload. Validation returns `{listeners, upstreams, replaced_listeners, warnings}`. A successful apply returns `{applied: true, revision, disk_revision, summary, source, access_changed}`; `source` remains redacted and `summary` has the validation shape. Dashboard state then publishes the new configuration revision over the shared event stream.
+
+Stale runtime/file versions return `409`. Invalid configuration or resource preparation returns `400`; drafts over 1 MiB are refused. A rejected transaction leaves runtime state unchanged, and a rejected save leaves the file unchanged. A successful save uses a synced temporary file and atomic rename in the same directory, retaining file permissions. Apply continues if the requesting HTTP client disconnects, so reconnect and read the revision after a lost response. External editors should use atomic replacement and avoid writing during an apply; revision checks cannot lock an uncooperative external writer.
+
+Topology changes preserve established SHiP and chain API connections in their previous listener generations. They continue using the old pools, including failover, until they close. See [reload behavior and filesystem requirements](configuration.md#reloading-configuration). Changing access settings may require a new address or token. Open event streams recheck enabled/hostname policy on updates and close when access is revoked.
 
 ## Security
 
 - Nothing here is served unless `dashboard.enabled` is `true`. Upgrading does not expose new data on an existing `metrics_port`.
-- Once enabled, read endpoints, the dashboard and the live stream need no token, like `/metrics`, and they show client IP addresses. Bind `metrics_address` to a private interface, or put the port behind a reverse proxy with access control.
+- Once enabled, status read endpoints, the dashboard and the live stream need no token, like `/metrics`, and they show client IP addresses. The configuration read requires a token. Bind `metrics_address` to a private interface, or put the port behind a reverse proxy with access control.
 - Dashboard routes only answer requests addressed by IP, `localhost`, or a name listed in `dashboard.allowed_hosts`, so a page on another domain that rebinds its DNS to this router cannot read the API.
 - At most 32 live streams are open at once (`503` beyond that), and every HTTP connection serves one request, so the dashboard cannot crowd out health and readiness probes.
 - Control endpoints accept only the `Authorization` header (no cookies or query strings), so a cross-site page cannot send them on a visitor's behalf.

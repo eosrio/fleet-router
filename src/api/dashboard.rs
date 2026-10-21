@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use futures::Stream;
 use serde::Serialize;
@@ -203,6 +203,7 @@ impl Subscription {
 
 pub(super) async fn get_stream(
     State(app): State<SharedState>,
+    headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
     let permit = app.streams.clone().try_acquire_owned().map_err(|_| {
         ApiError::new(
@@ -211,14 +212,22 @@ pub(super) async fn get_stream(
         )
     })?;
     let stream = futures::stream::unfold(
-        (app.dashboard_feed.subscribe(), permit),
-        |(mut sub, permit)| async move {
+        (
+            app.dashboard_feed.subscribe(),
+            permit,
+            app.handle(),
+            headers,
+        ),
+        |(mut sub, permit, state, headers)| async move {
             let update = sub.next().await?;
+            if !super::stream_allowed(state.current()?.as_ref(), &headers) {
+                return None;
+            }
             let event = SseEvent::default()
                 .event("dashboard")
                 .id(update.revision.to_string())
                 .data(&update.data);
-            Some((Ok(event), (sub, permit)))
+            Some((Ok(event), (sub, permit, state, headers)))
         },
     );
     Ok(Sse::new(stream).keep_alive(
@@ -242,12 +251,15 @@ async fn capture(
     let telemetry = telemetry::global();
     loop {
         if let Some(generation) = telemetry.capture_version() {
-            let sessions = session_views(app).await;
+            let app = app.current();
+            let sessions = session_views(&app).await;
             let mut counts = HashMap::new();
             for session in &sessions {
-                *counts.entry(session.listener.clone()).or_default() += 1;
+                *counts
+                    .entry((session.listener.clone(), session.config_generation))
+                    .or_default() += 1;
             }
-            let status = status_with_session_counts(app, counts).await;
+            let status = status_with_session_counts(&app, counts).await;
             let mut transitions = Vec::new();
             for listener in &status.listeners {
                 for u in &listener.upstreams {
@@ -276,6 +288,8 @@ async fn capture(
 /// Runs once per process when the dashboard is enabled. The counter hot path
 /// never builds JSON or wakes viewers. Lifecycle bursts coalesce at four Hz.
 pub async fn run(app: SharedState, mut shutdown: broadcast::Receiver<()>) {
+    let state = app.handle();
+    drop(app);
     let telemetry = telemetry::global();
     let mut previous = HashMap::new();
     let mut last_event = 0;
@@ -291,6 +305,9 @@ pub async fn run(app: SharedState, mut shutdown: broadcast::Receiver<()>) {
             _ = shutdown.recv() => break,
             _ = sleep_until(next_publish) => {},
         }
+        let Some(app) = state.current() else {
+            break;
+        };
         let Capture {
             status,
             sessions,
@@ -359,6 +376,7 @@ mod tests {
                     ..Default::default()
                 }];
                 ListenerContext {
+                    config_generation: 0,
                     health: ListenerHealthState {
                         name: Some(name.into()),
                         state_db: build_state_db(servers.clone()),
@@ -375,6 +393,9 @@ mod tests {
             })
             .collect();
         Arc::new(AppState {
+            runtime: Default::default(),
+            config_revision: 0,
+            draining: Vec::new(),
             listeners,
             health: vec![],
             dashboard: true,
@@ -485,6 +506,7 @@ mod tests {
 
     fn publish(feed: &Feed, n: u64) {
         let status = StatusView {
+            config: Default::default(),
             version: "test",
             now_ms: n * 1000,
             started_ms: 1,

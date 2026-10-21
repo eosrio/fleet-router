@@ -43,6 +43,7 @@
         <a href="#fleet" data-view="fleet">Fleet</a>
         <a href="#sessions" data-view="sessions">Sessions <span class="count" id="nav-sessions"></span></a>
         <a href="#events" data-view="events">Events <span class="count" id="nav-events" hidden></span></a>
+        <a href="#config" data-view="config">Configuration</a>
       </nav>
 
       <div class="mast-actions">
@@ -143,6 +144,37 @@
       </div>
       <ol class="event-list event-list-full" id="all-events"></ol>
       <p class="empty" id="events-empty" hidden>No events match these filters.</p>
+    </section>
+    <section class="view" id="view-config" data-view="config" aria-labelledby="config-title" hidden>
+      <div class="view-head">
+        <h1 id="config-title">Configuration</h1>
+        <p class="view-summary" id="config-revision"></p>
+      </div>
+      <div id="config-locked" class="config-note">
+        <p>Unlock controls to read or edit the configuration file.</p>
+        <button type="button" class="button" id="config-unlock">Unlock controls</button>
+      </div>
+      <div id="config-editor" hidden>
+        <p class="config-path"><code id="config-path"></code></p>
+        <p class="config-note">Save edits here, or reload changes made in the file. Established streams keep their current configuration until they disconnect.</p>
+        <p class="config-warning" id="config-stale" role="status" hidden>The running configuration changed. Your draft is preserved; load the file again before applying.</p>
+        <div class="config-actions">
+          <button type="button" class="button" id="config-load">Load file</button>
+          <button type="button" class="button" id="config-reload">Reload file</button>
+          <span id="config-draft" class="config-draft"></span>
+          <button type="button" class="button" id="config-validate">Validate</button>
+          <button type="button" class="button button-primary" id="config-save">Save and apply</button>
+        </div>
+        <label class="config-label" for="config-source">Configuration (JSON)</label>
+        <textarea id="config-source" spellcheck="false" autocapitalize="off" autocomplete="off" aria-describedby="config-secret config-feedback"></textarea>
+        <p class="config-note" id="config-secret">The saved control token is hidden. Leave <code>__FLEET_ROUTER_KEEP_SECRET__</code> unchanged to preserve it.</p>
+        <p class="config-feedback" id="config-feedback" role="status" aria-live="polite"></p>
+      </div>
+      <section class="recent" id="config-draining" aria-labelledby="config-drain-title" hidden>
+        <h2 id="config-drain-title">Streams draining</h2>
+        <p class="config-note">These streams retain their previous upstream pool and failover policy. Their monitors stop after the last connection closes.</p>
+        <ul class="config-drains" id="config-drains"></ul>
+      </section>
     </section>
   </main>
 

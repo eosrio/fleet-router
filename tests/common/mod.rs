@@ -44,7 +44,7 @@ pub struct RouterProcess {
     /// Every listener's port, in config order.
     pub listener_ports: Vec<u16>,
     pub metrics_port: Option<u16>,
-    _cfg: NamedTempFile,
+    _cfg: tempfile::TempPath,
 }
 
 impl RouterProcess {
@@ -95,7 +95,7 @@ impl RouterProcess {
                 listen_port: listener_ports[0],
                 listener_ports,
                 metrics_port,
-                _cfg: file,
+                _cfg: file.into_temp_path(),
             };
             match router.wait_ready().await {
                 Ok(()) => return router,
@@ -353,11 +353,14 @@ pub async fn read_msg(r: &mut WsReader, within: Duration) -> Message {
 /// frame panics. Returns early with the Close frame when one arrives (code
 /// 1005 when it carried none), or without one when the time is up or the
 /// socket drops.
-pub async fn read_blocks(
-    r: &mut WsReader,
+pub async fn read_blocks<S>(
+    r: &mut S,
     n: usize,
     within: Duration,
-) -> (Vec<BlockView>, Option<CloseFrame>) {
+) -> (Vec<BlockView>, Option<CloseFrame>)
+where
+    S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
     let deadline = tokio::time::Instant::now() + within;
     let mut blocks = Vec::with_capacity(n);
     while blocks.len() < n {

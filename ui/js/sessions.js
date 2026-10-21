@@ -135,7 +135,7 @@ function render() {
 
 function fillRow(tr, s, now, unlocked) {
   const cells = [
-    el("td", null, el("span.mono", null, s.client), el("div.sub", null, s.listener, s.finality ? "  finality" : "")),
+    el("td", null, el("span.mono", null, s.client), el("div.sub", null, s.listener, s.draining ? " · draining" : "", s.finality ? "  finality" : "")),
     el("td", null, el("div", null, s.upstream_name || s.upstream), el("div.sub", null, s.upstream)),
     el("td.num", { title: new Date(s.started_ms).toLocaleString() }, duration((now - s.started_ms) / 1000)),
     el("td.num", null, s.start_block === null ? "–" : int(s.start_block)),

@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-21
+
 ### Added
 
+- Configuration reload and JSON editing in the dashboard. Authenticated API
+  endpoints validate drafts, apply external file edits, or atomically save and
+  apply changes, with runtime and file revision checks. Listener and upstream
+  topology, client TLS, chain API ports and dashboard settings can change without restarting.
+  Established connections retain their previous configuration and failover pool
+  until they close; pending drains appear in Configuration and Sessions.
 - Client-facing TLS termination (`tls` at the top level, per listener, or on `chain_api`) for both SHiP WebSocket listeners (`wss://`) and the `/v1/chain/*` HTTP chain API (`https://`). Supports PEM certificate chains (`cert_file`) and PKCS#8/PKCS#1/SEC1 private keys (`key_file`), multi-domain SNI (`sni: [{ server_names, cert_file, key_file }]`) with exact and `*.domain` wildcard matching, and automatic zero-downtime certificate hot-reload when files change on disk.
 - HTTP-only live upstream support for `chain_api`: live servers (`role: "live"`) may omit `endpoint` when `api_endpoint` (or its alias `http_endpoint`) is set, allowing dedicated `/v1/chain/*` RPC nodes without a SHiP socket to participate in `get_info` polling, state reads, block lookups, and transaction pushes.
 
@@ -672,7 +680,8 @@ First public release on crates.io and GitHub.
 - Upstream handshake now skips leading control frames and retries against
   another upstream instead of dropping the client on an unexpected first frame.
 
-[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/eosrio/fleet-router/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/eosrio/fleet-router/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/eosrio/fleet-router/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/eosrio/fleet-router/compare/v0.4.0...v0.5.0

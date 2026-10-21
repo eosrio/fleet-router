@@ -3,7 +3,7 @@ members = [".", "mock-ship"]
 
 [package]
 name = "fleet-router"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.99"
 description = "Reverse proxy and load balancer for the Antelope SHiP (State History Plugin) WebSocket protocol."
@@ -61,9 +61,10 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 
+tempfile = "3"
+
 [dev-dependencies]
 mock-ship = { path = "mock-ship" }
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 reqwest = { version = "0.13", features = ["json"] }
-tempfile = "3"
 serde_json = "1"

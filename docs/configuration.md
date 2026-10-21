@@ -14,6 +14,7 @@ All `*_ms` fields are in **milliseconds**.
 - [Minimal example](#minimal-example)
 - [Top-level fields](#top-level-fields)
   - [Dashboard](#dashboard)
+- [Reloading configuration](#reloading-configuration)
 - [Upstream servers](#upstream-servers)
   - [Upstream preference](#upstream-preference)
 - [Topology and stitching](#topology-and-stitching)
@@ -21,6 +22,25 @@ All `*_ms` fields are in **milliseconds**.
 - [Upstream TLS (`wss://`)](#upstream-tls-wss)
 - [Client message limits](#client-message-limits)
 - [Multiple networks](#multiple-networks)
+
+## Reloading configuration
+
+With the dashboard and a control token enabled, open **Configuration** and unlock controls:
+
+- To apply an external file edit, choose **Reload file** and review the validation summary.
+- To edit in the dashboard, change the JSON, choose **Validate**, then **Save and apply**. **Load file** replaces the draft without applying anything.
+
+Both routes validate the whole configuration and reserve new listening ports before applying it. A validation error or occupied port leaves the running configuration unchanged; a failed save also leaves the file unchanged. Stale browser drafts and intervening file edits return a conflict instead of overwriting a newer revision. The configuration source is limited to 1 MiB. File edits are applied explicitly; there is no automatic file watcher.
+
+Listeners and upstreams can be added, removed or replaced, including chain API and dashboard ports. New connections use the new configuration. Established SHiP streams retain their previous upstream pool, failover policy and limits until they disconnect; established chain API connections likewise retain their previous policy and pool. Removing a listener stops new connections and releases its port. Its monitors remain while established connections need them, then stop. Configuration and Sessions show these connections as **draining**. There is no forced drain deadline, so long-lived streams can retain an old pool indefinitely. Keep removed upstreams available if those streams still depend on them.
+
+Unchanged listeners keep their running state. Connection caps on a listener include its draining generations; lowering a cap rejects new connections until enough old ones finish. For a retained SHiP endpoint with the same listener and chain policy, upstream connection counts and cumulative counters survive replacement, including removal and re-addition while old streams remain. A renamed listener is a new identity. Other request limits remain specific to each connection's generation.
+
+The editor reads the file selected at startup by `--config` (resolved to an absolute path). Saving uses an atomic replacement in the same directory; the service account needs permission to create and replace files there. Existing file permissions are retained. In container deployments, mount a writable configuration directory rather than a single bind-mounted file if dashboard saving is needed. A read-only file can still be reloaded after an external edit. A conflicting address change, such as replacing a wildcard bind with a specific address on the same occupied port, is refused: use a free port or restart for that change.
+
+Inline `dashboard.control_token` values appear as `__FLEET_ROUTER_KEEP_SECRET__`; leave this placeholder unchanged to retain the saved token. Token files and environment tokens are resolved again on apply. If you change the dashboard address or token, reconnect or unlock with the new settings. Disabling the dashboard or removing its metrics endpoint also removes the reload API; re-enable it through a process restart. Existing event streams close when the dashboard is disabled or their hostname is no longer allowed.
+
+The [configuration API](api.md#configuration-endpoints) exposes the same validation, revision checks and apply path.
 
 ## Minimal example
 

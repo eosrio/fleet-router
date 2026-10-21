@@ -14,6 +14,7 @@
 //! JSON API from [`crate::api`].
 
 use std::fmt::Write as _;
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,8 +29,11 @@ use axum::Router;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
+#[cfg(test)]
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, Semaphore};
+use tokio::sync::broadcast;
+#[cfg(test)]
+use tokio::sync::Semaphore;
 
 use crate::api::{self, SharedState, StatusView};
 use crate::health::{coverage_response, readiness, render_metrics};
@@ -37,30 +41,13 @@ use crate::health::{coverage_response, readiness, render_metrics};
 include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
 
 /// Concurrent HTTP connections, including open dashboard streams.
-const MAX_HTTP_CONNECTIONS: usize = 256;
+pub(crate) const MAX_HTTP_CONNECTIONS: usize = 256;
 /// A client must send its request headers within this time.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Run the HTTP endpoint until a shutdown signal is received.
-pub async fn run_http_server(addr: String, app: SharedState, shutdown: broadcast::Receiver<()>) {
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            tracing::error!(%addr, error = %e, "failed to bind health/metrics endpoint");
-            return;
-        }
-    };
-    if app.dashboard {
-        tracing::info!(%addr, "health/metrics endpoint and dashboard listening (/ui/)");
-    } else {
-        tracing::info!(%addr, "health/metrics endpoint listening");
-    }
-    serve(listener, app, shutdown).await;
-}
-
 /// Accept connections on `listener` and serve [`router`] until shutdown.
+#[cfg(test)]
 pub async fn serve(listener: TcpListener, app: SharedState, mut shutdown: broadcast::Receiver<()>) {
-    let router = router(app);
     let slots = Arc::new(Semaphore::new(MAX_HTTP_CONNECTIONS));
     loop {
         tokio::select! {
@@ -76,27 +63,11 @@ pub async fn serve(listener: TcpListener, app: SharedState, mut shutdown: broadc
                     tracing::debug!("health/metrics connection limit reached; rejecting");
                     continue;
                 };
-                let service = TowerToHyperService::new(router.clone());
-                let mut conn_shutdown = shutdown.resubscribe();
+                let conn_shutdown = shutdown.resubscribe();
+                let app = app.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    // One request per connection, as before the move to hyper:
-                    // idle keep-alive connections must not hold slots.
-                    let conn = http1::Builder::new()
-                        .timer(TokioTimer::new())
-                        .header_read_timeout(HEADER_READ_TIMEOUT)
-                        .keep_alive(false)
-                        .serve_connection(TokioIo::new(stream), service);
-                    // Dashboard streams never end on their own, so shutdown
-                    // drops the connection instead of waiting for it.
-                    tokio::select! {
-                        result = conn => {
-                            if let Err(e) = result {
-                                tracing::debug!(error = %e, "health/metrics connection error");
-                            }
-                        }
-                        _ = conn_shutdown.recv() => {}
-                    }
+                    connection(stream, app, conn_shutdown).await;
                 });
             }
             _ = shutdown.recv() => {
@@ -104,6 +75,37 @@ pub async fn serve(listener: TcpListener, app: SharedState, mut shutdown: broadc
                 break;
             }
         }
+    }
+}
+
+/// Resolve configuration at request time, including token and Host policy changes.
+pub async fn connection(
+    stream: tokio::net::TcpStream,
+    app: SharedState,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    let state = app.handle();
+    drop(app);
+    let service = hyper::service::service_fn(move |request| {
+        let app = state.current();
+        async move {
+            match app {
+                Some(app) => {
+                    let service = TowerToHyperService::new(router(app));
+                    hyper::service::Service::call(&service, request).await
+                }
+                None => Ok(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+            }
+        }
+    });
+    let conn = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .keep_alive(false)
+        .serve_connection(TokioIo::new(stream), service);
+    tokio::select! {
+        result = conn => { if let Err(error) = result { tracing::debug!(%error, "health/metrics connection error"); } }
+        _ = shutdown.recv() => {}
     }
 }
 
@@ -139,7 +141,7 @@ pub fn router(app: SharedState) -> Router {
 /// `localhost` always pass, other names only when listed in
 /// `dashboard.allowed_hosts`. This stops DNS rebinding: a page on an
 /// attacker's domain that resolves to this router still sends its own name.
-fn host_allowed(host: &str, allowed: &[String]) -> bool {
+pub(crate) fn host_allowed(host: &str, allowed: &[String]) -> bool {
     let host = host.trim().to_ascii_lowercase();
     let name = match host.strip_prefix('[') {
         Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
@@ -456,7 +458,11 @@ mod tests {
             chain_api: None,
         };
         Arc::new(AppState {
+            runtime: Default::default(),
+            config_revision: 0,
+            draining: Vec::new(),
             listeners: vec![ListenerContext {
+                config_generation: 0,
                 health: health.clone(),
                 config_db: build_config_db(servers),
                 order: vec!["127.0.0.1:18080".to_string()],
@@ -564,6 +570,7 @@ mod tests {
     #[test]
     fn status_page_escapes_names() {
         let status = StatusView {
+            config: Default::default(),
             version: "1.0.0",
             now_ms: 0,
             started_ms: 0,

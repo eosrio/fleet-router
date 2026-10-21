@@ -3,7 +3,7 @@ members = [".", "mock-ship"]
 
 [package]
 name = "fleet-router"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.99"
 description = "Reverse proxy and load balancer for the Antelope SHiP (State History Plugin) WebSocket protocol."

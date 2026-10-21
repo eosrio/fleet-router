@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-21
+
 ### Added
 
 - Configuration reload and JSON editing in the dashboard. Authenticated API
@@ -678,7 +680,8 @@ First public release on crates.io and GitHub.
 - Upstream handshake now skips leading control frames and retries against
   another upstream instead of dropping the client on an unexpected first frame.
 
-[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/eosrio/fleet-router/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/eosrio/fleet-router/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/eosrio/fleet-router/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/eosrio/fleet-router/compare/v0.4.0...v0.5.0

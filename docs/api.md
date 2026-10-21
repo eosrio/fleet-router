@@ -34,7 +34,7 @@ Full router state. The [dashboard stream](#get-apiv1dashboardstream) includes th
 
 ```json
 {
-  "version": "0.7.0",
+  "version": "0.8.0",
   "now_ms": 1760700000000,
   "started_ms": 1760690000000,
   "uptime_secs": 10000,

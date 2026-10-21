@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An invalid or missing TLS certificate/key file no longer blocks valid renewals for other domains on the same listener. Failed pairs retain their previous certificate and retry on the next poll.
 - The dashboard could alternate which synchronized upstream appeared behind
   after a node restarted and its status polls shifted relative to its peers.
   Head lag now compares each fresh chain-head reply with peer heads known before its

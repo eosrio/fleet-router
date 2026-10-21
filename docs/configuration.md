@@ -304,7 +304,7 @@ Client-facing listeners default to plaintext (`ws://` for SHiP and `http://` for
 - **`key_file`** *(string, required)* — Path to a PEM private key (PKCS#8, PKCS#1 RSA, or SEC1 EC).
 - **`sni`** *(array of objects, optional)* — Additional certificate/key pairs selected by the client's TLS Server Name Indication (SNI). Each entry has `server_names` (exact hostnames or single-label wildcards such as `*.wax.example.com`), `cert_file`, and `key_file`. Connections whose SNI does not match any entry (or that omit SNI) receive the default `cert_file` / `key_file`.
 
-All configured PEM files are validated at startup (and by `fleet-router config test`) and monitored every 5 seconds in the background. When a certificate or private key file is renewed on disk, `fleet-router` atomically reloads it without dropping active connections; if a reload fails (for example while a renewal script is mid-write), the previous valid certificate stays active and a warning is logged.
+All configured PEM files are validated at startup (and by `fleet-router config test`) and monitored every 5 seconds in the background. When a certificate or private key file is renewed on disk, `fleet-router` atomically reloads it without dropping active connections. Each certificate/key pair reloads independently: if one fails (for example while a renewal script is mid-write), its previous valid certificate stays active and a warning is logged, while valid renewals for other domains still take effect. Failed pairs are retried on the next poll.
 
 ## Client message limits
 

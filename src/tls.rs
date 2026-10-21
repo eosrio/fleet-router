@@ -195,6 +195,30 @@ pub fn load_certified_key(cert_file: &Path, key_file: &Path) -> Result<Arc<Certi
     Ok(Arc::new(certified))
 }
 
+/// Update one certificate pair only after both files load successfully. Failed
+/// attempts keep their old stamp so the next poll retries them.
+fn reload_certified_key(
+    cert_file: &Path,
+    key_file: &Path,
+    stamp: &mut FileStamp,
+    certified: &mut Arc<CertifiedKey>,
+) -> Result<bool> {
+    let next_stamp = FileStamp::read(cert_file, key_file).with_context(|| {
+        format!(
+            "cannot stat TLS files ('{}', '{}')",
+            cert_file.display(),
+            key_file.display()
+        )
+    })?;
+    if next_stamp == *stamp {
+        return Ok(false);
+    }
+    let next_certified = load_certified_key(cert_file, key_file)?;
+    *certified = next_certified;
+    *stamp = next_stamp;
+    Ok(true)
+}
+
 #[derive(Debug, Clone)]
 struct SniSlot {
     patterns: Vec<String>,
@@ -272,8 +296,9 @@ impl DynamicCertResolver {
     /// certificate slots reloaded.
     ///
     /// If a changed file fails to parse (e.g. while an external tool is still
-    /// writing it), this method returns an `Err` and leaves the previously
-    /// loaded certificate active in memory.
+    /// writing it), that pair keeps its previously loaded certificate and is
+    /// retried on the next poll. Other valid renewals are still published. An
+    /// `Err` reports all failed pairs and how many pairs were reloaded.
     pub fn reload_if_changed(&self) -> Result<usize> {
         let current = self
             .store
@@ -283,38 +308,29 @@ impl DynamicCertResolver {
 
         let mut updated = current;
         let mut reloaded = 0usize;
-
-        let new_default_stamp =
-            FileStamp::read(&updated.default_cert_file, &updated.default_key_file).map_err(
-                |e| {
-                    anyhow!(
-                        "cannot stat TLS files ('{}', '{}'): {e}",
-                        updated.default_cert_file.display(),
-                        updated.default_key_file.display()
-                    )
-                },
-            )?;
-        if new_default_stamp != updated.default_stamp {
-            let cert = load_certified_key(&updated.default_cert_file, &updated.default_key_file)?;
-            updated.default_certified = cert;
-            updated.default_stamp = new_default_stamp;
-            reloaded += 1;
-        }
-
-        for slot in &mut updated.sni {
-            let new_stamp = FileStamp::read(&slot.cert_file, &slot.key_file).map_err(|e| {
-                anyhow!(
-                    "cannot stat SNI TLS files ('{}', '{}'): {e}",
-                    slot.cert_file.display(),
-                    slot.key_file.display()
-                )
-            })?;
-            if new_stamp != slot.stamp {
-                let cert = load_certified_key(&slot.cert_file, &slot.key_file)?;
-                slot.certified = cert;
-                slot.stamp = new_stamp;
-                reloaded += 1;
+        let mut failures = Vec::new();
+        let mut reload = |cert_file: &Path,
+                          key_file: &Path,
+                          stamp: &mut FileStamp,
+                          certified: &mut Arc<CertifiedKey>| {
+            match reload_certified_key(cert_file, key_file, stamp, certified) {
+                Ok(changed) => reloaded += usize::from(changed),
+                Err(err) => failures.push(format!("{err:#}")),
             }
+        };
+        reload(
+            &updated.default_cert_file,
+            &updated.default_key_file,
+            &mut updated.default_stamp,
+            &mut updated.default_certified,
+        );
+        for slot in &mut updated.sni {
+            reload(
+                &slot.cert_file,
+                &slot.key_file,
+                &mut slot.stamp,
+                &mut slot.certified,
+            );
         }
 
         if reloaded > 0 {
@@ -323,6 +339,13 @@ impl DynamicCertResolver {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             *guard = updated;
+        }
+        if !failures.is_empty() {
+            bail!(
+                "{} TLS certificate pair(s) failed to reload; reloaded {reloaded} pair(s): {}",
+                failures.len(),
+                failures.join("; ")
+            );
         }
         Ok(reloaded)
     }
@@ -461,7 +484,7 @@ impl TlsAcceptorHandle {
                                 tracing::warn!(
                                     listener = %listener_label,
                                     error = %err,
-                                    "failed to reload updated TLS certificate(s); keeping previous certificate active"
+                                    "TLS reload failed for some certificate pairs; their previous certificates remain active"
                                 );
                             }
                         }
@@ -686,5 +709,136 @@ mod tests {
             resolver.resolve_name(None).cert[0].as_ref(),
             second_der.as_slice()
         );
+    }
+
+    #[test]
+    fn valid_default_renewal_survives_broken_sni_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let (cert_path, key_path, _) = write_test_cert(
+            temp.path(),
+            "default",
+            "default.example.com",
+            &["default.example.com"],
+        );
+        let (sni_cert, sni_key, original_sni) =
+            write_test_cert(temp.path(), "sni", "sni.example.com", &["sni.example.com"]);
+        let cfg = TlsConfig {
+            cert_file: cert_path.clone(),
+            key_file: key_path.clone(),
+            sni: vec![SniCertConfig {
+                server_names: vec!["sni.example.com".into()],
+                cert_file: sni_cert.clone(),
+                key_file: sni_key,
+            }],
+        };
+        let resolver = DynamicCertResolver::from_config(&cfg).unwrap();
+        let (renewed_cert, renewed_key, renewed_der) = write_test_cert(
+            temp.path(),
+            "renewed",
+            "default.example.com",
+            &["default.example.com", "extra-renewal.example.com"],
+        );
+        fs::copy(renewed_cert, cert_path).unwrap();
+        fs::copy(renewed_key, key_path).unwrap();
+        fs::write(sni_cert, "mid-write invalid PEM").unwrap();
+        let reload = resolver.reload_if_changed();
+        assert!(reload.is_err(), "failed renewals must remain observable");
+        assert_eq!(
+            resolver.resolve_name(Some("sni.example.com")).cert[0].as_ref(),
+            original_sni.as_slice(),
+            "a broken SNI renewal must retain its last valid certificate"
+        );
+        assert_eq!(
+            resolver.resolve_name(None).cert[0].as_ref(),
+            renewed_der.as_slice(),
+            "unrelated valid renewal must be published even when SNI fails: {reload:?}"
+        );
+    }
+
+    #[test]
+    fn certificate_reload_failures_are_isolated_and_retried_after_repair() {
+        let names = ["default.example.com", "a.example.com", "b.example.com"];
+        for failed_index in [0, 1] {
+            for missing_file in [false, true] {
+                for failed_key in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let original: Vec<_> = names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            write_test_cert(temp.path(), &format!("original-{i}"), name, &[name])
+                        })
+                        .collect();
+                    let cfg = TlsConfig {
+                        cert_file: original[0].0.clone(),
+                        key_file: original[0].1.clone(),
+                        sni: (1..names.len())
+                            .map(|i| SniCertConfig {
+                                server_names: vec![names[i].into()],
+                                cert_file: original[i].0.clone(),
+                                key_file: original[i].1.clone(),
+                            })
+                            .collect(),
+                    };
+                    let resolver = DynamicCertResolver::from_config(&cfg).unwrap();
+                    let renewed: Vec<_> = names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            let pair = write_test_cert(
+                                temp.path(),
+                                &format!("renewed-{i}"),
+                                name,
+                                &[name, "extra-renewal.example.com"],
+                            );
+                            fs::copy(&pair.0, &original[i].0).unwrap();
+                            fs::copy(&pair.1, &original[i].1).unwrap();
+                            pair
+                        })
+                        .collect();
+                    let failed_path = if failed_key {
+                        &original[failed_index].1
+                    } else {
+                        &original[failed_index].0
+                    };
+                    if missing_file {
+                        fs::remove_file(failed_path).unwrap();
+                    } else {
+                        fs::write(failed_path, "mid-write invalid PEM").unwrap();
+                    }
+
+                    let error = resolver.reload_if_changed().unwrap_err().to_string();
+                    assert!(error.contains("reloaded 2 pair(s)"), "{error}");
+                    assert!(
+                        error.contains(&failed_path.display().to_string()),
+                        "{error}"
+                    );
+                    for i in 0..names.len() {
+                        let expected = if i == failed_index {
+                            &original[i].2
+                        } else {
+                            &renewed[i].2
+                        };
+                        assert_eq!(
+                            resolver.resolve_name(Some(names[i])).cert[0].as_ref(),
+                            expected.as_slice(),
+                            "failed_index={failed_index}, missing_file={missing_file}, failed_key={failed_key}, domain={}",
+                            names[i]
+                        );
+                    }
+                    // A failed pair is retried, while already renewed pairs stay current.
+                    let error = resolver.reload_if_changed().unwrap_err().to_string();
+                    assert!(error.contains("reloaded 0 pair(s)"), "{error}");
+                    fs::copy(&renewed[failed_index].0, &original[failed_index].0).unwrap();
+                    fs::copy(&renewed[failed_index].1, &original[failed_index].1).unwrap();
+                    assert_eq!(resolver.reload_if_changed().unwrap(), 1);
+                    assert_eq!(
+                        resolver.resolve_name(Some(names[failed_index])).cert[0].as_ref(),
+                        renewed[failed_index].2.as_slice()
+                    );
+                    assert_eq!(resolver.reload_if_changed().unwrap(), 0);
+                }
+            }
+        }
     }
 }

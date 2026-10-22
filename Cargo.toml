@@ -39,7 +39,7 @@ chrono = "0.4.37"
 clap = { version = "4.5.4", features = ["derive", "string", "wrap_help", "unicode"] }
 color-print = "0.3.5"
 futures = { version = "0.3.30", features = ["compat"] }
-rs_abieos = { version = "0.6.0", default-features = false, features = ["rust-backend"] }
+rs_abieos = { version = "=0.7.0", default-features = false, features = ["rust-backend"] }
 http = "1.0"
 # HTTP/1.1 listener and pooled upstream client for the chain API. The server
 # side also carries the control API and dashboard (axum); `client` and

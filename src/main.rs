@@ -27,6 +27,7 @@ use tokio::time::{sleep, timeout, timeout_at};
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::abi::accept_upstream_abi;
 use crate::config_sample::CONFIG_SAMPLE;
 use crate::fleet::view::uncovered;
 use crate::fleet::{FleetHub, FleetView, Log};
@@ -148,7 +149,7 @@ enum Probe {
     ReadTimeout,
     NoMessage,
     ReadFailed(String),
-    InvalidAbi,
+    InvalidAbi(String),
     Unexpected(String),
 }
 
@@ -168,13 +169,10 @@ async fn probe_upstream(endpoint: &str, max_message_bytes: usize, bound: Duratio
         Err(_) => Probe::ReadTimeout,
         Ok(None) => Probe::NoMessage,
         Ok(Some(Err(e))) => Probe::ReadFailed(e.to_string()),
-        Ok(Some(Ok(Message::Text(txt)))) => {
-            if txt.contains("eosio::abi") {
-                Probe::Abi
-            } else {
-                Probe::InvalidAbi
-            }
-        }
+        Ok(Some(Ok(Message::Text(txt)))) => match accept_upstream_abi(&txt) {
+            Ok(()) => Probe::Abi,
+            Err(error) => Probe::InvalidAbi(error.to_string()),
+        },
         Ok(Some(Ok(other))) => Probe::Unexpected(format!("{:?}", other.type_id())),
     }
 }
@@ -506,9 +504,9 @@ async fn run_tests(config: &ServerConfig, strict: bool) -> bool {
                         e
                     );
                 }
-                Probe::InvalidAbi => {
+                Probe::InvalidAbi(error) => {
                     cprintln!(" ✅  <green>Websocket connected!</>");
-                    cprintln!(" ❌  <red>{}:</> Invalid ABI!", endpoint);
+                    cprintln!(" ❌  <red>{}:</> Invalid ABI! Error: {}", endpoint, error);
                 }
                 Probe::Unexpected(kind) => {
                     cprintln!(" ✅  <green>Websocket connected!</>");

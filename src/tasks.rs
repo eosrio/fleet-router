@@ -632,8 +632,8 @@ async fn handle_monitoring_msg(
             *ship_abi = Some(text);
             match loaded {
                 Ok(()) => Inbound::AbiAccepted,
-                Err(_) => {
-                    tracing::warn!(upstream = %server.endpoint, "error setting ABI for upstream");
+                Err(error) => {
+                    tracing::warn!(upstream = %server.endpoint, %error, "error setting ABI for upstream");
                     Inbound::AbiRejected
                 }
             }

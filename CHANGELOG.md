@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Accept Wire Network's `sysio::abi/1.*` SHiP handshake by using the published
+  `rs_abieos` 0.7.0 Rust backend. Earlier builds rejected this ABI version and
+  repeatedly reconnected to otherwise reachable Wire upstreams.
+- Include the ABI parser error in upstream monitoring warnings.
+
 ## [0.8.0] - 2026-10-21
 
 ### Added

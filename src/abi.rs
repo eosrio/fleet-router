@@ -237,6 +237,19 @@ mod tests {
     }
 
     #[test]
+    fn wire_ship_abi_parses() {
+        accept_upstream_abi(r#"{"version":"sysio::abi/1.1"}"#)
+            .expect("Wire ABI version prefix must be supported");
+        let abi = include_str!("../tests/fixtures/wire_ship_abi.json");
+        accept_upstream_abi(abi)
+            .expect("Wire SHiP ABI must be accepted by monitors and client dials");
+        assert!(
+            abi_compatible(abi),
+            "Wire request/result indices must match the router"
+        );
+    }
+
+    #[test]
     fn interior_nul_is_rejected_like_set_abi() {
         let err = accept_upstream_abi("{\"version\":\"eosio::abi/1.1\"\0}").unwrap_err();
         let message = err.to_string();

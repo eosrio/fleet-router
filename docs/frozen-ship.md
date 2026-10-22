@@ -222,7 +222,9 @@ Keep all these ports private. The archive answers selected block endpoints, whil
 
 Prepare a new immutable copy, deep/hash-check it, start its server, and verify health, payload coverage and boundary IDs before routing readers to it. Archive catalogs are fixed at startup; adding files requires a restart. Keep a verified copy of the old range until its replacement has passed the same checks.
 
-Add new ranges and same-range replicas to the stitched listener's `servers`. Config-file changes require a controlled router restart; follow [graceful shutdown](operations.md#graceful-shutdown) and expect clients to reconnect to the restarted router from their checkpoints. The control API can drain one replica during maintenance; it cannot substitute for a missing copy of history.
+Add new ranges and same-range replicas to the stitched listener's `servers`. With fleet-router 0.8 or later, use the authenticated dashboard configuration editor or **Reload file** to validate and apply the change explicitly. New connections use the updated topology; existing streams retain their previous upstream pool until they disconnect. Keep old archive servers available while those streams still depend on them. See [configuration reload](configuration.md#reloading-configuration) for revision checks, draining generations and filesystem requirements.
+
+On older versions, or when a bind-address conflict requires a restart, follow [graceful shutdown](operations.md#graceful-shutdown) and expect clients to reconnect from their checkpoints. The control API can drain one replica during maintenance; it cannot substitute for a missing copy of history.
 
 ## References
 

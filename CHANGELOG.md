@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Publish the operator references on the website with shared navigation, installation
+  and Wire Network upgrade guides, and release notes. Build pages from Markdown in
+  CI, and update the homepage and frozen-history guide for TLS and config reload.
+
 ## [0.8.1] - 2026-10-22
 
 ### Fixed

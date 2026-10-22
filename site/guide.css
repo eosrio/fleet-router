@@ -7,7 +7,7 @@
   padding-block: 3.5rem 5rem;
 }
 
-.guide-toc {
+.guide-sidebar {
   grid-column: 1;
   grid-row: 1 / span 2;
   position: sticky;
@@ -17,23 +17,70 @@
   font-size: 0.875rem;
 }
 
-.guide-toc h2 {
+.guide-sidebar h2 {
   font-size: 1rem;
   margin-bottom: 0.75rem;
 }
 
-.guide-toc ol {
+.guide-navigation > summary { display: none; }
+
+.guide-sidebar ul {
   list-style: none;
   padding: 0;
 }
 
-.guide-toc li + li {
+.guide-sidebar li + li {
   margin-top: 0.65rem;
 }
 
-.guide-toc a {
+.guide-sidebar a {
   color: var(--ink-2);
 }
+
+.guide-sidebar [aria-current="page"] {
+  color: var(--ink);
+  font-weight: 600;
+  text-decoration-thickness: 2px;
+}
+
+.guide-meta,
+.guide-source {
+  font-size: 0.875rem;
+}
+
+.guide-contents {
+  border-block: 1px solid var(--rule);
+  padding-block: 1rem;
+}
+
+.guide-contents summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.guide-navigation > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.guide-contents ul {
+  margin-block: 1rem 0;
+  columns: 2;
+  column-gap: 2rem;
+}
+
+.guide-contents li {
+  break-inside: avoid;
+}
+
+.guide-body h3,
+.guide-body h4 {
+  margin-block: 2rem 1rem;
+  scroll-margin-top: calc(var(--mast) + 2rem);
+}
+
+.guide-body h3 { font-size: 1.25rem; }
+.guide-body h4 { font-size: 1.0625rem; }
 
 .guide-body {
   grid-column: 2;
@@ -127,18 +174,22 @@
     padding-top: 2rem;
   }
 
-  .guide-toc {
+  .guide-sidebar {
     position: static;
     grid-column: auto;
     grid-row: auto;
   }
 
-  .guide-toc ol {
+  .guide-sidebar ul {
     columns: 2;
     column-gap: 2rem;
   }
 
-  .guide-toc li {
+  .guide-navigation > summary { display: list-item; }
+  .guide-navigation nav { margin-top: 1rem; }
+  .guide-navigation h2 { display: none; }
+
+  .guide-sidebar li {
     break-inside: avoid;
   }
 
@@ -154,7 +205,5 @@
     font-size: 2rem;
   }
 
-  .guide-toc ol {
-    columns: 1;
-  }
+  .guide-contents ul { columns: 1; }
 }

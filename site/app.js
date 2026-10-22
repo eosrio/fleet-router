@@ -1,6 +1,14 @@
 (function () {
   "use strict";
 
+  var guideNavigation = document.querySelector(".guide-navigation");
+  if (guideNavigation) {
+    var narrowGuide = window.matchMedia("(max-width: 979.98px)");
+    function updateGuideNavigation() { guideNavigation.open = !narrowGuide.matches; }
+    updateGuideNavigation();
+    narrowGuide.addEventListener("change", updateGuideNavigation);
+  }
+
   var reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   /* ---------- theme ---------- */

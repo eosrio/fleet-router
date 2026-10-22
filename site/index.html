@@ -53,7 +53,7 @@
         <a href="#install">Install</a>
         <a href="#config">Config</a>
         <a href="#metrics">Metrics</a>
-        <a href="frozen-ship.html">Deploy</a>
+        <a href="documentation.html">Docs</a>
         <a href="#dashboard">Dashboard</a>
       </nav>
       <div class="mast-actions">
@@ -75,7 +75,7 @@
         <figure class="panel" id="panel">
           <div class="panel-plate">
             <span class="plate-name">fleet-router</span>
-            <span class="plate-meta">listener <code>eos</code> · <code>0.0.0.0:17000</code> · <code>v0.6.0</code></span>
+            <span class="plate-meta">listener <code>eos</code> · <code>0.0.0.0:17000</code> · <code data-release-version>v0.8.1</code></span>
           </div>
           <ul class="panel-legend" aria-label="Panel states">
             <li><i class="key key-set"></i>route set</li>
@@ -113,7 +113,7 @@
               <code id="cmd-hero">cargo install fleet-router</code>
               <button type="button" class="copy" data-copy-target="cmd-hero" aria-label="Copy the cargo install command"><span class="copy-label"><span>Copy</span><span>Copied</span><span>Failed</span></span></button>
             </div>
-            <p class="hero-alt">Also as <a href="#install">Docker image and prebuilt binaries</a>. MIT licensed. <a href="https://github.com/eosrio/fleet-router">Source on GitHub</a> · <a href="https://crates.io/crates/fleet-router">crates.io</a> · <a href="https://github.com/eosrio/fleet-router/blob/main/CHANGELOG.md">Changelog</a></p>
+            <p class="hero-alt">Also as <a href="#install">Docker image and prebuilt binaries</a>. MIT licensed. <a href="https://github.com/eosrio/fleet-router">Source on GitHub</a> · <a href="https://crates.io/crates/fleet-router">crates.io</a> · <a href="changelog.html">Changelog</a></p>
           </div>
         </div>
       </div>
@@ -136,7 +136,7 @@
           </li>
           <li>
             <h3>Fail over</h3>
-            <p>When the active upstream closes, errors or goes silent, the client socket stays open. A quiet upstream is pinged and abandoned if nothing comes back within 4 s. The router re-sends the in-flight <code>get_blocks</code> from the next block on another suitable node and replays the client frames buffered during the swap.</p>
+            <p>When the active upstream closes, errors or goes silent, the client socket stays open. A quiet upstream is pinged and abandoned if nothing comes back within 4 s. The router re-sends the in-flight <code>get_blocks</code> from the next block on another suitable node with the outstanding credit, including acknowledgements received during the swap.</p>
           </li>
           <li>
             <h3>De-duplicate</h3>
@@ -158,9 +158,9 @@
         </div>
         <dl class="legend">
           <div><dt>Single resilient endpoint<small><i class="key key-set"></i><code>ws://router:17000</code></small></dt><dd>Hyperion, Atomic and other indexers share one WebSocket instead of each consumer pinning itself to one SHiP node.</dd></div>
-          <div><dt>Range-aware least-connections<small><code>trace_begin_block … trace_end_block</code></small></dt><dd>Prefers an upstream whose trace range covers the requested block, then the least-loaded healthy node. Finality-data requests go only to a node whose finality range covers that block.</dd></div>
+          <div><dt>Range-aware least-connections<small><code>trace_begin_block … trace_end_block</code></small></dt><dd>Checks coverage for the requested traces, chain state and finality data, then chooses among suitable upstreams using priority, weight and load. See the <a href="operations.html#how-routing-and-failover-work">routing contract</a>.</dd></div>
           <div><dt>Upstream preference<small><code>priority · weight</code></small></dt><dd>Among nodes that can serve a request equally well, the router uses the lowest <code>priority</code> tier, then the fewest connections per unit of <code>weight</code>. A high priority makes a node a last resort, and failover still moves off a failed preferred node to a backup that covers the block.</dd></div>
-          <div><dt>Transparent failover<small><i class="key key-failover"></i><code>resume at next block</code></small></dt><dd>On upstream loss the router reconnects to another suitable node, resumes <code>get_blocks</code> at the next block, de-duplicates replayed blocks and replays buffered client frames. That includes a node that goes silent without closing the connection, such as a pulled cable or a frozen VM: a quiet upstream is pinged and abandoned after <code>upstream_liveness_timeout_ms</code> (4 s by default).</dd></div>
+          <div><dt>Transparent failover<small><i class="key key-failover"></i><code>resume at next block</code></small></dt><dd>On upstream loss the router reconnects to another suitable node, resumes <code>get_blocks</code> at the next block, de-duplicates replayed blocks and preserves the client's outstanding credit. That includes a node that goes silent without closing the connection, such as a pulled cable or a frozen VM: a quiet upstream is pinged and abandoned after <code>upstream_liveness_timeout_ms</code> (4 s by default).</dd></div>
           <div><dt>Stale-upstream deprioritization<small><i class="key key-stale"></i><code>upstream_stale = 1</code></small></dt><dd>An upstream that stops advancing its chain state is flagged stale and deprioritized when routing. It is not hard-excluded.</dd></div>
           <div><dt>Many networks, one process<small><code>listeners[] · /ready/&lt;name&gt;</code></small></dt><dd><code>listeners</code> serves each chain on its own port with its own upstream pool, <code>chain_id</code>, connection cap and <code>/ready/&lt;name&gt;</code> check.</dd></div>
           <div><dt><code>chain_id</code> verification<small><i class="key key-offline"></i><code>require_chain_id</code></small></dt><dd>An upstream whose reported <code>chain_id</code> disagrees with the pin or the rest of its pool stays offline. Nodes that omit <code>chain_id</code>, such as FIO and other EOSIO 2.0 builds, stay usable unless <code>require_chain_id</code> is set.</dd></div>
@@ -168,7 +168,10 @@
           <div><dt>Live dashboard<small><code>/ui/ · /status · /api/v1</code></small></dt><dd>Opt-in fleet view with block ranges, sessions, throughput, failovers and an event log, plus a no-JavaScript status page and a JSON API with a server-sent events stream. Off by default.</dd></div>
           <div><dt>Operator controls<small><code>drain · disable · move</code></small></dt><dd>With a control token set, drain an upstream for maintenance, disable or enable it, change its priority and weight at runtime, clear its quarantines, or move a single session. A drain uses the normal failover, so clients stay connected.</dd></div>
           <div><dt>Prometheus metrics<small><code>/metrics · server, endpoint, listener</code></small></dt><dd>Per-upstream series carry <code>server</code> and <code>endpoint</code> labels, plus <code>listener</code> in multi-listener mode, with gauges for the start and end of each SHiP range.</dd></div>
-          <div><dt>Upstream <code>wss://</code><small><code>wss://host:port</code></small></dt><dd>Optional TLS to SHiP nodes, verified with rustls against the OS trust store. A bare <code>host:port</code> stays <code>ws://</code>. The client listener remains plaintext.</dd></div>
+          <div><dt>Upstream and client TLS<small><code>wss:// · https://</code></small></dt><dd>Optional TLS to SHiP nodes, verified with rustls against the OS trust store. Client listeners can also terminate TLS, with SNI certificates and automatic certificate renewal. See <a href="configuration.html#client-tls-termination">TLS configuration</a>.</dd></div>
+          <div><dt>Live configuration reload<small><code>validate · save · apply</code></small></dt><dd>Add or replace listeners and upstreams through the authenticated configuration editor. New connections use the new configuration; existing streams keep their previous pool until they close. See <a href="configuration.html#reloading-configuration">reload behavior</a>.</dd></div>
+          <div><dt>HTTP chain API<small><code>/v1/chain/*</code></small></dt><dd>An optional HTTP or HTTPS listener routes block requests across archive and live nodes, with state calls on live upstreams and read-only defaults. Dedicated HTTP-only live nodes are supported. See the <a href="chain-api.html">chain API reference</a>.</dd></div>
+          <div><dt>Wire Network<small><code>sysio::abi/1.*</code></small></dt><dd>Version 0.8.1 accepts Wire's SHiP ABI using <code>rs_abieos</code> 0.7.0. See <a href="wire-network.html">upgrading and verifying a Wire deployment</a>.</dd></div>
           <div><dt>Resource safety<small><code>max_connections · idle_timeout_ms</code></small></dt><dd>Connection cap, handshake and idle timeouts, and a bounded maximum WebSocket message size.</dd></div>
           <div><dt>Runs as a service<small><code>systemd · Docker · launchd</code></small></dt><dd>Ships systemd units for one process or one process per network, with a raised open-file limit and basic sandboxing. The operations guide also covers the Docker restart policy, launchd on macOS and a service wrapper on Windows.</dd></div>
           <div><dt>Graceful shutdown<small><code>SIGINT · SIGTERM</code></small></dt><dd>Handles <code>SIGINT</code> and <code>SIGTERM</code> with a bounded drain and WebSocket close frames to connected clients. Written in Rust on tokio and tokio-tungstenite; ABI checks use pure-Rust <code>rs_abieos</code>, so <code>libclang</code> is not required.</dd></div>
@@ -197,11 +200,11 @@
           <div class="install-row">
             <div class="install-what">
               <h3>Docker</h3>
-              <p>Published to GitHub Container Registry on tagged releases. The image runs as a non-root user.</p>
+              <p>Public on GitHub Container Registry; no login is needed to pull it. Pin a release tag for rollout. The image runs as a non-root user.</p>
             </div>
             <div class="cmd" data-copy-name="the docker pull command">
               <span class="cmd-prompt" aria-hidden="true">$</span>
-              <code id="cmd-docker">docker pull ghcr.io/eosrio/fleet-router</code>
+              <code id="cmd-docker">docker pull ghcr.io/eosrio/fleet-router:0.8.1</code>
               <button type="button" class="copy" data-copy-target="cmd-docker" aria-label="Copy the docker pull command"><span class="copy-label"><span>Copy</span><span>Copied</span><span>Failed</span></span></button>
             </div>
           </div>
@@ -246,12 +249,12 @@
             </div>
           </li>
         </ol>
-        <p class="after-terminal">To keep it running across reboots, install the systemd unit from <code>deploy/</code>. See <a href="https://github.com/eosrio/fleet-router/blob/main/docs/operations.md#run-as-a-service">Run as a service</a> for systemd, Docker, launchd and Windows.</p>
-        <p class="after-terminal">Serving frozen history alongside live nodes? <a href="frozen-ship.html">Deploy frozen SHiP archives</a> with Hyperion Tools and fleet-router 0.7's single stitched endpoint.</p>
+        <p class="after-terminal">To keep it running across reboots, install the systemd unit from <code>deploy/</code>. See <a href="operations.html#run-as-a-service">Run as a service</a> for systemd, Docker, launchd and Windows.</p>
+        <p class="after-terminal">Serving frozen history alongside live nodes? <a href="frozen-ship.html">Deploy frozen SHiP archives</a> with Hyperion Tools and a single stitched endpoint.</p>
 
         <aside class="notice" aria-label="Security notice">
           <i class="key key-failover" aria-hidden="true"></i>
-          <p><strong>Do not expose fleet-router directly to the public internet.</strong> The client listener is plaintext <code>ws://</code> and unauthenticated. Terminate TLS and add access control on a reverse proxy in front of it. Keep <code>metrics_port</code>, and the dashboard it can serve, on a private network.</p>
+          <p><strong>Do not expose fleet-router directly to the public internet.</strong> Client listeners and the optional chain API are unauthenticated. Configure <a href="configuration.html#client-tls-termination">TLS</a> for encryption and use a trusted network or a reverse proxy with access control. Keep <code>metrics_port</code>, and the dashboard it can serve, on a private network.</p>
         </aside>
       </div>
     </section>
@@ -322,7 +325,7 @@
             <thead><tr><th scope="col">Endpoint</th><th scope="col">Answer</th></tr></thead>
             <tbody>
               <tr><th scope="row"><code>/health</code></th><td>200 while the process is running.</td></tr>
-              <tr><th scope="row"><code>/ready</code></th><td>200 when at least one upstream is online and not disabled by an operator. In multi-listener mode, when every listener has one. Otherwise 503.</td></tr>
+              <tr><th scope="row"><code>/ready</code></th><td>200 when the listener has an eligible online upstream; stitched listeners require a live upstream. Every listener must be ready in multi-listener mode. Otherwise 503. <a href="observability.html#readiness-and-coverage">Readiness and history coverage</a>.</td></tr>
               <tr><th scope="row"><code>/ready/&lt;name&gt;</code></th><td>200 or 503 for that listener, or 404 if the name is unknown.</td></tr>
               <tr><th scope="row"><code>/metrics</code></th><td>Prometheus text exposition of router and upstream state.</td></tr>
               <tr><th scope="row"><code>/ui/</code><br><code>/status</code><br><code>/api/v1</code></th><td>The <a href="#dashboard">dashboard</a>, status page and JSON API, only with <code>dashboard.enabled</code>.</td></tr>
@@ -391,7 +394,7 @@ fleet_router_upstream_weight{endpoint,server}</code></pre>
             <div><dt>Access</dt><dd>Read views need no token. Controls need the bearer token from <code>control_token_file</code> or <code>FLEET_ROUTER_CONTROL_TOKEN</code>. Dashboard routes answer only to an IP address, <code>localhost</code> or a name in <code>allowed_hosts</code>, which blocks DNS rebinding.</dd></div>
           </dl>
         </div>
-        <p class="logging">The full contract is in the <a href="https://github.com/eosrio/fleet-router/blob/main/docs/api.md">API reference</a>.</p>
+        <p class="logging">The full contract is in the <a href="api.html">API reference</a>.</p>
       </div>
     </section>
   </main>
@@ -407,11 +410,11 @@ fleet_router_upstream_weight{endpoint,server}</code></pre>
       </div>
       <ul class="footer-links">
         <li><a href="https://github.com/eosrio/fleet-router">GitHub</a></li>
-        <li><a href="frozen-ship.html">Frozen SHiP guide</a></li>
+        <li><a href="documentation.html">Documentation</a></li>
         <li><a href="https://crates.io/crates/fleet-router">crates.io</a></li>
         <li><a href="https://github.com/eosrio/fleet-router#readme">README</a></li>
         <li><a href="https://github.com/eosrio/fleet-router/releases">Releases</a></li>
-        <li><a href="https://github.com/eosrio/fleet-router/blob/main/CHANGELOG.md">Changelog</a></li>
+        <li><a href="changelog.html">Changelog</a></li>
       </ul>
       <p class="footer-note">MIT License. Maintained by <a href="https://eosrio.io">EOS Rio</a> and <a href="https://rioblocks.io">Rio Blocks</a>.</p>
     </div>

@@ -20,6 +20,7 @@ All `*_ms` fields are in **milliseconds**.
 - [Topology and stitching](#topology-and-stitching)
 - [Chain API](#chain-api)
 - [Upstream TLS (`wss://`)](#upstream-tls-wss)
+- [Client TLS termination](#client-tls-termination)
 - [Client message limits](#client-message-limits)
 - [Multiple networks](#multiple-networks)
 

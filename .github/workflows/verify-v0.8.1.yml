@@ -1,0 +1,35 @@
+name: Verify v0.8.1 published artifacts
+on:
+  push:
+    branches: ["verify/v0.8.1-artifacts"]
+permissions:
+  contents: read
+  packages: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IMAGE_REF: ghcr.io/eosrio/fleet-router@sha256:42e177720d1d1369986507397ac120a780585f6afce4d2347a96438e4ccc89e0
+    steps:
+      - name: Inspect published package visibility
+        run: gh api orgs/eosrio/packages/container/fleet-router --jq '{name,visibility,repository:.repository.full_name}'
+      - name: Pull and smoke-test the immutable published image
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          docker pull "$IMAGE_REF"
+          docker image inspect "$IMAGE_REF" > image.json
+          jq -e '.[0].Config.Labels["org.opencontainers.image.revision"] == "fd9f34d90c0ebcc524a0f9a6aa627ba5bee485e0"' image.json
+          jq -e '.[0].Config.Labels["org.opencontainers.image.version"] == "0.8.1"' image.json
+          docker run --rm --network none --read-only "$IMAGE_REF" --version | tee image-version.txt
+          grep -Fx 'fleet-router 0.8.1' image-version.txt
+      - name: Verify and smoke-test the published Linux archive
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/eosrio/fleet-router/releases/download/v0.8.1/fleet-router-v0.8.1-x86_64-unknown-linux-gnu.tar.gz -o linux.tar.gz
+          printf '%s\n' 'fdb5363d870ee798e7108c680c923864fd8a563702fcd8e25652acf8f6341a06  linux.tar.gz' | sha256sum -c -
+          tar -xzf linux.tar.gz
+          ./fleet-router --version | tee linux-version.txt
+          grep -Fx 'fleet-router 0.8.1' linux-version.txt

@@ -131,6 +131,24 @@ refactors with no observable effect do not need an entry.
 - [ ] `cargo test --workspace`
 - [ ] Updated `CHANGELOG.md` under `[Unreleased]` (for user-facing changes)
 
+## Documentation site
+
+Operator guides live in `docs/`; the site renders those same Markdown files at
+deploy time. To build and validate locally with Node.js 24 or newer:
+
+```sh
+npm --prefix scripts/site ci --ignore-scripts
+npm --prefix scripts/site run check
+python -m http.server 8000 --directory site --bind 127.0.0.1
+```
+
+Open `http://127.0.0.1:8000/documentation.html`. Generated guide HTML is ignored
+by Git. The shared layout is `scripts/site/page.html`, the page list and link
+mapping are in `scripts/site/build.mjs`, and the landing page remains
+`site/index.html`. Add new public guides to the page list and `site/.gitignore`.
+CI checks local links, heading fragments, IDs and code-copy targets. GitHub Pages
+rebuilds on changes to the documentation, generator, site assets or version.
+
 ## Reporting bugs and requesting features
 
 Please use the GitHub issue tracker:

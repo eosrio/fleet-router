@@ -22,3 +22,6 @@ target/
 .windsurf/
 
 config.json
+
+# Documentation build dependencies
+scripts/site/node_modules/

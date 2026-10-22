@@ -14,6 +14,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  site:
+    name: Documentation site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: scripts/site/package-lock.json
+      - run: npm ci --ignore-scripts
+        working-directory: scripts/site
+      - run: npm run check
+        working-directory: scripts/site
+
   dashboard:
     name: Dashboard logic
     runs-on: ubuntu-latest

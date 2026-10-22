@@ -1,0 +1,13 @@
+{
+  "name": "fleet-router-site",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node build.mjs && node check.mjs"
+  },
+  "devDependencies": {
+    "linkedom": "0.18.14",
+    "markdown-it": "15.0.3"
+  }
+}

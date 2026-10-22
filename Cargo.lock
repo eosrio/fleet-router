@@ -1564,9 +1564,9 @@ dependencies = [
 
 [[package]]
 name = "rs_abieos"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a4fb604abee4ceedfdb793b3439e9f5f1ca63fb06ac95c47be81a33854c2d0f"
+checksum = "07aa4bb2bea77da65de03366a33369021d23963453406ef8d7d5135c278a0f70"
 
 [[package]]
 name = "rustc-hash"

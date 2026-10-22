@@ -451,8 +451,12 @@ async fn replacing_topology_preserves_old_stream_and_its_failover_pool() {
     let router = RouterProcess::start(cfg).await;
     let http = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{}", router.metrics());
+    // This test bypasses fixture()'s readiness check. Both original upstreams
+    // must be discovered so the preferred node and its failover peer are usable.
+    status(&http, &base, |s| s["totals"]["upstreams_up"] == 2).await;
     let (mut client, _) = connect_async(router.ws_url()).await.unwrap();
-    client.next().await.unwrap().unwrap();
+    let abi = client.next().await.unwrap().unwrap();
+    assert!(abi.is_text(), "expected initial upstream ABI, got {abi:?}");
     let (mut writer, mut reader) = client.split();
     writer
         .send(Message::Binary(

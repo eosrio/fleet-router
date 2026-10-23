@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Make `config test` validate handshake ABIs with the same parser as the running
+  router. Valid Wire `sysio::abi/1.*` handshakes no longer report `Invalid ABI`,
+  and malformed payloads containing `eosio::abi` are rejected with the parser error.
+
 ### Documentation
 
 - Publish the operator references on the website with shared navigation, installation

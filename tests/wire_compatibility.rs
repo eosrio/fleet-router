@@ -17,6 +17,65 @@ use tokio_tungstenite::tungstenite::Message;
 const WIRE_ABI: &str = include_str!("fixtures/wire_ship_abi.json");
 const WAIT: Duration = Duration::from_secs(5);
 
+/// Exercise the actual CLI handshake probe against the supplied first frame.
+async fn config_test_abi(text: &str, strict: bool) -> (bool, String) {
+    let mock = MockShipServer::new(MockShipConfig {
+        abi_text: Some(text.into()),
+        ..MockShipConfig::live(1, 1000)
+    })
+    .await;
+    let endpoint = mock.endpoint();
+    let _mock = mock.start();
+    let mut cfg = base_config(&[server("wire", &endpoint)]);
+    // The CLI validates fixed ports without starting a listener.
+    cfg["listen_port"] = json!(17000);
+    cfg.as_object_mut().unwrap().remove("metrics_port");
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(file.as_file_mut(), &cfg).unwrap();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_fleet-router"));
+    command.args(["config", "test"]).arg(file.path());
+    if strict {
+        command.arg("--strict");
+    }
+    let output = timeout(WAIT, command.kill_on_drop(true).output())
+        .await
+        .expect("config test timed out")
+        .expect("spawn config test");
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.status.success(), text)
+}
+
+#[tokio::test]
+async fn config_test_accepts_wire_abi_in_both_modes() {
+    for strict in [false, true] {
+        let (ok, output) = config_test_abi(WIRE_ABI, strict).await;
+        assert!(ok, "strict={strict}: {output}");
+        assert!(
+            output.contains("ABI Received") && output.contains("Valid servers:"),
+            "the runtime accepts this Wire ABI; the CLI must also accept it (strict={strict}): {output}"
+        );
+        assert!(!output.contains("Invalid ABI"), "{output}");
+    }
+}
+
+#[tokio::test]
+async fn config_test_rejects_invalid_abis_containing_the_eosio_marker() {
+    for abi in [
+        "not JSON: eosio::abi/1.1",
+        r#"{"version":"unsupported::abi/1.1","comment":"eosio::abi"}"#,
+        r#"{"version":"eosio::abi/1.1","structs":false}"#,
+    ] {
+        let (_, output) = config_test_abi(abi, false).await;
+        assert!(output.contains("Invalid ABI!"), "{abi}: {output}");
+        assert!(output.contains("Error:"), "missing parser error: {output}");
+        assert!(!output.contains("ABI Received"), "{abi}: {output}");
+    }
+}
+
 fn decode(abi: &mut AbiHandle, frame: Message) -> Value {
     let Message::Binary(bytes) = frame else {
         panic!("expected a binary SHiP result, got {frame:?}");

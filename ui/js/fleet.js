@@ -148,7 +148,7 @@ class ListenerPanel {
         this.rows.set(u.endpoint, row);
       }
       if (this.body.children[index] !== row.node) this.body.insertBefore(row.node, this.body.children[index] || null);
-      row.update(u, this.axis, status);
+      row.update(u, this.axis, status, listener.chain_api?.upstreams.find((api) => api.ship_endpoint === u.endpoint));
     });
     for (const [endpoint, row] of this.rows) {
       if (!seen.has(endpoint)) {
@@ -164,6 +164,18 @@ class ListenerPanel {
     const usage = l.max_connections ? l.sessions / l.max_connections : 0;
     const meter = el("span.meter", { "aria-hidden": "true" }, el("i", { style: `width:${Math.min(100, usage * 100).toFixed(1)}%` }));
     if (usage >= 0.8) meter.classList.add("is-warn");
+    const api = l.chain_api;
+    const apiMeta = api
+      ? el(
+          `span${api.ready ? "" : ".is-warn"}`,
+          { title: `Chain API at ${api.listen}; ${api.usable_upstreams} of ${api.upstreams_total} upstream APIs usable${api.listening ? "" : "; listener not listening"}` },
+          "chain API ",
+          el("b", null, api.listen),
+          el("span.lamp", { "data-status": api.ready ? "up" : "down", "aria-hidden": "true" }),
+          el("b", null, api.ready ? "ready" : api.listening ? "not ready" : "not listening"),
+          el("span", null, `${int(api.usable_upstreams)}/${int(api.upstreams_total)} usable`),
+        )
+      : el("span", null, "chain API ", el("b", null, "not configured"));
     this.meta.replaceChildren(
       el("span", null, "port ", el("b", null, `:${l.port}`)),
       el("span", { title: l.chain_id || "chain_id not pinned" }, "chain ", el("b", null, l.chain_id ? shortHash(l.chain_id) : "not pinned")),
@@ -173,6 +185,7 @@ class ListenerPanel {
         el("span.lamp", { "data-status": l.ready ? "up" : "down", "aria-hidden": "true" }),
         el("b", null, l.ready ? "ready" : "not ready"),
       ),
+      apiMeta,
       el("span", null, "sessions ", el("b", null, `${int(l.sessions)} / ${int(l.max_connections)}`), meter),
       el("span", null, "accepted ", el("b", null, int(l.accepted_total))),
       el(`span${l.rejected_total > 0 ? ".is-warn" : ""}`, null, "rejected ", el("b", null, int(l.rejected_total))),
@@ -243,7 +256,7 @@ class UpstreamRow {
     resize.observe(this.trackCell);
   }
 
-  update(u, axis, status) {
+  update(u, axis, status, api) {
     this.data = u;
     this.axis = axis;
     const flashing = isFlashing(this.key);
@@ -254,6 +267,14 @@ class UpstreamRow {
     this.name.setAttribute("aria-label", `${u.name}, ${u.status}. Open details`);
 
     const tags = [];
+    if (api) {
+      const label = api.status.replaceAll("_", " ");
+      tags.push(el(
+        `span.tag${api.status === "up" ? "" : ".tag-warn"}`,
+        { title: `Chain API ${api.api_endpoint} (${api.role}): ${label}` },
+        `API ${label}`,
+      ));
+    }
     if (u.tls) tags.push(el("span.tag", { title: "Upstream dialed with TLS (wss://)" }, "TLS"));
     const overridden = u.config && (u.config.priority !== u.priority || u.config.weight !== u.weight);
     tags.push(

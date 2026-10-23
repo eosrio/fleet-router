@@ -205,11 +205,31 @@ pub struct ListenerView {
     pub port: u16,
     pub chain_id: Option<String>,
     pub ready: bool,
+    pub chain_api: Option<ChainApiView>,
     pub max_connections: usize,
     pub sessions: usize,
     pub accepted_total: u64,
     pub rejected_total: u64,
     pub upstreams: Vec<UpstreamView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainApiView {
+    pub listen: String,
+    pub listening: bool,
+    pub ready: bool,
+    pub usable_upstreams: usize,
+    pub upstreams_total: usize,
+    pub upstreams: Vec<ChainApiUpstreamView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainApiUpstreamView {
+    pub ship_endpoint: String,
+    pub api_endpoint: String,
+    pub role: &'static str,
+    /// `up`, `down`, `disabled`, `chain_mismatch`, or `unverified`.
+    pub status: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -331,11 +351,54 @@ async fn listener_view(ctx: &ListenerContext, now: Instant, sessions: usize) -> 
     drop(db);
     // The verdict of `/ready`: a stitched listener needs a live upstream.
     let ready = crate::health::tip_ready(&ctx.health).await;
+    let chain_api = ctx.health.chain_api.as_ref().map(|api| {
+        let view = ctx.health.hub.as_ref().map(|hub| hub.view());
+        let snapshots = api.snapshot();
+        let upstreams: Vec<_> = api
+            .directory
+            .slots()
+            .iter()
+            .zip(&snapshots)
+            .map(|(slot, snapshot)| {
+                let state = slot.state();
+                let disabled = view
+                    .as_ref()
+                    .and_then(|view| view.up(slot.index))
+                    .is_some_and(|upstream| upstream.operator_disabled);
+                let status = if disabled {
+                    "disabled"
+                } else if state.chain_mismatch {
+                    "chain_mismatch"
+                } else if !state.up {
+                    "down"
+                } else if !slot.role.is_live() && !snapshot.verified {
+                    "unverified"
+                } else {
+                    "up"
+                };
+                ChainApiUpstreamView {
+                    ship_endpoint: slot.ship_endpoint.clone(),
+                    api_endpoint: slot.endpoint.to_string(),
+                    role: slot.role.as_str(),
+                    status,
+                }
+            })
+            .collect();
+        ChainApiView {
+            listen: api.bind.clone(),
+            listening: api.stats.bound(),
+            ready: crate::health::chain_api_ready(&ctx.health),
+            usable_upstreams: upstreams.iter().filter(|u| u.status == "up").count(),
+            upstreams_total: upstreams.len(),
+            upstreams,
+        }
+    });
     ListenerView {
         name: ctx.name().to_string(),
         port: ctx.port,
         chain_id: ctx.chain_id.as_ref().map(hex_32),
         ready,
+        chain_api,
         max_connections: ctx.max_connections,
         // Client sessions, as `max_connections` counts them. An upstream's
         // `sessions` are its connection slots: a stitched session can hold

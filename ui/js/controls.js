@@ -306,10 +306,16 @@ function range(r) {
 function renderFacts(u) {
   const lag = headLag(u);
   const overridden = u.config && (u.config.priority !== u.priority || u.config.weight !== u.weight);
+  const api = store.status?.listeners
+    .find((listener) => listener.name === open.listener)?.chain_api?.upstreams
+    .find((upstream) => upstream.ship_endpoint === u.endpoint);
   const rows = [
     ["Status", [STATUS_LABEL[u.status] || u.status, el("div.sub", null, STATUS_TEXT[u.status] || "")]],
     ["Listener", open.listener],
     ["Endpoint", [u.endpoint, u.tls ? el("span.sub", null, "  TLS") : null]],
+    ["Chain API", api
+      ? [api.status.replaceAll("_", " "), el("div.sub", null, `${api.api_endpoint} · ${api.role}`)]
+      : el("span.sub", null, "not configured for this upstream")],
     [
       "Priority, weight",
       [`${u.priority}, ${u.weight}`, overridden ? el("div.sub", null, `changed at runtime; config has ${u.config.priority}, ${u.config.weight}`) : null],

@@ -1624,6 +1624,7 @@ async fn chain_api_series_name_their_listener_and_readiness_follows_the_live_cha
             }],
         },
     ]);
+    cfg["dashboard"] = json!({ "enabled": true });
     let (router, ports) = start_with_chain_api(cfg).await;
     let (port, metrics) = (ports[0], router.metrics());
     let labels = upstream_labels(Some("main"), &node);
@@ -1656,6 +1657,21 @@ async fn chain_api_series_name_their_listener_and_readiness_follows_the_live_cha
         "not ready (plain): no chain API configured\n",
     )
     .await;
+    let status: Value =
+        serde_json::from_str(&http_get(metrics, "/api/v1/status").await.unwrap().1).unwrap();
+    assert_eq!(status["listeners"][0]["chain_api"]["ready"], false);
+    assert_eq!(status["listeners"][0]["chain_api"]["listening"], true);
+    assert_eq!(status["listeners"][0]["chain_api"]["usable_upstreams"], 0);
+    assert_eq!(status["listeners"][0]["chain_api"]["upstreams_total"], 1);
+    assert_eq!(
+        status["listeners"][0]["chain_api"]["upstreams"][0]["status"],
+        "chain_mismatch"
+    );
+    assert_eq!(
+        status["listeners"][0]["chain_api"]["upstreams"][0]["ship_endpoint"],
+        node.ship_ep
+    );
+    assert_eq!(status["listeners"][1]["chain_api"], Value::Null);
 
     node.api.set_chain_id(CHAIN);
     wait_http(
@@ -1672,6 +1688,14 @@ async fn chain_api_series_name_their_listener_and_readiness_follows_the_live_cha
         "ready (main): 1 chain API upstream(s) up\n",
     )
     .await;
+    let status: Value =
+        serde_json::from_str(&http_get(metrics, "/api/v1/status").await.unwrap().1).unwrap();
+    assert_eq!(status["listeners"][0]["chain_api"]["ready"], true);
+    assert_eq!(status["listeners"][0]["chain_api"]["usable_upstreams"], 1);
+    assert_eq!(
+        status["listeners"][0]["chain_api"]["upstreams"][0]["status"],
+        "up"
+    );
     // The SHiP side of `main` never answers: its tip readiness is apart.
     assert_eq!(http_get(metrics, "/ready/main").await.unwrap().0, 503);
 

@@ -178,6 +178,11 @@ fn api_readiness(l: &ListenerHealthState) -> Readiness {
     }
 }
 
+/// The dashboard uses the same verdict as `/ready/<listener>?scope=api`.
+pub(crate) fn chain_api_ready(l: &ListenerHealthState) -> bool {
+    api_readiness(l).ready()
+}
+
 /// Whether `l` can serve the chain tip, as `GET /ready/<listener>` answers.
 pub(crate) async fn tip_ready(l: &ListenerHealthState) -> bool {
     listener_readiness(l, Scope::Tip).await.ready()

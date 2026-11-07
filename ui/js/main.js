@@ -6,6 +6,7 @@ import {
   controlMode,
   initControls,
   openUpstream,
+  rebalanceAction,
   refreshUpstreamDialog,
   sessionAction,
   syncControlState,
@@ -59,7 +60,7 @@ function showView(name, { focus = false } = {}) {
     renderAll();
     markEventsSeen();
   }
-  document.title = view === "fleet" ? "fleet-router dashboard" : `${view[0].toUpperCase()}${view.slice(1)} – fleet-router`;
+  document.title = view === "fleet" ? "fleet-router dashboard" : `${view === "sessions" ? "Clients" : view[0].toUpperCase() + view.slice(1)} – fleet-router`;
   if (focus) {
     window.scrollTo({ top: 0 });
     document.getElementById("main").focus({ preventScroll: true });
@@ -132,7 +133,7 @@ on((kind, payload) => {
 function main() {
   initTheme();
   injectDefs();
-  initFleet({ openUpstream });
+  initFleet({ openUpstream, rebalance: rebalanceAction });
   initEvents();
   initSessions({ sessionAction });
   initControls({

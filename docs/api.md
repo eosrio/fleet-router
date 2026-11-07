@@ -11,6 +11,8 @@ The dashboard is **off by default**. Turn it on with [`dashboard.enabled`](confi
 
 The endpoint has the same exposure as `/metrics`: keep it on a trusted network. The API shows upstream addresses and client IP addresses. See [Security](#security).
 
+The dashboard's **Clients** view lists active SHiP sessions and recent disconnections. The client address is the socket peer seen by the router; a proxy or NAT can hide the original host, and multiple processes can share an address. The router does not infer application names.
+
 - [Conventions](#conventions)
 - [Read endpoints](#read-endpoints)
 - [Live stream](#live-stream)
@@ -49,6 +51,8 @@ Full router state. The [dashboard stream](#get-apiv1dashboardstream) includes th
       "ready": true,
       "max_connections": 10000,
       "sessions": 12,
+      "rebalance_supported": true,
+      "rebalance_running": false,
       "accepted_total": 340,
       "rejected_total": 0,
       "upstreams": [
@@ -103,6 +107,8 @@ Full router state. The [dashboard stream](#get-apiv1dashboardstream) includes th
 `priority` and `weight` are the values in effect. `config` holds the values from the config file, so a client can show when an operator changed them at runtime. An upstream's `sessions` is the number of connections sessions hold to it now; in a stitched listener a session can also hold a pre-dialed standby link to the next range's upstream. A listener's `sessions` and `totals.sessions` count client sessions. `sessions_total` counts every session it has been assigned since start, including failovers to it. `failovers_total` counts sessions that left it through failover: the stream ended, a request was rerouted to an upstream that serves it better, or an operator moved or drained it. `blocks_total` and `bytes_total` count block frames and bytes forwarded from it to clients.
 
 A listener's `ready` is what [`/ready/<listener>`](observability.md#readiness-and-coverage) answers: a stitched listener needs an online live upstream.
+
+`rebalance_supported` is true for pool listeners. `rebalance_running` is true while an operator-requested rebalance is in progress.
 
 `head_block` is the last block in its trace or chain-state range (`max(end) - 1`), or `null` before the first status reply.
 
@@ -205,7 +211,10 @@ Recent events, newest last (up to 500 kept in memory). Optional `?after=<id>` re
 | `upstream_quarantined` | A block-range quarantine was armed. |
 | `session_failover` | A session moved to another upstream. `upstream` is the new upstream; `message` names both and says why. |
 | `session_failed` | A session was closed because no upstream could serve it (for example close code 1011). |
+| `session_closed` | A client session ended. `client` is its socket peer, `session` its ID, and `upstream` the last upstream if known. `last_block` is included if a block was delivered. `message` includes the router's recorded end reason. |
 | `control` | An operator action through the control API (`message` describes it). |
+
+The Clients view shows the latest ten matching `session_closed` events. They share the bounded 500-event in-memory log with other events and are lost on restart or when displaced by newer events. They cannot identify a disconnect that happened before this feature was running.
 
 ## Live stream
 
@@ -285,10 +294,13 @@ Every successful action is recorded as a `control` event and logged.
 | `PATCH /api/v1/listeners/{listener}/upstreams/{endpoint}` | `{"priority": 5, "weight": 2}` (either field) | Change priority or weight. `weight` must be at least 1. Applies to new sessions and failovers. |
 | `POST /api/v1/listeners/{listener}/upstreams/{endpoint}/reset` | | Restore `priority`, `weight`, and enabled state from the config. |
 | `POST /api/v1/listeners/{listener}/upstreams/{endpoint}/clear-quarantine` | | Remove its active block-range quarantines. |
+| `POST /api/v1/listeners/{listener}/rebalance` | | Start a best-effort rebalance of the listener's active pool sessions. |
 | `POST /api/v1/sessions/{id}/move` | | Move one session to another upstream with the normal failover. Returns `409` when no other upstream can take it, by the same rule as a drain. |
 | `POST /api/v1/sessions/{id}/close` | | Close one session with WebSocket close code 1000 and reason `closed by operator`. |
 
 Upstream actions return the updated upstream object (same shape as in `status`). Session actions return `202` with `{"ok": true}`; the move or close happens asynchronously and shows up as an event.
+
+Rebalance also returns `202` with `{"ok": true}` when accepted, not when finished. It checks the current generation's sessions one at a time, using each session's request and the current routing rules. It moves only when the next eligible pool choice improves coverage, freshness, priority, or weighted distribution; a balanced pool can move zero sessions. Each move uses the existing failover path, so the client WebSocket stays connected and resumes at its cursor. Coverage, quarantine, capacity, and exclusions can prevent a move. The start and finish or stop are `control` events; the latter reports how many moves completed. A run stops on a configuration change, a session or move timeout, or after five minutes. A second request while it is running returns `409`; run it again to reconsider the current state. Rebalance applies only to the current pool listener generation and returns `409` for stitched listeners; older draining generations are not changed.
 
 A moved session avoids the upstream it left until its next link is up. If no other upstream can take it after all (the target filled up or failed meanwhile), it returns to the upstream it left instead of closing. A session whose dial lands on an upstream an operator disabled meanwhile goes to another upstream when one can take it. Disabling, draining and changing `priority` or `weight` also apply to the listener's [chain API](chain-api.md).
 

@@ -76,6 +76,9 @@ export const api = {
   sessionAction(id, action) {
     return request("POST", `sessions/${encodeURIComponent(id)}/${action}`, { auth: true });
   },
+  rebalance(listener) {
+    return request("POST", `listeners/${encodeURIComponent(listener)}/rebalance`, { auth: true });
+  },
 };
 
 function upstreamPath(listener, endpoint) {

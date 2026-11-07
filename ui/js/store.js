@@ -110,6 +110,8 @@ export function applyDashboardFrame(frame) {
         typeof event.kind !== "string" || event.kind.length === 0 ||
         typeof event.message !== "string" || !["info", "warn", "error"].includes(event.level) ||
         [event.listener, event.upstream].some(value => value != null && typeof value !== "string") ||
+        (event.client != null && typeof event.client !== "string") ||
+        (event.last_block != null && (!Number.isSafeInteger(event.last_block) || event.last_block < 0)) ||
         (event.session != null && (!Number.isSafeInteger(event.session) || event.session < 1))) {
       throw new Error("Invalid dashboard event");
     }

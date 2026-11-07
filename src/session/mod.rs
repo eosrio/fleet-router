@@ -856,6 +856,7 @@ impl Session {
 
     /// Close links quietly, abort running dials and log the summary line.
     fn finish(&mut self) {
+        self.registry.set_end_reason(self.end_reason);
         if let Some(link) = self.link.take() {
             drop(link.close_quietly());
         }
@@ -998,9 +999,113 @@ impl Session {
             return Flow::Stop;
         }
         if self.registry.info.take_move_request() {
+            // A manual move and a rebalance can arrive together. Notify again
+            // so the coalesced rebalance request is not lost.
+            self.registry.info.control.notify_one();
             return self.on_operator_move().await;
         }
+        if let Some(reply) = self.registry.info.take_rebalance_request() {
+            if reply.is_current(&self.registry.info) && self.should_rebalance() {
+                let before = self.registry.info.upstream();
+                let flow = self.on_operator_move().await;
+                reply.respond((self.registry.info.upstream() != before).then_some(before));
+                return flow;
+            }
+            reply.respond(None);
+        }
         Flow::Continue
+    }
+
+    /// Compare this session's actual next pick with its current upstream.
+    /// Rebalancing is deliberately limited to pool listeners: stitched
+    /// sessions may own standby slots and prefer ranges over even load.
+    fn should_rebalance(&mut self) -> bool {
+        if self.ctx.stitched() {
+            return false;
+        }
+        self.sync_view();
+        let Some(endpoint) = self.link.as_ref().map(|link| link.endpoint.clone()) else {
+            return false;
+        };
+        let Some(source) = self.view.upstreams.iter().find(|u| u.endpoint == endpoint) else {
+            return false;
+        };
+        if !source.routable() || !source.online || !source.known || !source.abi_ok {
+            return false;
+        }
+        let now = std_now();
+        let route = self
+            .c
+            .req
+            .as_ref()
+            .map(|request| (Need::of(request), self.c.cursor));
+        let mut alternatives = self.ex.clone();
+        // A move replaces the previous soft exclusion with its source before
+        // the failover pick. Use the same exclusion here when comparing.
+        alternatives.soft = Some(endpoint.clone());
+        alternatives.add_hard(endpoint.clone(), MOVE_EXCLUSION, now);
+        let Some((target_index, target_rank)) = pool_rank(
+            &self.view,
+            route,
+            &alternatives,
+            false,
+            self.id,
+            self.ctx.live_lag_blocks,
+            now,
+        ) else {
+            return false;
+        };
+        let Some(target) = self.view.up(target_index) else {
+            return false;
+        };
+        // A fallback without the requested fields is not a valid rebalance.
+        if target_rank >= 2 || !can_take_over(target, route.map(|(_, block)| block)) {
+            return false;
+        }
+        if let Some(request) = self.c.req.as_ref().filter(|_| self.c.in_progress()) {
+            if !self.alternative_for(self.c.cursor, request, &endpoint) {
+                return false;
+            }
+        }
+
+        // Rank the current upstream against the same fleet union. Its own
+        // slot must not make it appear full when comparing it with a target.
+        let mut current_view = self.view.as_ref().clone();
+        let mut only_source = self.ex.clone();
+        only_source.soft = None;
+        only_source.hard.retain(|(up, _)| *up != endpoint);
+        for upstream in &mut current_view.upstreams {
+            if upstream.endpoint == endpoint {
+                upstream.max_sessions = None;
+            } else {
+                only_source.add_hard(upstream.endpoint.clone(), MOVE_EXCLUSION, now);
+            }
+        }
+        let Some((_, source_rank)) = pool_rank(
+            &current_view,
+            route,
+            &only_source,
+            false,
+            self.id,
+            self.ctx.live_lag_blocks,
+            now,
+        ) else {
+            return false;
+        };
+        if target_rank != source_rank {
+            return target_rank < source_rank;
+        }
+        if target.priority != source.priority {
+            return target.priority < source.priority;
+        }
+
+        // Move only if it improves the weighted distribution after moving
+        // one slot; equal alternatives do not churn when already balanced.
+        let from = source.connections.load(Ordering::Relaxed) as u128;
+        let to = target.connections.load(Ordering::Relaxed) as u128;
+        from > 0
+            && (2 * from - 1) * u128::from(target.weight.max(1))
+                > (2 * to + 1) * u128::from(source.weight.max(1))
     }
 
     /// Move the session off its link's upstream, with the normal failover:

@@ -788,6 +788,10 @@ main {
   color: var(--ink-3);
 }
 
+.plate-rebalance {
+  margin-left: auto;
+}
+
 .plate-meta > span {
   display: inline-flex;
   align-items: center;

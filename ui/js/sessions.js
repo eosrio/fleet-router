@@ -1,7 +1,7 @@
 // Sessions view reads the same pushed revision as the fleet and event log.
 
 import { store } from "./store.js";
-import { syncOptions } from "./events.js";
+import { eventRow, syncOptions } from "./events.js";
 import { bytes, duration, el, int, plural, setText } from "./util.js";
 
 const filters = { listener: "", upstream: "", search: "" };
@@ -131,6 +131,14 @@ function render() {
   }
   const summary = document.getElementById("sessions-summary");
   setText(summary, list.length === rows.length ? plural(rows.length, "session", "sessions") : `${int(list.length)} of ${plural(rows.length, "session", "sessions")}`);
+  const q = filters.search.toLowerCase();
+  const disconnected = store.events.filter((event) => event.kind === "session_closed" &&
+    (!filters.listener || event.listener === filters.listener) &&
+    (!filters.upstream || event.upstream === filters.upstream) &&
+    (!q || (event.client || "").toLowerCase().includes(q))).slice(-10).reverse();
+  const recent = document.getElementById("session-disconnects");
+  recent.replaceChildren(...(disconnected.length ? disconnected.map((event) => eventRow(event)) :
+    [el("li.empty", null, "No retained disconnections match these filters.")]));
 }
 
 function fillRow(tr, s, now, unlocked) {

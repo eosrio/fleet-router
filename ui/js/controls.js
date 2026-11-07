@@ -237,6 +237,24 @@ function raise(root) {
 
 /* ---------- session actions ---------- */
 
+export async function rebalanceAction(listener) {
+  if (mode === "off") return showControlsOffInfo();
+  if (mode === "locked") return openUnlock();
+  const ok = await confirmAction({
+    title: `Rebalance ${listener}?`,
+    text: "Eligible sessions move one at a time to improve the distribution. Clients keep their connections. Priority, weight, availability and block coverage still apply.",
+    ok: "Rebalance",
+  });
+  if (!ok) return;
+  try {
+    await api.rebalance(listener);
+    toast(`Rebalancing ${listener}. See Events for the result.`);
+    announce(`Rebalancing ${listener}.`);
+  } catch (err) {
+    if (!handleAuthError(err)) toast(`Could not rebalance ${listener}: ${err.message}`, "error");
+  }
+}
+
 export async function sessionAction(session, action) {
   if (mode !== "unlocked") return;
   if (action === "close") {

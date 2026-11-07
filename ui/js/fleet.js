@@ -23,6 +23,7 @@ const LAG_WARN = 10;
 
 const panels = new Map();
 let onOpenUpstream = () => {};
+let onRebalance = () => {};
 let controlMode = "off"; // "off" | "locked" | "unlocked"
 
 const resize = new ResizeObserver((entries) => {
@@ -34,13 +35,15 @@ const resize = new ResizeObserver((entries) => {
   }
 });
 
-export function initFleet({ openUpstream }) {
+export function initFleet({ openUpstream, rebalance }) {
   onOpenUpstream = openUpstream;
+  onRebalance = rebalance;
 }
 
 export function setControlMode(mode) {
   controlMode = mode;
   for (const panel of panels.values()) {
+    panel.updateRebalance();
     for (const row of panel.rows.values()) row.updateAction();
   }
 }
@@ -94,6 +97,18 @@ class ListenerPanel {
 
     this.title = el("h2.plate-name", { id: `listener-${cssId(name)}` });
     this.meta = el("div.plate-meta");
+    this.rebalance = el("button.button.button-small.plate-rebalance", {
+      type: "button",
+      "aria-label": `Rebalance ${name} sessions`,
+      onclick: async () => {
+        this.rebalancePending = true;
+        this.updateRebalance();
+        try { await onRebalance(name); } finally {
+          this.rebalancePending = false;
+          this.updateRebalance();
+        }
+      },
+    }, "Rebalance");
     this.axisWide = el("div.h-track", { role: "columnheader" });
     this.axisWide.append(el("span.sr-only", { text: "Block track" }));
     this.axisWideSvg = svgShell("board-axis");
@@ -123,14 +138,16 @@ class ListenerPanel {
       this.axisNarrow,
       this.body,
     );
-    this.node = el("section.panel", { "aria-labelledby": this.title.id }, el("div.plate", null, this.title, this.meta), this.board);
+    this.node = el("section.panel", { "aria-labelledby": this.title.id }, el("div.plate", null, this.title, this.meta, this.rebalance), this.board);
     resize.observe(this.axisWide);
     resize.observe(this.axisNarrow);
   }
 
   update(listener, status) {
+    this.data = listener;
     setText(this.title, listener.name);
     this.renderMeta(listener);
+    this.updateRebalance();
 
     const best = bestHead(listener);
     let min = null;
@@ -158,6 +175,15 @@ class ListenerPanel {
       }
     }
     this.drawAxes();
+  }
+
+  updateRebalance() {
+    if (!this.data) return;
+    const running = this.data.rebalance_running;
+    const supported = this.data.rebalance_supported;
+    this.rebalance.disabled = running || !supported || this.rebalancePending;
+    this.rebalance.title = !supported ? "Available for pool listeners" : controlMode === "unlocked" ? "Rebalance eligible sessions" : "Unlock controls to rebalance";
+    setText(this.rebalance, running ? "Rebalancing…" : "Rebalance");
   }
 
   renderMeta(l) {

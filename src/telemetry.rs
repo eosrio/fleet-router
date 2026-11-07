@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, oneshot, Notify};
 
 /// Events kept in memory for `GET /api/v1/events`.
 pub const MAX_EVENTS: usize = 500;
@@ -55,6 +55,7 @@ pub enum EventKind {
     UpstreamQuarantined,
     SessionFailover,
     SessionFailed,
+    SessionClosed,
     Control,
 }
 
@@ -68,6 +69,10 @@ pub struct Event {
     pub listener: Option<String>,
     pub upstream: Option<String>,
     pub session: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_block: Option<u32>,
     pub message: String,
 }
 
@@ -82,6 +87,8 @@ impl Event {
             listener: None,
             upstream: None,
             session: None,
+            client: None,
+            last_block: None,
             message: message.into(),
         }
     }
@@ -98,6 +105,12 @@ impl Event {
 
     pub fn session(mut self, id: u64) -> Self {
         self.session = Some(id);
+        self
+    }
+
+    pub fn client(mut self, client: SocketAddr, last_block: Option<u32>) -> Self {
+        self.client = Some(client.to_string());
+        self.last_block = last_block;
         self
     }
 }
@@ -124,6 +137,8 @@ pub struct Sample {
 pub struct ListenerStats {
     pub accepted_total: AtomicU64,
     pub rejected_total: AtomicU64,
+    /// Only one operator rebalance may run for a listener at a time.
+    pub rebalance_running: AtomicBool,
 }
 
 /// Live view of one client session, shared between the session task and the
@@ -136,6 +151,7 @@ pub struct SessionInfo {
     pub client: SocketAddr,
     pub started_ms: u64,
     upstream: Mutex<String>,
+    last_upstream: Mutex<String>,
     start_block: AtomicU64,
     last_block: AtomicU64,
     /// The start of the latest request, then one past each block delivered.
@@ -145,9 +161,39 @@ pub struct SessionInfo {
     bytes: AtomicU64,
     failovers: AtomicU32,
     move_requested: AtomicBool,
+    rebalance_requested: Mutex<Option<RebalanceRequest>>,
     close_requested: AtomicBool,
     /// Wakes the session loop after [`Self::request_move`] or [`Self::request_close`].
     pub control: Notify,
+}
+
+/// A pending operator request must still belong to the active listener
+/// generation when its session actor processes it.
+pub struct RebalanceRequest {
+    reply: oneshot::Sender<Option<String>>,
+    state: crate::api::StateHandle,
+}
+
+impl std::fmt::Debug for RebalanceRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RebalanceRequest").finish_non_exhaustive()
+    }
+}
+
+impl RebalanceRequest {
+    pub fn is_current(&self, session: &SessionInfo) -> bool {
+        !self.reply.is_closed()
+            && self.state.current().is_some_and(|app| {
+                app.listeners.iter().any(|ctx| {
+                    ctx.name() == &*session.listener
+                        && ctx.config_generation == session.config_generation
+                })
+            })
+    }
+
+    pub fn respond(self, source: Option<String>) {
+        let _ = self.reply.send(source);
+    }
 }
 
 impl SessionInfo {
@@ -165,6 +211,9 @@ impl SessionInfo {
     pub fn set_upstream(&self, endpoint: &str) {
         let _change = global().begin_change();
         *lock(&self.upstream) = endpoint.to_string();
+        if !endpoint.is_empty() {
+            *lock(&self.last_upstream) = endpoint.to_string();
+        }
     }
 
     pub fn start_block(&self) -> Option<u32> {
@@ -231,6 +280,30 @@ impl SessionInfo {
         self.control.notify_one();
     }
 
+    /// Ask the session actor to consider a rebalance using its own request and
+    /// routing state. The reply names the source when it started a move.
+    pub fn request_rebalance(
+        &self,
+        state: crate::api::StateHandle,
+    ) -> Option<oneshot::Receiver<Option<String>>> {
+        let mut pending = lock(&self.rebalance_requested);
+        if let Some(request) = pending.as_ref() {
+            if request.reply.is_closed() {
+                *pending = None;
+            } else {
+                return None;
+            }
+        }
+        let (tx, rx) = oneshot::channel();
+        *pending = Some(RebalanceRequest { reply: tx, state });
+        self.control.notify_one();
+        Some(rx)
+    }
+
+    pub fn take_rebalance_request(&self) -> Option<RebalanceRequest> {
+        lock(&self.rebalance_requested).take()
+    }
+
     /// Ask the session to close with code 1000.
     pub fn request_close(&self) {
         self.close_requested.store(true, Ordering::Release);
@@ -250,12 +323,37 @@ impl SessionInfo {
 /// Removes its session from the registry when dropped.
 pub struct SessionRegistration {
     pub info: Arc<SessionInfo>,
+    end_reason: &'static str,
+}
+
+impl SessionRegistration {
+    pub fn set_end_reason(&mut self, reason: &'static str) {
+        self.end_reason = reason;
+    }
 }
 
 impl Drop for SessionRegistration {
     fn drop(&mut self) {
         let _change = global().begin_change();
+        // Wake a coordinator waiting for an actor that can no longer reply.
+        drop(self.info.take_rebalance_request());
         lock(&global().sessions).remove(&self.info.id);
+        let upstream = lock(&self.info.last_upstream).clone();
+        let mut event = Event::new(
+            Level::Info,
+            EventKind::SessionClosed,
+            format!(
+                "client {} disconnected ({})",
+                self.info.client, self.end_reason
+            ),
+        )
+        .listener(&self.info.listener)
+        .session(self.info.id)
+        .client(self.info.client, self.info.last_block());
+        if !upstream.is_empty() {
+            event = event.upstream(&upstream);
+        }
+        global().emit(event);
     }
 }
 
@@ -423,6 +521,7 @@ impl Telemetry {
             client,
             started_ms: now_ms(),
             upstream: Mutex::new(upstream.to_string()),
+            last_upstream: Mutex::new(upstream.to_string()),
             start_block: AtomicU64::new(NO_BLOCK),
             last_block: AtomicU64::new(NO_BLOCK),
             next_block: AtomicU64::new(NO_BLOCK),
@@ -431,11 +530,15 @@ impl Telemetry {
             bytes: AtomicU64::new(0),
             failovers: AtomicU32::new(0),
             move_requested: AtomicBool::new(false),
+            rebalance_requested: Mutex::new(None),
             close_requested: AtomicBool::new(false),
             control: Notify::new(),
         });
         lock(&self.sessions).insert(info.id, info.clone());
-        SessionRegistration { info }
+        SessionRegistration {
+            info,
+            end_reason: "session ended",
+        }
     }
 
     pub fn session(&self, id: u64) -> Option<Arc<SessionInfo>> {
@@ -495,6 +598,24 @@ mod tests {
 
         drop(registration);
         assert!(telemetry.session(id).is_none());
+    }
+
+    #[test]
+    fn canceled_rebalance_requests_do_not_block_a_later_attempt() {
+        let telemetry = global();
+        let state = crate::api::AppState::health_only(vec![]);
+        let client: SocketAddr = "127.0.0.1:5002".parse().unwrap();
+        let registration = telemetry.register_session(Arc::from("t"), client, "up:1");
+        let info = registration.info.clone();
+        let first = info.request_rebalance(state.handle()).unwrap();
+        assert!(info.request_rebalance(state.handle()).is_none());
+        drop(first);
+        let mut second = info.request_rebalance(state.handle()).unwrap();
+        drop(registration);
+        assert!(matches!(
+            second.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
     }
 
     #[test]

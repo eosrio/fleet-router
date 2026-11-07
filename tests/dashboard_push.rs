@@ -94,10 +94,23 @@ async fn push_bootstraps_sessions_controls_and_reconnect_without_read_requests()
         .await;
     assert!(opened["revision"].as_u64().unwrap() > first);
     assert_eq!(opened["status"]["listeners"][0]["sessions"], 1);
+    let client_id = opened["sessions"][0]["id"].clone();
+    let client_address = opened["sessions"][0]["client"].clone();
     client.close(None).await.unwrap();
-    stream
+    let closed = stream
         .until(|f| f["sessions"].as_array().unwrap().is_empty())
         .await;
+    let disconnect = closed["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "session_closed" && event["session"] == client_id)
+        .expect("the removal and its disconnect event must be in the same frame");
+    assert_eq!(disconnect["client"], client_address);
+    assert!(disconnect["message"]
+        .as_str()
+        .unwrap()
+        .contains("client closed"));
 
     let response = http
         .post(format!(

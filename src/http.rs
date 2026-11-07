@@ -588,6 +588,8 @@ mod tests {
                 ready: false,
                 max_connections: 1,
                 sessions: 0,
+                rebalance_supported: false,
+                rebalance_running: false,
                 accepted_total: 0,
                 rejected_total: 0,
                 upstreams: vec![],

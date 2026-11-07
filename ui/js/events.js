@@ -54,9 +54,10 @@ function matches(ev) {
   return true;
 }
 
-function row(ev, isNew) {
+export function eventRow(ev, isNew = false) {
   const key = ev.level === "error" ? "key-failover" : ev.level === "warn" ? "key-stale" : ev.kind === "upstream_up" || ev.kind === "upstream_fresh" ? "key-set" : "";
-  const where = [ev.listener, ev.upstream, ev.session !== null && ev.session !== undefined ? `session ${ev.session}` : null].filter(Boolean).join("  ");
+  const where = [ev.listener, ev.upstream, ev.session !== null && ev.session !== undefined ? `session ${ev.session}` : null,
+    ev.kind === "session_closed" && Number.isSafeInteger(ev.last_block) ? `last block ${int(ev.last_block)}` : null].filter(Boolean).join("  ");
   const node = el(
     `li.ev${isNew ? ".is-new" : ""}`,
     { dataset: { level: ev.level, id: String(ev.id) } },
@@ -76,13 +77,13 @@ export function renderRecent(fresh = new Set()) {
     list.replaceChildren(el("li.empty", null, "No events yet."));
     return;
   }
-  list.replaceChildren(...items.map((ev) => row(ev, fresh.has(ev.id))));
+  list.replaceChildren(...items.map((ev) => eventRow(ev, fresh.has(ev.id))));
 }
 
 export function renderAll(fresh = new Set()) {
   const list = document.getElementById("all-events");
   const items = store.events.filter(matches).reverse();
-  list.replaceChildren(...items.map((ev) => row(ev, fresh.has(ev.id))));
+  list.replaceChildren(...items.map((ev) => eventRow(ev, fresh.has(ev.id))));
   document.getElementById("events-empty").hidden = items.length > 0;
 }
 

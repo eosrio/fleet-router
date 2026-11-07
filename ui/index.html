@@ -41,7 +41,7 @@
 
       <nav class="views" aria-label="Views">
         <a href="#fleet" data-view="fleet">Fleet</a>
-        <a href="#sessions" data-view="sessions">Sessions <span class="count" id="nav-sessions"></span></a>
+        <a href="#sessions" data-view="sessions">Clients <span class="count" id="nav-sessions"></span></a>
         <a href="#events" data-view="events">Events <span class="count" id="nav-events" hidden></span></a>
         <a href="#config" data-view="config">Configuration</a>
       </nav>
@@ -88,7 +88,7 @@
 
     <section class="view" id="view-sessions" data-view="sessions" aria-labelledby="sessions-title" hidden>
       <div class="view-head">
-        <h1 id="sessions-title">Sessions</h1>
+        <h1 id="sessions-title">Clients</h1>
         <p class="view-summary" id="sessions-summary"></p>
       </div>
       <div class="toolbar">
@@ -124,6 +124,14 @@
         </table>
       </div>
       <p class="empty" id="sessions-empty" hidden></p>
+      <section class="recent" aria-labelledby="disconnects-title">
+        <div class="recent-head">
+          <h2 id="disconnects-title">Recent disconnections</h2>
+          <a href="#events">All events</a>
+        </div>
+        <p class="config-note">Shown while retained among the last 500 events. Cleared when the router restarts.</p>
+        <ol class="event-list" id="session-disconnects"></ol>
+      </section>
     </section>
 
     <section class="view" id="view-events" data-view="events" aria-labelledby="events-title" hidden>

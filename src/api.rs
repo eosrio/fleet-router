@@ -27,6 +27,7 @@ use crate::tasks::hex_32;
 use crate::telemetry::{self, Event, EventKind, Level, ListenerStats};
 
 mod dashboard;
+mod rebalance;
 pub use dashboard::{run as run_dashboard, Feed};
 
 /// Everything the HTTP endpoint knows about one client listener.
@@ -93,6 +94,7 @@ pub const MAX_STREAMS: usize = 32;
 
 /// Long-lived HTTP connections and publishers resolve state without retaining
 /// a retired listener's upstream clients and configuration for their lifetime.
+#[derive(Clone)]
 pub struct StateHandle {
     runtime: std::sync::Weak<crate::runtime::Runtime>,
     fallback: Option<SharedState>,
@@ -207,6 +209,8 @@ pub struct ListenerView {
     pub ready: bool,
     pub max_connections: usize,
     pub sessions: usize,
+    pub rebalance_supported: bool,
+    pub rebalance_running: bool,
     pub accepted_total: u64,
     pub rejected_total: u64,
     pub upstreams: Vec<UpstreamView>,
@@ -341,6 +345,12 @@ async fn listener_view(ctx: &ListenerContext, now: Instant, sessions: usize) -> 
         // `sessions` are its connection slots: a stitched session can hold
         // two (a standby link, a pre-dial) or none (holding, waiting).
         sessions,
+        rebalance_supported: ctx
+            .health
+            .hub
+            .as_ref()
+            .is_some_and(|hub| hub.topology == crate::models::ResolvedTopology::Pool),
+        rebalance_running: ctx.stats.rebalance_running.load(Ordering::Acquire),
         accepted_total: ctx.stats.accepted_total.load(Ordering::Relaxed),
         rejected_total: ctx.stats.rejected_total.load(Ordering::Relaxed),
         upstreams,
@@ -944,6 +954,7 @@ pub fn router() -> Router<SharedState> {
         )
         .route("/sessions/{id}/move", post(post_session_move))
         .route("/sessions/{id}/close", post(post_session_close))
+        .route("/listeners/{listener}/rebalance", post(rebalance::start))
         .fallback(api_not_found)
 }
 

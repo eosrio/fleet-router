@@ -122,6 +122,7 @@ test("malformed events preserve all usable state and allow the corrected revisio
     { kind: null }, { kind: 7 }, { kind: "" }, { message: null }, { level: null },
     { t_ms: "bad" }, { t_ms: NaN }, { t_ms: Infinity }, { t_ms: -1 }, { t_ms: 8640000000000001 },
     { listener: {} }, { upstream: [] }, { session: "bad" },
+    { client: {} }, { last_block: "bad" }, { last_block: -1 },
   ]) {
     const invalid = frame(2, { bootstrap: true, events: [{ id: 10, ...malformed }] });
     assert.throws(() => applyDashboardFrame(invalid), /invalid dashboard event/i);

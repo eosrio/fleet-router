@@ -389,9 +389,53 @@ th {{ color:var(--ink-3); font-weight:500; }}
             );
         }
         out.push_str("</tbody></table></div>\n");
+        if let Some(api) = &listener.chain_api {
+            render_chain_api_table(&mut out, api);
+        }
     }
     out.push_str("</main>\n</body>\n</html>\n");
     out
+}
+
+fn format_us(us: Option<u64>) -> String {
+    match us {
+        None => "&ndash;".to_string(),
+        Some(us) if us < 1_000 => format!("{us} us"),
+        Some(us) if us < 1_000_000 => format!("{} ms", us / 1_000),
+        Some(us) => format!("{:.1} s", us as f64 / 1_000_000.0),
+    }
+}
+
+/// Chain API backends on the plain status page. Names and addresses are escaped.
+fn render_chain_api_table(out: &mut String, api: &api::ChainApiView) {
+    let _ = write!(
+        out,
+        r#"<h3>Chain API &middot; {listen}</h3>
+<div class="wrap"><table>
+<thead><tr><th>Status</th><th>Backend</th><th>Endpoint</th><th>Role</th><th>In flight</th><th>Requests</th><th>Errors</th><th>Latency</th><th>Head</th></tr></thead>
+<tbody>
+"#,
+        listen = escape_html(&api.listen),
+    );
+    for backend in &api.upstreams {
+        let _ = writeln!(
+            out,
+            r#"<tr><td class="{status}">&#9679; {status}</td><td>{name}</td><td>{endpoint}</td><td>{role}</td><td>{inflight} / {cap}</td><td>{requests}</td><td>{errors}</td><td>{latency}</td><td>{head}</td></tr>"#,
+            status = backend.status,
+            name = escape_html(&backend.name),
+            endpoint = escape_html(&backend.endpoint),
+            role = backend.role,
+            inflight = backend.in_flight,
+            cap = backend.max_in_flight,
+            requests = backend.requests_total,
+            errors = backend.errors_total,
+            latency = format_us(backend.latency_last_us),
+            head = backend
+                .head_block
+                .map_or_else(|| "&ndash;".to_string(), |b| b.to_string()),
+        );
+    }
+    out.push_str("</tbody></table></div>\n");
 }
 
 async fn status_page(State(app): State<SharedState>) -> Response {
@@ -591,11 +635,49 @@ mod tests {
                 accepted_total: 0,
                 rejected_total: 0,
                 upstreams: vec![],
+                chain_api: Some(api::ChainApiView {
+                    listen: "127.0.0.1:9".to_string(),
+                    upstreams: vec![api::ChainApiUpstreamView {
+                        name: "<api>".to_string(),
+                        endpoint: "bad\"host".to_string(),
+                        role: "live",
+                        status: "up",
+                        operator_disabled: false,
+                        chain_mismatch: false,
+                        busy: false,
+                        verified: None,
+                        in_flight: 0,
+                        max_in_flight: 1,
+                        requests_total: 0,
+                        errors_total: 0,
+                        results: api::ChainApiResultCounts {
+                            ok: 0,
+                            unknown_block: 0,
+                            not_found: 0,
+                            busy: 0,
+                            error: 0,
+                            connect: 0,
+                            timeout: 0,
+                        },
+                        latency_last_us: None,
+                        latency_avg_us: None,
+                        latency_p50_us: None,
+                        latency_p95_us: None,
+                        last_success_ms: None,
+                        last_error_ms: None,
+                        head_block: None,
+                        blocks: None,
+                    }],
+                }),
             }],
         };
         let html = render_status_page(&status);
         assert!(html.contains("&lt;eos&gt;"));
         assert!(!html.contains("<eos>"));
+        assert!(html.contains("&lt;api&gt;"));
+        assert!(!html.contains("<api>"));
+        assert!(html.contains("bad&quot;host"));
+        assert!(!html.contains("bad\"host"));
         assert!(html.contains("Up 1h 1m"));
     }
 

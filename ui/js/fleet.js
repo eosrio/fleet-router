@@ -3,6 +3,7 @@
 // head lag on a separate relative scale on the right. Sampled history ends
 // must never be used as a second, contradictory measure of head lag.
 
+import { beginChainApiPass, ChainApiSection, endChainApiPass } from "./chainapi.js";
 import { axisMarkup, trackMarkup, trackLabel } from "./track.js";
 import { bestHead, currentRates, headLag, isFlashing, store } from "./store.js";
 import {
@@ -48,6 +49,7 @@ export function setControlMode(mode) {
 export function renderFleet(status) {
   const root = document.getElementById("listeners");
   const seen = new Set();
+  beginChainApiPass();
   status.listeners.forEach((listener, index) => {
     seen.add(listener.name);
     let panel = panels.get(listener.name);
@@ -65,6 +67,7 @@ export function renderFleet(status) {
     }
   }
   root.querySelector(".placeholder")?.remove();
+  endChainApiPass();
   renderSummary(status);
 }
 
@@ -123,7 +126,14 @@ class ListenerPanel {
       this.axisNarrow,
       this.body,
     );
-    this.node = el("section.panel", { "aria-labelledby": this.title.id }, el("div.plate", null, this.title, this.meta), this.board);
+    this.chain = new ChainApiSection(name);
+    this.node = el(
+      "section.panel",
+      { "aria-labelledby": this.title.id },
+      el("div.plate", null, this.title, this.meta),
+      this.board,
+      this.chain.node,
+    );
     resize.observe(this.axisWide);
     resize.observe(this.axisNarrow);
   }
@@ -158,6 +168,7 @@ class ListenerPanel {
       }
     }
     this.drawAxes();
+    this.chain.update(listener.chain_api, status.now_ms);
   }
 
   renderMeta(l) {

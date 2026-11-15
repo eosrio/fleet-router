@@ -1533,6 +1533,36 @@ fn render_api_upstream_series(out: &mut String, upstreams: &[ApiUpstreamSnapshot
             ));
         }
     }
+
+    let metric = "fleet_router_upstream_api_request_duration_seconds";
+    header(
+        out,
+        metric,
+        "histogram",
+        "Time until a chain API attempt sent to an upstream returned a response head, or failed. A relayed response body is not included. Buckets match fleet_router_api_request_duration_seconds.",
+    );
+    for u in upstreams {
+        upstream_histogram(out, metric, &u.labels, &u.slot.latency());
+    }
+}
+
+/// `_bucket`, `_sum` and `_count` for one upstream histogram. `labels` is
+/// the label list without braces, already escaped.
+fn upstream_histogram(
+    out: &mut String,
+    metric: &str,
+    labels: &str,
+    snap: &crate::fleet::HistogramSnapshot,
+) {
+    for (le, n) in &snap.cumulative {
+        out.push_str(&format!("{metric}_bucket{{{labels},le=\"{le}\"}} {n}\n"));
+    }
+    out.push_str(&format!(
+        "{metric}_bucket{{{labels},le=\"+Inf\"}} {}\n",
+        snap.count
+    ));
+    out.push_str(&format!("{metric}_sum{{{labels}}} {}\n", snap.sum_seconds));
+    out.push_str(&format!("{metric}_count{{{labels}}} {}\n", snap.count));
 }
 
 /// A counter family with one fixed label, for every chain API listener.
@@ -3242,6 +3272,14 @@ mod tests {
                         v("result=\"timeout\"")
                     ),
                     format!(
+                        "fleet_router_upstream_api_request_duration_seconds_count{} 0\n",
+                        a("")
+                    ),
+                    format!(
+                        "fleet_router_upstream_api_request_duration_seconds_bucket{} 0\n",
+                        a("le=\"+Inf\"")
+                    ),
+                    format!(
                         "fleet_router_api_requests_total{} 1\n",
                         lab("class=\"block\",code=\"2xx\"")
                     ),
@@ -3345,6 +3383,11 @@ mod tests {
                     ("fleet_router_upstream_api_in_flight", "gauge", 2),
                     ("fleet_router_upstream_api_max_in_flight", "gauge", 2),
                     ("fleet_router_upstream_api_requests_total", "counter", 14),
+                    (
+                        "fleet_router_upstream_api_request_duration_seconds",
+                        "histogram",
+                        2 * 15,
+                    ),
                     ("fleet_router_api_requests_total", "counter", 32),
                     (
                         "fleet_router_api_request_duration_seconds",
@@ -3396,6 +3439,87 @@ mod tests {
             let metrics = render_metrics(&[plain]).await;
             assert!(!metrics.contains("fleet_router_api_"), "{metrics}");
             assert!(!metrics.contains("fleet_router_upstream_api_"), "{metrics}");
+        }
+
+        #[tokio::test]
+        async fn dashboard_view_reports_attempts_head_and_a_disable() {
+            let l = listener(Some("main"), servers(true), true);
+            probed(&l);
+            let live = slot(&l, Role::Live);
+            live.record(UpstreamResult::Ok, Duration::from_millis(4));
+            live.record(UpstreamResult::Error, Duration::from_millis(20));
+            live.record(UpstreamResult::UnknownBlock, Duration::from_micros(2_000));
+            live.record(UpstreamResult::Connect, Duration::from_millis(1));
+
+            let view = crate::api::chain_api_view(api(&l), Instant::now());
+            let text = serde_json::to_string(&view).unwrap();
+            assert!(!text.contains("http"), "{text}");
+            assert!(!text.contains('@'), "{text}");
+            assert_eq!(view.listen, "127.0.0.1:18889");
+
+            let archive = view
+                .upstreams
+                .iter()
+                .find(|u| u.name == "archive-a")
+                .unwrap();
+            assert_eq!(archive.endpoint, "127.0.0.1:18890");
+            assert_eq!(archive.status, "up");
+            assert_eq!(archive.role, "frozen");
+            assert_eq!(archive.verified, Some(true));
+            assert_eq!(archive.head_block, Some(1000));
+            assert_eq!(
+                archive.blocks,
+                Some(crate::api::RangeView {
+                    begin: 1,
+                    end: 1001
+                })
+            );
+            assert_eq!(archive.requests_total, 0);
+            assert_eq!(archive.latency_last_us, None);
+
+            let live_view = view.upstreams.iter().find(|u| u.name == "live-1").unwrap();
+            assert_eq!(live_view.endpoint, "127.0.0.1:18888");
+            assert_eq!(live_view.status, "up");
+            assert_eq!(live_view.role, "live");
+            assert_eq!(live_view.verified, None);
+            assert_eq!(live_view.head_block, Some(2000));
+            assert!(live_view.blocks.is_none());
+            assert_eq!(live_view.requests_total, 4);
+            assert_eq!(
+                live_view.errors_total, 2,
+                "an unknown block is not a failure"
+            );
+            assert_eq!(live_view.results.ok, 1);
+            assert_eq!(live_view.results.unknown_block, 1);
+            assert_eq!(live_view.results.error, 1);
+            assert_eq!(live_view.results.connect, 1);
+            assert_eq!(live_view.latency_last_us, Some(1_000));
+            assert_eq!(live_view.latency_avg_us, Some(6_750));
+            assert_eq!(live_view.latency_p50_us, Some(3_000));
+            assert_eq!(live_view.latency_p95_us, Some(25_000));
+            assert!(live_view.last_success_ms.is_some());
+            assert!(live_view.last_error_ms >= live_view.last_success_ms);
+
+            {
+                let mut db = l.state_db.lock().await;
+                db.get_mut(LIVE).unwrap().operator_disabled = true;
+            }
+            l.hub.as_ref().unwrap().refresh().await;
+            let view = crate::api::chain_api_view(api(&l), Instant::now());
+            let live_view = view.upstreams.iter().find(|u| u.name == "live-1").unwrap();
+            assert_eq!(live_view.status, "disabled");
+            assert!(live_view.operator_disabled);
+            assert_eq!(live_view.requests_total, 4);
+
+            chain_mismatch(&l, Role::Frozen, true);
+            let view = crate::api::chain_api_view(api(&l), Instant::now());
+            let archive = view
+                .upstreams
+                .iter()
+                .find(|u| u.name == "archive-a")
+                .unwrap();
+            assert_eq!(archive.status, "down");
+            assert!(archive.chain_mismatch);
         }
     }
 }

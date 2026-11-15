@@ -19,7 +19,7 @@ use crate::models::{ApiUpstream, Role};
 use crate::ship::{BlockPos, Range};
 
 use super::pick::{ApiView, BUSY_TTL};
-use super::stats::UpstreamResult;
+use super::stats::{AttemptStats, UpstreamResult};
 
 /// Probe failures in a row that take an API down.
 const DOWN_AFTER_FAILURES: u8 = 2;
@@ -160,7 +160,10 @@ pub struct ApiSlot {
     in_flight: AtomicUsize,
     freed: Notify,
     state: Mutex<ApiState>,
+    /// Attempt outcomes. [`Self::record`] increments this and the latency.
     pub results: LabeledCounter<UpstreamResult>,
+    /// Latency and the last success or failure. Not updated by probes.
+    attempts: AttemptStats,
 }
 
 /// One request's hold on an API slot; dropping it frees the slot.
@@ -194,7 +197,24 @@ impl ApiSlot {
             freed: Notify::new(),
             state: Mutex::new(ApiState::default()),
             results: LabeledCounter::new(),
+            attempts: AttemptStats::default(),
         }
+    }
+
+    /// One finished client attempt: the result counter, the latency
+    /// histogram, and the last success or failure time. Lock-free.
+    pub fn record(&self, result: UpstreamResult, elapsed: std::time::Duration) {
+        self.results.inc(result);
+        self.attempts.record(result, elapsed);
+    }
+
+    pub fn attempts(&self) -> super::stats::AttemptSnapshot {
+        self.attempts.snapshot()
+    }
+
+    /// The latency histogram `/metrics` renders.
+    pub fn latency(&self) -> crate::fleet::HistogramSnapshot {
+        self.attempts.latency()
     }
 
     /// The probe state, locked. Held only briefly, never across an await.

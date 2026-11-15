@@ -263,6 +263,70 @@ impl Histogram {
             sum_seconds: self.sum_us.load(Ordering::Relaxed) as f64 / 1e6,
         }
     }
+
+    /// Observations so far. A concurrent `observe` can make this disagree
+    /// with [`Self::average_us`] by one sample.
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// Truncated mean of the observed microseconds, or `None` when empty.
+    pub fn average_us(&self) -> Option<u64> {
+        let count = self.count();
+        (count > 0).then(|| self.sum_us.load(Ordering::Relaxed) / count)
+    }
+
+    /// Interpolated `q` (0 to 1) inside the fixed buckets, in microseconds.
+    ///
+    /// `None` when there is no observation, `q` is outside 0..=1, or the
+    /// rank falls above the last finite bucket (10 s). The value is an
+    /// upper-bound estimate within a bucket: one sample in a bucket lands
+    /// on that bucket's `le`.
+    pub fn quantile_us(&self, q: f64) -> Option<u64> {
+        if !(0.0..=1.0).contains(&q) {
+            return None;
+        }
+        let mut counts = [0u64; HANDOFF_BUCKETS.len()];
+        let mut running = 0u64;
+        for (i, n) in self.buckets.iter().enumerate() {
+            let n = n.load(Ordering::Relaxed);
+            counts[i] = n;
+            running = running.saturating_add(n);
+        }
+        let count = self.count().max(running);
+        if count == 0 {
+            return None;
+        }
+        let rank_f = (q * count as f64).ceil();
+        if !rank_f.is_finite() {
+            return None;
+        }
+        let rank = (rank_f as u64).clamp(1, count);
+        // Above the last finite bucket: no interpolated upper bound.
+        if rank > running {
+            return None;
+        }
+        let mut prev_bound = 0u64;
+        let mut prev = 0u64;
+        let mut seen = 0u64;
+        for (i, &(_, bound)) in HANDOFF_BUCKETS.iter().enumerate() {
+            seen = seen.saturating_add(counts[i]);
+            if seen >= rank {
+                let span_n = seen - prev;
+                let span_us = bound - prev_bound;
+                if span_n == 0 {
+                    return Some(bound);
+                }
+                let pos = rank - prev;
+                let add = u64::try_from(u128::from(span_us) * u128::from(pos) / u128::from(span_n))
+                    .unwrap_or(span_us);
+                return Some(prev_bound.saturating_add(add));
+            }
+            prev = seen;
+            prev_bound = bound;
+        }
+        None
+    }
 }
 
 /// Session counters for one upstream of a listener.

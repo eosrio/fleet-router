@@ -82,7 +82,43 @@ Full router state. The [dashboard stream](#get-apiv1dashboardstream) includes th
             { "block": 400000000, "range": 1, "expires_in_secs": 540 }
           ]
         }
-      ]
+      ],
+      "chain_api": {
+        "listen": "127.0.0.1:8888",
+        "upstreams": [
+          {
+            "name": "EOS SHiP 1",
+            "endpoint": "10.0.1.10:8888",
+            "role": "live",
+            "status": "up",
+            "operator_disabled": false,
+            "chain_mismatch": false,
+            "busy": false,
+            "verified": null,
+            "in_flight": 0,
+            "max_in_flight": 64,
+            "requests_total": 1200,
+            "errors_total": 4,
+            "results": {
+              "ok": 1190,
+              "unknown_block": 6,
+              "not_found": 0,
+              "busy": 1,
+              "error": 2,
+              "connect": 1,
+              "timeout": 0
+            },
+            "latency_last_us": 3200,
+            "latency_avg_us": 4100,
+            "latency_p50_us": 5000,
+            "latency_p95_us": 25000,
+            "last_success_ms": 1760700000000,
+            "last_error_ms": 1760699000000,
+            "head_block": 412345677,
+            "blocks": null
+          }
+        ]
+      }
     }
   ]
 }
@@ -122,6 +158,37 @@ sampled `head_block` values can falsely alternate which synchronized node is
 behind after a restart. The left-hand graph shows the sampled history ranges
 (including finality and quarantines); the right-hand scale shows measured lag
 from 60 blocks behind to "at head". An unavailable comparison has no head marker.
+
+`chain_api` is present only when the listener has a chain API. `listen` is
+the `host:port` it accepts clients on. Each backend's `endpoint` is its
+`api_endpoint` as `host:port`, with no scheme and no userinfo. `status` is
+`disabled` when an operator disabled or drained the server, `down` when the
+probes say it is down or it reports another chain, and `up` otherwise. A
+frozen backend's `verified` is whether it has been checked against its SHiP
+endpoint; it is `null` for a live backend. `busy` means a 503 answer is still
+inside its skip interval.
+
+`requests_total` counts attempts sent to that backend. Probes are not
+counted. `errors_total` is the attempts whose result is `busy`, `error`,
+`connect` or `timeout`. `unknown_block` and `not_found` are answers, so they
+count as requests and not as errors. `results` is the same split as
+`fleet_router_upstream_api_requests_total`.
+
+Latency is the time until the attempt returned a response head, or failed. A
+relayed body is not included. `latency_last_us` is the latest attempt,
+`latency_avg_us` the mean, and `latency_p50_us` / `latency_p95_us` are
+interpolated inside the same 1 ms–10 s buckets as
+`fleet_router_upstream_api_request_duration_seconds`. A percentile that falls
+above 10 s is `null`. All four are `null` before the first attempt.
+`last_success_ms` is the last 2xx and `last_error_ms` the last failure, both
+`null` until one happens.
+
+`head_block` is the head a live API reported to its probes, or a frozen API's
+`describe.last` (else one below its described range). It is `null` until
+known. `blocks` is the frozen described range, or `null`.
+
+The dashboard draws this under the listener's SHiP upstreams. The plain
+`/status` page includes the same backends in a table.
 
 After upgrading the router, reload an already-open dashboard tab to load the new
 JavaScript. Reconnecting its live data stream does not replace code already

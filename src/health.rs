@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::chain_api::directory::{ApiSlot, Snapshot};
+use crate::chain_api::directory::ApiSlot;
 use crate::chain_api::route::RequestClass;
 use crate::chain_api::stats::{AnswerRole, ApiStats, BlockRegion, StatusClass};
 use crate::chain_api::ChainApiCtx;
@@ -113,18 +113,18 @@ pub(crate) async fn readiness(
 }
 
 /// One listener's readiness verdict.
-struct Readiness {
+pub(crate) struct Readiness {
     /// Upstreams online (for the chain API, upstream APIs up), for the 200
     /// body.
-    online: usize,
+    pub(crate) online: usize,
     /// Empty when ready.
-    reasons: Vec<String>,
+    pub(crate) reasons: Vec<String>,
     /// The verdict came from the state map alone (pool, or no hub).
     pool: bool,
 }
 
 impl Readiness {
-    fn ready(&self) -> bool {
+    pub(crate) fn ready(&self) -> bool {
         self.reasons.is_empty()
     }
 }
@@ -154,16 +154,31 @@ fn api_readiness(l: &ListenerHealthState) -> Readiness {
         };
     };
     let snaps = api.snapshot();
-    let usable = |s: &&Snapshot| s.up && (s.role.is_live() || s.verified);
-    let live_configured = snaps.iter().any(|s| s.role.is_live());
-    let live_up = snaps
-        .iter()
-        .filter(usable)
-        .filter(|s| s.role.is_live())
-        .count();
-    let online = snaps.iter().filter(usable).count();
+    chain_api_readiness(
+        api.stats.bound(),
+        snaps
+            .iter()
+            .map(|s| (s.role, s.up && (s.role.is_live() || s.verified))),
+    )
+}
+
+/// Shared by health endpoints and the dashboard, using each caller's snapshot.
+/// `usable` excludes disabled, mismatched and unverified frozen APIs. Busy
+/// intervals and occupied slots are transient capacity, not readiness failures.
+pub(crate) fn chain_api_readiness(
+    listening: bool,
+    upstreams: impl IntoIterator<Item = (Role, bool)>,
+) -> Readiness {
+    let mut live_configured = false;
+    let mut live_up = 0;
+    let mut online = 0;
+    for (role, usable) in upstreams {
+        live_configured |= role.is_live();
+        online += usize::from(usable);
+        live_up += usize::from(role.is_live() && usable);
+    }
     let mut reasons = Vec::new();
-    if !api.stats.bound() {
+    if !listening {
         reasons.push("chain API not listening".to_string());
     }
     if live_configured && live_up == 0 {
@@ -3439,6 +3454,84 @@ mod tests {
             let metrics = render_metrics(&[plain]).await;
             assert!(!metrics.contains("fleet_router_api_"), "{metrics}");
             assert!(!metrics.contains("fleet_router_upstream_api_"), "{metrics}");
+        }
+
+        fn assert_dashboard_readiness(
+            l: &ListenerHealthState,
+            listening: bool,
+            ready: bool,
+            usable: usize,
+        ) {
+            let view = crate::api::chain_api_view(api(l), Instant::now());
+            let json = serde_json::to_value(&view).unwrap();
+            assert_eq!(json["listening"], listening);
+            assert_eq!(json["ready"], ready);
+            assert_eq!(json["usable_upstreams"], usable);
+            assert_eq!(json["upstreams_total"], view.upstreams.len());
+            let health = api_readiness(l);
+            assert_eq!(json["ready"], health.ready());
+            assert_eq!(json["readiness_reasons"], serde_json::json!(health.reasons));
+            assert_eq!(json["usable_upstreams"], health.online);
+            for (backend, slot) in json["upstreams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(api(l).directory.slots())
+            {
+                assert_eq!(backend["ship_endpoint"], slot.ship_endpoint);
+                let snap = api(l)
+                    .snapshot()
+                    .into_iter()
+                    .find(|s| s.index == slot.index)
+                    .unwrap();
+                assert_eq!(
+                    backend["usable"],
+                    snap.up && (snap.role.is_live() || snap.verified)
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn dashboard_readiness_matches_health_through_backend_transitions() {
+            let l = listener(Some("main"), servers(true), true);
+            assert_dashboard_readiness(&l, false, false, 0);
+            probed(&l);
+            assert_dashboard_readiness(&l, true, true, 2);
+            assert!(!tip_ready(&l).await, "SHiP health remains independent");
+            api(&l).stats.set_bound(false);
+            assert_dashboard_readiness(&l, false, false, 2);
+            api(&l).stats.set_bound(true);
+
+            // A healthy archive cannot replace a configured live API.
+            chain_mismatch(&l, Role::Live, true);
+            assert_dashboard_readiness(&l, true, false, 1);
+            chain_mismatch(&l, Role::Live, false);
+            {
+                let mut db = l.state_db.lock().await;
+                db.get_mut(LIVE).unwrap().operator_disabled = true;
+                l.hub.as_ref().unwrap().rebuild(&db);
+            }
+            assert_dashboard_readiness(&l, true, false, 1);
+            {
+                let mut db = l.state_db.lock().await;
+                db.get_mut(LIVE).unwrap().operator_disabled = false;
+                l.hub.as_ref().unwrap().rebuild(&db);
+            }
+            // A temporary busy interval is not a readiness failure.
+            slot(&l, Role::Live).state().busy_until =
+                Some(Instant::now() + Duration::from_secs(10));
+            assert_dashboard_readiness(&l, true, true, 2);
+
+            let archive = listener(None, servers(false), true);
+            api(&archive).stats.set_bound(true);
+            slot(&archive, Role::Frozen).state().up = true;
+            assert_dashboard_readiness(&archive, true, false, 0);
+            probed(&archive);
+            assert_dashboard_readiness(&archive, true, true, 1);
+            slot(&archive, Role::Frozen).state().up = false;
+            assert_dashboard_readiness(&archive, true, false, 0);
+            chain_mismatch(&archive, Role::Frozen, true);
+            assert_dashboard_readiness(&archive, true, false, 0);
         }
 
         #[tokio::test]

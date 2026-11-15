@@ -2,6 +2,7 @@
 // actions, confirmations and toasts. Everything is in-page; no browser dialogs.
 
 import { api, ApiError, getToken, setToken } from "./api.js";
+import { chainApiBackendStatus } from "./chainapi.js";
 import { headLag, findUpstream, store } from "./store.js";
 import { announce, countdown, el, int, setText, shortHash, STATUS_LABEL } from "./util.js";
 
@@ -306,10 +307,15 @@ function range(r) {
 function renderFacts(u) {
   const lag = headLag(u);
   const overridden = u.config && (u.config.priority !== u.priority || u.config.weight !== u.weight);
+  const backend = store.status?.listeners.find((listener) => listener.name === open.listener)
+    ?.chain_api?.upstreams.find((entry) => entry.ship_endpoint === u.endpoint);
   const rows = [
     ["Status", [STATUS_LABEL[u.status] || u.status, el("div.sub", null, STATUS_TEXT[u.status] || "")]],
     ["Listener", open.listener],
     ["Endpoint", [u.endpoint, u.tls ? el("span.sub", null, "  TLS") : null]],
+    ["Chain API", backend
+      ? [chainApiBackendStatus(backend), el("div.sub", null, `${backend.endpoint} · ${backend.role}${backend.busy ? " · busy" : ""}${backend.usable ? " · usable" : " · not usable"}`)]
+      : el("span.sub", null, "not configured for this upstream")],
     [
       "Priority, weight",
       [`${u.priority}, ${u.weight}`, overridden ? el("div.sub", null, `changed at runtime; config has ${u.config.priority}, ${u.config.weight}`) : null],

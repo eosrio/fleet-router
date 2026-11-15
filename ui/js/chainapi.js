@@ -6,9 +6,12 @@ import { duration, el, int, rate, setText } from "./util.js";
 const RATE_WINDOW = 5;
 const rates = new Map();
 let seen = new Set();
+let instance = null;
 
 /** Drop rate samples for backends that disappeared from the latest status. */
-export function beginChainApiPass() {
+export function beginChainApiPass(startedMs, reset = false) {
+  if (reset || startedMs !== instance) rates.clear();
+  instance = startedMs;
   seen = new Set();
 }
 
@@ -16,6 +19,28 @@ export function endChainApiPass() {
   for (const key of rates.keys()) {
     if (!seen.has(key)) rates.delete(key);
   }
+}
+
+/** Independent listener readiness, also shown beside SHiP readiness. */
+export function chainApiReadiness(api) {
+  if (!api) return el("span", null, "chain API ", el("b", null, "not configured"));
+  return el(
+    `span${api.ready ? "" : ".is-warn"}`,
+    { title: [`Chain API at ${api.listen}`, ...(api.readiness_reasons || [])].join("; ") },
+    "chain API ",
+    el("span.lamp", { "data-status": api.ready ? "up" : "down", "aria-hidden": "true" }),
+    el("b", null, api.ready ? "ready" : api.listening ? "not ready" : "not listening"),
+    ` · ${int(api.usable_upstreams)}/${int(api.upstreams_total)} usable`,
+  );
+}
+
+/** Explain why a probe-up backend may not be usable. */
+export function chainApiBackendStatus(backend) {
+  if (backend.operator_disabled) return "disabled";
+  if (backend.chain_mismatch) return "chain mismatch";
+  if (backend.status !== "up") return backend.status || "down";
+  if (backend.verified === false) return "unverified";
+  return "up";
 }
 
 export class ChainApiSection {
@@ -64,9 +89,11 @@ export class ChainApiSection {
     this.meta.replaceChildren(
       ...[
         el("span", null, "listen ", el("b", null, api.listen || "–")),
-        el("span", null, `${int(up)} of ${int(api.upstreams.length)} up`),
+        chainApiReadiness(api),
+        el("span", null, `${int(up)} of ${int(api.upstreams.length)} probes up`),
         down > 0 ? el("span.is-warn", null, `${int(down)} down`) : null,
         disabled > 0 ? el("span.is-warn", null, `${int(disabled)} disabled`) : null,
+        ...(api.readiness_reasons || []).map((reason) => el("span.is-warn", null, reason)),
       ].filter((node) => node),
     );
 
@@ -138,8 +165,9 @@ class BackendRow {
   }
 
   update(b, nowMs, ratesNow) {
-    this.lamp.dataset.status = b.status === "up" || b.status === "down" || b.status === "disabled" ? b.status : "down";
-    this.lamp.title = b.status || "";
+    this.lamp.dataset.status = b.status === "up" && b.usable === false ? "stale" :
+      b.status === "up" || b.status === "down" || b.status === "disabled" ? b.status : "down";
+    this.lamp.title = chainApiBackendStatus(b);
     setText(this.name, b.name || b.endpoint || "");
     setText(this.endpoint, b.endpoint || "");
     this.tags.replaceChildren(...tagsFor(b));
@@ -186,11 +214,14 @@ class BackendRow {
 }
 
 function tagsFor(b) {
-  const tags = [el("span.tag", null, b.role || "")];
-  if (b.operator_disabled) tags.push(el("span.tag.tag-warn", null, "operator disabled"));
-  if (b.chain_mismatch) tags.push(el("span.tag.tag-warn", null, "chain mismatch"));
+  const label = chainApiBackendStatus(b);
+  const tags = [
+    el("span.tag", null, b.role || ""),
+    el(`span.tag${b.usable ? "" : ".tag-warn"}`, { title: b.operator_disabled ? "Disabled by an operator" : null }, label),
+  ];
+  if (b.chain_mismatch && label !== "chain mismatch") tags.push(el("span.tag.tag-warn", null, "chain mismatch"));
   if (b.busy) tags.push(el("span.tag.tag-warn", null, "busy"));
-  if (b.verified === false) tags.push(el("span.tag.tag-warn", { title: "Not verified against its SHiP endpoint, so it is not used" }, "unverified"));
+  if (b.verified === false) tags.push(el("span.tag.tag-warn", { title: "Not verified against its SHiP endpoint" }, label === "unverified" ? "not used" : "unverified; not used"));
   if (b.verified === true) tags.push(el("span.tag", { title: "Verified against its SHiP endpoint" }, "verified"));
   return tags;
 }
@@ -201,9 +232,15 @@ function sampleRate(key, now, requests, errors) {
     s = { last: null, req: [], err: [] };
     rates.set(key, s);
   }
-  if (s.last && now > s.last.t && requests >= s.last.requests && errors >= s.last.errors) {
+  if (s.last) {
     const dt = (now - s.last.t) / 1000;
-    if (dt > 0 && dt < 30) {
+    if (dt < 0 || dt >= 30 || requests < s.last.requests || errors < s.last.errors) {
+      s.req = [];
+      s.err = [];
+    } else if (dt === 0) {
+      // Duplicate renders must not consume increments before the next sample.
+      return { reqPerS: avg(s.req), errPerS: avg(s.err) };
+    } else {
       s.req.push((requests - s.last.requests) / dt);
       s.err.push((errors - s.last.errors) / dt);
       if (s.req.length > RATE_WINDOW) {
@@ -211,9 +248,6 @@ function sampleRate(key, now, requests, errors) {
         s.err.shift();
       }
     }
-  } else if (s.last && (requests < s.last.requests || now < s.last.t)) {
-    s.req = [];
-    s.err = [];
   }
   s.last = { t: now, requests, errors };
   return { reqPerS: avg(s.req), errPerS: avg(s.err) };

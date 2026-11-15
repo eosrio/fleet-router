@@ -225,6 +225,12 @@ pub struct ListenerView {
 pub struct ChainApiView {
     /// `host:port` the listener accepts chain API clients on.
     pub listen: String,
+    pub listening: bool,
+    /// Same verdict and reasons as `/ready/<listener>?scope=api`.
+    pub ready: bool,
+    pub readiness_reasons: Vec<String>,
+    pub usable_upstreams: usize,
+    pub upstreams_total: usize,
     pub upstreams: Vec<ChainApiUpstreamView>,
 }
 
@@ -247,9 +253,14 @@ pub struct ChainApiResultCounts {
 pub struct ChainApiUpstreamView {
     pub name: String,
     pub endpoint: String,
+    /// Links this API to the corresponding SHiP row and operator controls.
+    pub ship_endpoint: String,
     pub role: &'static str,
     /// `disabled`, then `down`, then `up`. See [`api_backend_status`].
     pub status: &'static str,
+    /// Probe-up on the right chain, enabled, and verified when frozen.
+    /// Temporary busy/full conditions remain separate capacity indicators.
+    pub usable: bool,
     pub operator_disabled: bool,
     pub chain_mismatch: bool,
     /// Skipped until a 503 answer's busy interval ends.
@@ -440,7 +451,7 @@ async fn listener_view(ctx: &ListenerContext, now: Instant, sessions: usize) -> 
 /// `endpoint` is the canonical `host:port`.
 pub(crate) fn chain_api_view(api: &ChainApiCtx, now: Instant) -> ChainApiView {
     let fleet = api.fleet_view();
-    let upstreams = api
+    let upstreams: Vec<_> = api
         .directory
         .slots()
         .iter()
@@ -452,8 +463,22 @@ pub(crate) fn chain_api_view(api: &ChainApiCtx, now: Instant) -> ChainApiView {
             )
         })
         .collect();
+    let listening = api.stats.bound();
+    let readiness = crate::health::chain_api_readiness(
+        listening,
+        api.directory
+            .slots()
+            .iter()
+            .zip(&upstreams)
+            .map(|(slot, u)| (slot.role, u.usable)),
+    );
     ChainApiView {
         listen: api.bind.clone(),
+        listening,
+        ready: readiness.ready(),
+        readiness_reasons: readiness.reasons,
+        usable_upstreams: readiness.online,
+        upstreams_total: upstreams.len(),
         upstreams,
     }
 }
@@ -492,8 +517,10 @@ fn chain_api_upstream(
     ChainApiUpstreamView {
         name: slot.name.to_string(),
         endpoint: slot.endpoint.to_string(),
+        ship_endpoint: slot.ship_endpoint.clone(),
         role: slot.role.as_str(),
         status: api_backend_status(operator_disabled, probe_up, chain_mismatch),
+        usable: !operator_disabled && probe_up && !chain_mismatch && verified != Some(false),
         operator_disabled,
         chain_mismatch,
         busy,

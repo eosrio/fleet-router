@@ -364,7 +364,11 @@ th {{ color:var(--ink-3); font-weight:500; }}
 "#,
             name = escape_html(&listener.name),
             port = listener.port,
-            ready = if listener.ready { "ready" } else { "not ready" },
+            ready = if listener.ready {
+                "SHiP ready"
+            } else {
+                "SHiP not ready"
+            },
             sessions = listener.sessions,
             max = listener.max_connections,
             accepted = listener.accepted_total,
@@ -391,6 +395,8 @@ th {{ color:var(--ink-3); font-weight:500; }}
         out.push_str("</tbody></table></div>\n");
         if let Some(api) = &listener.chain_api {
             render_chain_api_table(&mut out, api);
+        } else {
+            out.push_str("<p class=\"meta\">Chain API not configured</p>\n");
         }
     }
     out.push_str("</main>\n</body>\n</html>\n");
@@ -410,18 +416,62 @@ fn format_us(us: Option<u64>) -> String {
 fn render_chain_api_table(out: &mut String, api: &api::ChainApiView) {
     let _ = write!(
         out,
-        r#"<h3>Chain API &middot; {listen}</h3>
+        r#"<h3>Chain API &middot; {listen} &middot; {ready}</h3>
+<p class="meta">{usable} / {total} upstream APIs usable{reasons}</p>
 <div class="wrap"><table>
 <thead><tr><th>Status</th><th>Backend</th><th>Endpoint</th><th>Role</th><th>In flight</th><th>Requests</th><th>Errors</th><th>Latency</th><th>Head</th></tr></thead>
 <tbody>
 "#,
         listen = escape_html(&api.listen),
+        ready = if api.ready {
+            "ready"
+        } else if api.listening {
+            "not ready"
+        } else {
+            "not listening"
+        },
+        usable = api.usable_upstreams,
+        total = api.upstreams_total,
+        reasons = if api.readiness_reasons.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " &middot; {}",
+                escape_html(&api.readiness_reasons.join("; "))
+            )
+        },
     );
     for backend in &api.upstreams {
+        let mut context = Vec::new();
+        if backend.operator_disabled {
+            context.push("operator disabled");
+        }
+        if backend.chain_mismatch {
+            context.push("chain mismatch");
+        }
+        if backend.verified == Some(false) {
+            context.push("unverified; not used");
+        }
+        if backend.verified == Some(true) {
+            context.push("verified");
+        }
+        if backend.busy {
+            context.push("busy");
+        }
         let _ = writeln!(
             out,
-            r#"<tr><td class="{status}">&#9679; {status}</td><td>{name}</td><td>{endpoint}</td><td>{role}</td><td>{inflight} / {cap}</td><td>{requests}</td><td>{errors}</td><td>{latency}</td><td>{head}</td></tr>"#,
+            r#"<tr><td class="{status_class}">&#9679; {status}{context}</td><td>{name}</td><td>{endpoint}</td><td>{role}</td><td>{inflight} / {cap}</td><td>{requests}</td><td>{errors}</td><td>{latency}</td><td>{head}</td></tr>"#,
             status = backend.status,
+            status_class = if backend.status == "up" && !backend.usable {
+                "stale"
+            } else {
+                backend.status
+            },
+            context = if context.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", context.join(", "))
+            },
             name = escape_html(&backend.name),
             endpoint = escape_html(&backend.endpoint),
             role = backend.role,
@@ -637,15 +687,22 @@ mod tests {
                 upstreams: vec![],
                 chain_api: Some(api::ChainApiView {
                     listen: "127.0.0.1:9".to_string(),
+                    listening: true,
+                    ready: false,
+                    readiness_reasons: vec!["no verified frozen chain API upstream up".to_string()],
+                    usable_upstreams: 0,
+                    upstreams_total: 1,
                     upstreams: vec![api::ChainApiUpstreamView {
                         name: "<api>".to_string(),
                         endpoint: "bad\"host".to_string(),
-                        role: "live",
+                        ship_endpoint: "127.0.0.1:8".to_string(),
+                        role: "frozen",
                         status: "up",
+                        usable: false,
                         operator_disabled: false,
                         chain_mismatch: false,
-                        busy: false,
-                        verified: None,
+                        busy: true,
+                        verified: Some(false),
                         in_flight: 0,
                         max_in_flight: 1,
                         requests_total: 0,
@@ -679,6 +736,10 @@ mod tests {
         assert!(html.contains("bad&quot;host"));
         assert!(!html.contains("bad\"host"));
         assert!(html.contains("Up 1h 1m"));
+        assert!(html.contains("SHiP not ready"));
+        assert!(html.contains("0 / 1 upstream APIs usable"));
+        assert!(html.contains("no verified frozen chain API upstream up"));
+        assert!(html.contains("class=\"stale\">&#9679; up (unverified; not used, busy)"));
     }
 
     #[test]

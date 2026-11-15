@@ -85,12 +85,19 @@ Full router state. The [dashboard stream](#get-apiv1dashboardstream) includes th
       ],
       "chain_api": {
         "listen": "127.0.0.1:8888",
+        "listening": true,
+        "ready": true,
+        "readiness_reasons": [],
+        "usable_upstreams": 1,
+        "upstreams_total": 1,
         "upstreams": [
           {
             "name": "EOS SHiP 1",
             "endpoint": "10.0.1.10:8888",
+            "ship_endpoint": "10.0.1.10:8080",
             "role": "live",
             "status": "up",
+            "usable": true,
             "operator_disabled": false,
             "chain_mismatch": false,
             "busy": false,
@@ -160,13 +167,30 @@ behind after a restart. The left-hand graph shows the sampled history ranges
 from 60 blocks behind to "at head". An unavailable comparison has no head marker.
 
 `chain_api` is present only when the listener has a chain API. `listen` is
-the `host:port` it accepts clients on. Each backend's `endpoint` is its
+the configured `host:port`; `listening` says whether it is accepting connections.
+`ready` matches [`/ready/<listener>?scope=api`](observability.md#readiness-and-coverage),
+independently of SHiP readiness: a configured live API must be usable; an
+archive-only listener needs a verified frozen API instead. `readiness_reasons`
+is empty when ready and otherwise explains why it is not ready.
+`usable_upstreams` counts enabled APIs up on the right chain, with verification
+required for frozen APIs; `upstreams_total` counts the configured API slots.
+A usable archive does not make a mixed listener ready while all live APIs are
+down. Temporary busy intervals and full slots do not change readiness or the
+usable count; they describe capacity separately.
+
+Each backend's `endpoint` is its
 `api_endpoint` as `host:port`, with no scheme and no userinfo. `status` is
 `disabled` when an operator disabled or drained the server, `down` when the
 probes say it is down or it reports another chain, and `up` otherwise. A
 frozen backend's `verified` is whether it has been checked against its SHiP
 endpoint; it is `null` for a live backend. `busy` means a 503 answer is still
 inside its skip interval.
+
+`usable` applies the same eligibility rule as `usable_upstreams`. A frozen
+backend may have `status: "up"` and `usable: false` until it is verified.
+`ship_endpoint` identifies its corresponding SHiP upstream row, including the
+operator detail dialog. Both dashboards show readiness and reasons, and label
+unverified, mismatched, disabled and busy backends explicitly.
 
 `requests_total` counts attempts sent to that backend. Probes are not
 counted. `errors_total` is the attempts whose result is `busy`, `error`,
@@ -182,6 +206,10 @@ interpolated inside the same 1 ms–10 s buckets as
 above 10 s is `null`. All four are `null` before the first attempt.
 `last_success_ms` is the last 2xx and `last_error_ms` the last failure, both
 `null` until one happens.
+
+The dashboard derives request/error rates from recent counter samples. It
+discards them on a stream bootstrap, router restart, counter rollback, clock
+rollback or a gap of at least 30 seconds; duplicate timestamps add no sample.
 
 `head_block` is the head a live API reported to its probes, or a frozen API's
 `describe.last` (else one below its described range). It is `null` until

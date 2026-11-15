@@ -3,7 +3,7 @@
 // head lag on a separate relative scale on the right. Sampled history ends
 // must never be used as a second, contradictory measure of head lag.
 
-import { beginChainApiPass, ChainApiSection, endChainApiPass } from "./chainapi.js";
+import { beginChainApiPass, chainApiBackendStatus, chainApiReadiness, ChainApiSection, endChainApiPass } from "./chainapi.js";
 import { axisMarkup, trackMarkup, trackLabel } from "./track.js";
 import { bestHead, currentRates, headLag, isFlashing, store } from "./store.js";
 import {
@@ -46,10 +46,10 @@ export function setControlMode(mode) {
   }
 }
 
-export function renderFleet(status) {
+export function renderFleet(status, { reset = false } = {}) {
   const root = document.getElementById("listeners");
   const seen = new Set();
-  beginChainApiPass();
+  beginChainApiPass(status.started_ms, reset);
   status.listeners.forEach((listener, index) => {
     seen.add(listener.name);
     let panel = panels.get(listener.name);
@@ -158,7 +158,7 @@ class ListenerPanel {
         this.rows.set(u.endpoint, row);
       }
       if (this.body.children[index] !== row.node) this.body.insertBefore(row.node, this.body.children[index] || null);
-      row.update(u, this.axis, status);
+      row.update(u, this.axis, status, listener.chain_api?.upstreams.find((api) => api.ship_endpoint === u.endpoint));
     });
     for (const [endpoint, row] of this.rows) {
       if (!seen.has(endpoint)) {
@@ -181,9 +181,11 @@ class ListenerPanel {
       el(
         `span${l.ready ? "" : ".is-warn"}`,
         null,
+        "SHiP ",
         el("span.lamp", { "data-status": l.ready ? "up" : "down", "aria-hidden": "true" }),
         el("b", null, l.ready ? "ready" : "not ready"),
       ),
+      chainApiReadiness(l.chain_api),
       el("span", null, "sessions ", el("b", null, `${int(l.sessions)} / ${int(l.max_connections)}`), meter),
       el("span", null, "accepted ", el("b", null, int(l.accepted_total))),
       el(`span${l.rejected_total > 0 ? ".is-warn" : ""}`, null, "rejected ", el("b", null, int(l.rejected_total))),
@@ -254,7 +256,7 @@ class UpstreamRow {
     resize.observe(this.trackCell);
   }
 
-  update(u, axis, status) {
+  update(u, axis, status, api) {
     this.data = u;
     this.axis = axis;
     const flashing = isFlashing(this.key);
@@ -265,6 +267,10 @@ class UpstreamRow {
     this.name.setAttribute("aria-label", `${u.name}, ${u.status}. Open details`);
 
     const tags = [];
+    if (api) {
+      const label = chainApiBackendStatus(api);
+      tags.push(el(`span.tag${api.usable ? "" : ".tag-warn"}`, { title: `Chain API ${api.endpoint} (${api.role}): ${label}` }, `API ${label}`));
+    }
     if (u.tls) tags.push(el("span.tag", { title: "Upstream dialed with TLS (wss://)" }, "TLS"));
     const overridden = u.config && (u.config.priority !== u.priority || u.config.weight !== u.weight);
     tags.push(

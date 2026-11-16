@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-15
+
+### Upgrade notes
+
+- Restart the router with the new binary or image, then reload open dashboard
+  tabs to load the Chain API panels. Existing configuration files remain valid.
+- Chain API readiness is independent of SHiP readiness. A configured live API
+  must be usable; a healthy archive cannot replace it. Archive-only listeners
+  require a verified archive API. Busy intervals and full slots remain separate
+  capacity indicators. These panels expose the existing readiness policy.
+
 ### Added
 
 - The dashboard shows each chain API backend beside that listener's SHiP
@@ -718,7 +729,8 @@ First public release on crates.io and GitHub.
 - Upstream handshake now skips leading control frames and retries against
   another upstream instead of dropping the client on an unexpected first frame.
 
-[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/eosrio/fleet-router/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/eosrio/fleet-router/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/eosrio/fleet-router/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/eosrio/fleet-router/compare/v0.6.0...v0.7.0

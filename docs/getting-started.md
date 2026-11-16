@@ -4,20 +4,20 @@ fleet-router presents one SHiP WebSocket endpoint in front of a pool of upstream
 
 ## Install
 
-Download the archive for your platform from [GitHub Releases](https://github.com/eosrio/fleet-router/releases). Releases include Linux x86_64, macOS arm64 and x86_64, and Windows x86_64 binaries. For v0.8.1, compare the archive's SHA-256 hash with `SHA256SUMS.txt` from the same release.
+Download the archive for your platform from [GitHub Releases](https://github.com/eosrio/fleet-router/releases). Releases include Linux x86_64, macOS arm64 and x86_64, and Windows x86_64 binaries. For v0.9.0, compare the archive's SHA-256 hash with `SHA256SUMS.txt` from the same release.
 
 Or install the published crate. Building requires Rust 1.99 or newer, a C compiler and CMake:
 
 ```sh
-cargo install fleet-router --version 0.8.1 --locked
+cargo install fleet-router --version 0.9.0 --locked
 fleet-router --version
 ```
 
 The public GHCR image can be pulled without signing in:
 
 ```sh
-docker pull ghcr.io/eosrio/fleet-router:0.8.1
-docker run --rm ghcr.io/eosrio/fleet-router:0.8.1 --version
+docker pull ghcr.io/eosrio/fleet-router:0.9.0
+docker run --rm ghcr.io/eosrio/fleet-router:0.9.0 --version
 ```
 
 Pin a release tag or image digest for a controlled rollout. See [running as a service](operations.md#run-as-a-service) for persistent deployment and Docker volume and port settings.

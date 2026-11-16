@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-16
+
+### Changed
+
+- Update Tokio to 1.54.1, http-body-util to 0.1.5, hyper-util to 0.1.21,
+  and tokio-rustls to 0.26.6, including upstream runtime, HTTP connection
+  pooling and TLS transport-error fixes.
+- Refresh the pinned Rust 1.99 Trixie builder and Debian Trixie slim runtime
+  images.
+- Update CI and release actions: rust-cache 2.9.3, docker/login-action 4.8.0,
+  and action-gh-release 3.0.4.
+
+### Upgrade notes
+
+- Install the new binary or container image and restart the router to load
+  the updated dependencies. Existing 0.9.0 configuration remains valid.
+
 ## [0.9.0] - 2026-11-15
 
 ### Upgrade notes
@@ -729,7 +746,8 @@ First public release on crates.io and GitHub.
 - Upstream handshake now skips leading control frames and retries against
   another upstream instead of dropping the client on an unexpected first frame.
 
-[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/eosrio/fleet-router/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/eosrio/fleet-router/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/eosrio/fleet-router/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/eosrio/fleet-router/compare/v0.7.0...v0.8.0

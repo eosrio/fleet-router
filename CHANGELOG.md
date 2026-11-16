@@ -7,8 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The dashboard shows each chain API backend beside that listener's SHiP
+  upstreams: status (up, down, or disabled), in-flight requests, request and
+  error counts, latency (last, average, p50, p95), last success and last
+  error, and head block when the probes know it. `GET /api/v1/status` carries
+  the same `chain_api` object, and the plain status page lists it too.
+  `fleet_router_upstream_api_request_duration_seconds` is the per-backend
+  latency histogram, with the same buckets as the listener histogram. Unknown
+  Block and 404 answers count as requests, not errors.
+- Show Chain API readiness independently of SHiP, including whether the HTTP
+  listener is accepting, usable backend counts and reasons it is not ready.
+  Link API health to SHiP rows and upstream details, and identify unverified
+  archive APIs on both dashboards.
+
 ### Fixed
 
+- Clear stale dashboard Chain API rates after reconnects, restarts, counter
+  resets and long sample gaps.
 - Make `config test` validate handshake ABIs with the same parser as the running
   router. Valid Wire `sysio::abi/1.*` handshakes no longer report `Invalid ABI`,
   and malformed payloads containing `eosio::abi` are rejected with the parser error.

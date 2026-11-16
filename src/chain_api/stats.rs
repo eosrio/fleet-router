@@ -1,10 +1,12 @@
 //! Counters and gauges of one chain API listener, and the per-upstream
-//! request results. `/metrics` renders them; requests and probes only add.
+//! request results. `/metrics` and the dashboard read them; requests record
+//! an attempt, probes do not.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::fleet::{Histogram, HistogramSnapshot, LabeledCounter, MetricLabel};
+use crate::telemetry;
 
 use super::pick::RetryReason;
 use super::route::RequestClass;
@@ -147,6 +149,100 @@ labels!(UpstreamResult {
     Connect => "connect",
     Timeout => "timeout",
 });
+
+impl UpstreamResult {
+    /// The backend failed the attempt. Unknown Block and 404 are answers:
+    /// the node responded, and the router can ask another.
+    pub fn is_failure(self) -> bool {
+        matches!(
+            self,
+            Self::Busy | Self::Error | Self::Connect | Self::Timeout
+        )
+    }
+}
+
+/// No success or error has been recorded. A real timestamp is never this.
+const NEVER_MS: u64 = u64::MAX;
+
+/// Latency and the last success or failure of one upstream API.
+///
+/// Fixed histogram buckets, four atomics. [`Self::record`] only stores; it
+/// does not allocate or take a lock. Probes do not record.
+#[derive(Debug)]
+pub struct AttemptStats {
+    latency: Histogram,
+    /// Microseconds of the latest [`Self::record`]. Meaningful once
+    /// [`Histogram::count`] is non-zero.
+    last_us: AtomicU64,
+    last_success_ms: AtomicU64,
+    last_error_ms: AtomicU64,
+}
+
+/// What the dashboard reads from [`AttemptStats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttemptSnapshot {
+    pub count: u64,
+    pub last_us: Option<u64>,
+    pub avg_us: Option<u64>,
+    pub p50_us: Option<u64>,
+    pub p95_us: Option<u64>,
+    pub last_success_ms: Option<u64>,
+    pub last_error_ms: Option<u64>,
+}
+
+impl Default for AttemptStats {
+    fn default() -> Self {
+        AttemptStats {
+            latency: Histogram::default(),
+            last_us: AtomicU64::new(0),
+            last_success_ms: AtomicU64::new(NEVER_MS),
+            last_error_ms: AtomicU64::new(NEVER_MS),
+        }
+    }
+}
+
+impl AttemptStats {
+    /// One finished attempt. `elapsed` is the time until the response head
+    /// arrived, or until the attempt failed. The body of a relayed answer
+    /// is not included.
+    pub fn record(&self, result: UpstreamResult, elapsed: Duration) {
+        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        // Relaxed, like the histogram. A concurrent reader can be one
+        // sample behind; it never allocates and never takes a lock.
+        self.last_us.store(us, Ordering::Relaxed);
+        self.latency.observe(elapsed);
+        // Unknown Block and 404 do not move either timestamp, so they skip
+        // the clock read.
+        if result == UpstreamResult::Ok {
+            self.last_success_ms
+                .store(telemetry::now_ms(), Ordering::Relaxed);
+        } else if result.is_failure() {
+            self.last_error_ms
+                .store(telemetry::now_ms(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn latency(&self) -> HistogramSnapshot {
+        self.latency.snapshot()
+    }
+
+    pub fn snapshot(&self) -> AttemptSnapshot {
+        let count = self.latency.count();
+        AttemptSnapshot {
+            count,
+            last_us: (count > 0).then(|| self.last_us.load(Ordering::Relaxed)),
+            avg_us: self.latency.average_us(),
+            p50_us: self.latency.quantile_us(0.50),
+            p95_us: self.latency.quantile_us(0.95),
+            last_success_ms: stamp(self.last_success_ms.load(Ordering::Relaxed)),
+            last_error_ms: stamp(self.last_error_ms.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+fn stamp(ms: u64) -> Option<u64> {
+    (ms != NEVER_MS).then_some(ms)
+}
 
 /// The chain API counters of one listener.
 #[derive(Debug)]
@@ -294,5 +390,84 @@ mod tests {
         }
         assert_eq!(UpstreamResult::UnknownBlock.as_str(), "unknown_block");
         assert_eq!(Rejection::BodyTooLarge.index(), 2);
+    }
+
+    #[test]
+    fn failures_are_transport_and_unusable_answers() {
+        assert!(!UpstreamResult::Ok.is_failure());
+        assert!(!UpstreamResult::UnknownBlock.is_failure());
+        assert!(!UpstreamResult::NotFound.is_failure());
+        assert!(UpstreamResult::Busy.is_failure());
+        assert!(UpstreamResult::Error.is_failure());
+        assert!(UpstreamResult::Connect.is_failure());
+        assert!(UpstreamResult::Timeout.is_failure());
+    }
+
+    #[test]
+    fn attempts_record_latency_and_the_last_success_or_failure() {
+        let stats = AttemptStats::default();
+        let before = crate::telemetry::now_ms();
+        assert_eq!(stats.snapshot().count, 0);
+        assert_eq!(stats.snapshot().last_us, None);
+        assert_eq!(stats.snapshot().last_success_ms, None);
+        assert_eq!(stats.snapshot().last_error_ms, None);
+        assert_eq!(stats.latency().count, 0);
+
+        stats.record(UpstreamResult::Ok, Duration::from_micros(100));
+        stats.record(UpstreamResult::Error, Duration::from_millis(3));
+        stats.record(UpstreamResult::UnknownBlock, Duration::from_micros(100));
+        stats.record(UpstreamResult::NotFound, Duration::from_micros(100));
+        stats.record(UpstreamResult::Connect, Duration::from_millis(30));
+        let after = crate::telemetry::now_ms();
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.count, 5);
+        assert_eq!(snap.last_us, Some(30_000));
+        // 100+3000+100+100+30000 = 33300 µs over 5 attempts.
+        assert_eq!(snap.avg_us, Some(6_660));
+        assert!(snap.p50_us.is_some());
+        assert!(snap.p95_us.is_some());
+        let success = snap.last_success_ms.expect("a 2xx was recorded");
+        let error = snap.last_error_ms.expect("a failure was recorded");
+        assert!(success >= before && success <= after);
+        assert!(
+            error >= success && error <= after,
+            "{error} not after {success}"
+        );
+
+        // An Unknown Block is an answer: it must not move the timestamps.
+        let again = stats.snapshot();
+        stats.record(UpstreamResult::UnknownBlock, Duration::from_secs(30));
+        let later = stats.snapshot();
+        assert_eq!(later.last_success_ms, again.last_success_ms);
+        assert_eq!(later.last_error_ms, again.last_error_ms);
+        assert_eq!(later.last_us, Some(30_000_000));
+        assert_eq!(later.count, 6);
+        // 30 s sits above the last finite bucket, so the high percentile does not.
+        assert_eq!(later.p95_us, None);
+        assert!(later.avg_us.unwrap() > 1_000_000);
+    }
+
+    #[test]
+    fn quantiles_interpolate_inside_fixed_buckets() {
+        let stats = AttemptStats::default();
+        for _ in 0..100 {
+            stats.record(UpstreamResult::Ok, Duration::from_micros(100));
+        }
+        let snap = stats.snapshot();
+        // Every sample is in the 1 ms bucket. The rank is interpolated
+        // from 0 up to that bucket's bound.
+        assert_eq!(snap.p50_us, Some(500));
+        assert_eq!(snap.p95_us, Some(950));
+        assert_eq!(snap.avg_us, Some(100));
+        assert_eq!(snap.last_us, Some(100));
+
+        let one = AttemptStats::default();
+        one.record(UpstreamResult::Ok, Duration::from_millis(3));
+        // A single sample lands on its bucket's upper bound.
+        assert_eq!(one.snapshot().p50_us, Some(5_000));
+        assert_eq!(Histogram::default().quantile_us(1.5), None);
+        assert_eq!(Histogram::default().quantile_us(0.5), None);
+        assert_eq!(Histogram::default().average_us(), None);
     }
 }

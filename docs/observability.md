@@ -258,6 +258,7 @@ fleet_router_upstream_api_verified{endpoint,server}              # frozen only
 fleet_router_upstream_api_in_flight{endpoint,server}
 fleet_router_upstream_api_max_in_flight{endpoint,server}
 fleet_router_upstream_api_requests_total{endpoint,server,result}
+fleet_router_upstream_api_request_duration_seconds{endpoint,server} (histogram)
 fleet_router_api_requests_total{class,code}
 fleet_router_api_request_duration_seconds{class} (histogram)
 fleet_router_api_in_flight
@@ -274,7 +275,8 @@ Per upstream API:
 - `fleet_router_upstream_api_head_block` is the head a live API reported to its probes, and `fleet_router_upstream_api_earliest_block` its `earliest_available_block_num` (`0` until known, and for nodes that do not report it, such as EOSIO 2.0 and FIO).
 - `fleet_router_upstream_api_blocks_begin_block` and `_blocks_end_block` are the half-open range of blocks a frozen range server's API serves (`0` until it described itself). `fleet_router_upstream_api_verified` is `1` once it was verified against its SHiP endpoint; an API never verified is not used.
 - `fleet_router_upstream_api_in_flight` counts client requests in flight to the API (probes are not counted), and `fleet_router_upstream_api_max_in_flight` is its cap: `max_in_flight_per_upstream`, for a frozen range server at most the limit it describes.
-- `fleet_router_upstream_api_requests_total{result}` counts attempts sent to the API: `ok` (2xx), `unknown_block`, `not_found`, `busy` (503), `error` (any other answer), `connect` (the connection failed, or was lost after the request was written) and `timeout`.
+- `fleet_router_upstream_api_requests_total{result}` counts attempts sent to the API: `ok` (2xx), `unknown_block`, `not_found`, `busy` (503), `error` (any other answer), `connect` (the connection failed, or was lost after the request was written) and `timeout`. Probes are not counted.
+- `fleet_router_upstream_api_request_duration_seconds` is the time until an attempt returned a response head, or failed. A relayed body is not included. The buckets are the same as `fleet_router_api_request_duration_seconds` (1 ms to 10 s). The dashboard reads the last sample, the mean, and p50/p95 interpolated inside those buckets; a percentile above 10 s is omitted.
 
 Per listener:
 
@@ -286,7 +288,7 @@ Per listener:
 - `fleet_router_api_block_requests_total{region,role}` counts block requests by region (`irreversible`, `reversible`, or `unhinted` for a body with no block number the router could read) and by who wrote the answer (`live`, `frozen`, or `none` when the router answered: Busy, or the `502` for an answer longer than `max_response_bytes`). Only the combinations that can occur are rendered: a frozen range server answers only irreversible blocks.
 - `fleet_router_api_pushes_total{result}`: `ok` (a 2xx), `error` (another answer, or no node reached) and `ambiguous` (the connection failed after the push was written; it is never resent).
 
-Each chain API listener adds 173 series, and each upstream API 13 (live) or 14 (frozen).
+Each chain API listener adds 173 series. Each upstream API adds 28 (live) or 29 (frozen): the gauges and `requests_total` result series above, plus the 15 lines of `fleet_router_upstream_api_request_duration_seconds`.
 
 ## Alerts
 

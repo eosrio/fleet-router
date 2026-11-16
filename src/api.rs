@@ -20,9 +20,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Semaphore;
 
+use crate::chain_api::directory::ApiSlot;
+use crate::chain_api::stats::UpstreamResult;
+use crate::chain_api::ChainApiCtx;
 use crate::fleet::planner::can_take_over;
 use crate::health::ListenerHealthState;
-use crate::models::{Server, ServerConfigDb, ServerState};
+use crate::models::{Role, Server, ServerConfigDb, ServerState};
+use crate::ship::Range;
 use crate::tasks::hex_32;
 use crate::telemetry::{self, Event, EventKind, Level, ListenerStats};
 
@@ -145,7 +149,7 @@ pub type SharedState = Arc<AppState>;
 // Views
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RangeView {
     pub begin: u32,
     pub end: u32,
@@ -210,6 +214,96 @@ pub struct ListenerView {
     pub accepted_total: u64,
     pub rejected_total: u64,
     pub upstreams: Vec<UpstreamView>,
+    /// Present when this listener has a chain API. Absent otherwise, so a
+    /// client that does not know the field still reads the SHiP view.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_api: Option<ChainApiView>,
+}
+
+/// One listener's chain API, as the dashboard shows it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainApiView {
+    /// `host:port` the listener accepts chain API clients on.
+    pub listen: String,
+    pub listening: bool,
+    /// Same verdict and reasons as `/ready/<listener>?scope=api`.
+    pub ready: bool,
+    pub readiness_reasons: Vec<String>,
+    pub usable_upstreams: usize,
+    pub upstreams_total: usize,
+    pub upstreams: Vec<ChainApiUpstreamView>,
+}
+
+/// Counters behind `fleet_router_upstream_api_requests_total`, one field per
+/// `result` label.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainApiResultCounts {
+    pub ok: u64,
+    pub unknown_block: u64,
+    pub not_found: u64,
+    pub busy: u64,
+    pub error: u64,
+    pub connect: u64,
+    pub timeout: u64,
+}
+
+/// One chain API backend. `endpoint` is `host:port` with no scheme and no
+/// userinfo (an `api_endpoint` cannot carry either).
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainApiUpstreamView {
+    pub name: String,
+    pub endpoint: String,
+    /// Links this API to the corresponding SHiP row and operator controls.
+    pub ship_endpoint: String,
+    pub role: &'static str,
+    /// `disabled`, then `down`, then `up`. See [`api_backend_status`].
+    pub status: &'static str,
+    /// Probe-up on the right chain, enabled, and verified when frozen.
+    /// Temporary busy/full conditions remain separate capacity indicators.
+    pub usable: bool,
+    pub operator_disabled: bool,
+    pub chain_mismatch: bool,
+    /// Skipped until a 503 answer's busy interval ends.
+    pub busy: bool,
+    /// `None` for a live API. `Some` for a frozen range server.
+    pub verified: Option<bool>,
+    pub in_flight: usize,
+    pub max_in_flight: usize,
+    pub requests_total: u64,
+    /// Attempts whose result is `busy`, `error`, `connect` or `timeout`.
+    /// Unknown Block and 404 are answers, not failures.
+    pub errors_total: u64,
+    pub results: ChainApiResultCounts,
+    /// Microseconds. `None` until the first attempt, and for a percentile
+    /// that falls above the 10 s histogram bucket.
+    pub latency_last_us: Option<u64>,
+    pub latency_avg_us: Option<u64>,
+    pub latency_p50_us: Option<u64>,
+    pub latency_p95_us: Option<u64>,
+    pub last_success_ms: Option<u64>,
+    pub last_error_ms: Option<u64>,
+    /// Live: the head the API reported to its probes. Frozen: `describe.last`,
+    /// or one below the described range when `last` is not known yet.
+    pub head_block: Option<u32>,
+    /// Frozen described range, `[begin, end)`. `None` for a live API and
+    /// before a frozen API has described itself.
+    pub blocks: Option<RangeView>,
+}
+
+/// Display status of one chain API backend. An operator disable wins, as it
+/// does for a SHiP upstream. A chain mismatch is down: the API is not used.
+pub(crate) fn api_backend_status(
+    operator_disabled: bool,
+    probe_up: bool,
+    chain_mismatch: bool,
+) -> &'static str {
+    if operator_disabled {
+        "disabled"
+    } else if chain_mismatch || !probe_up {
+        "down"
+    } else {
+        "up"
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -344,7 +438,144 @@ async fn listener_view(ctx: &ListenerContext, now: Instant, sessions: usize) -> 
         accepted_total: ctx.stats.accepted_total.load(Ordering::Relaxed),
         rejected_total: ctx.stats.rejected_total.load(Ordering::Relaxed),
         upstreams,
+        chain_api: ctx
+            .health
+            .chain_api
+            .as_deref()
+            .map(|api| chain_api_view(api, now)),
     }
+}
+
+/// The chain API backends of one listener. Reads probe state under each
+/// slot's lock, then the lock-free attempt counters. No URL is copied:
+/// `endpoint` is the canonical `host:port`.
+pub(crate) fn chain_api_view(api: &ChainApiCtx, now: Instant) -> ChainApiView {
+    let fleet = api.fleet_view();
+    let upstreams: Vec<_> = api
+        .directory
+        .slots()
+        .iter()
+        .map(|slot| {
+            chain_api_upstream(
+                slot,
+                fleet.up(slot.index).is_some_and(|u| u.operator_disabled),
+                now,
+            )
+        })
+        .collect();
+    let listening = api.stats.bound();
+    let readiness = crate::health::chain_api_readiness(
+        listening,
+        api.directory
+            .slots()
+            .iter()
+            .zip(&upstreams)
+            .map(|(slot, u)| (slot.role, u.usable)),
+    );
+    ChainApiView {
+        listen: api.bind.clone(),
+        listening,
+        ready: readiness.ready(),
+        readiness_reasons: readiness.reasons,
+        usable_upstreams: readiness.online,
+        upstreams_total: upstreams.len(),
+        upstreams,
+    }
+}
+
+fn chain_api_upstream(
+    slot: &ApiSlot,
+    operator_disabled: bool,
+    now: Instant,
+) -> ChainApiUpstreamView {
+    let (probe_up, chain_mismatch, busy, verified, head_block, blocks) = {
+        let state = slot.state();
+        let head_block = match slot.role {
+            Role::Live => state.head,
+            Role::Frozen => state.last.map(|pos| pos.num).or_else(|| {
+                state
+                    .blocks
+                    .filter(|range| range.end > 0)
+                    .map(|range| range.end - 1)
+            }),
+        };
+        let blocks = matches!(slot.role, Role::Frozen)
+            .then_some(state.blocks)
+            .flatten()
+            .map(range_view);
+        (
+            state.up,
+            state.chain_mismatch,
+            state.busy_until.is_some_and(|until| now < until),
+            matches!(slot.role, Role::Frozen).then_some(state.verification.verified().is_some()),
+            head_block,
+            blocks,
+        )
+    };
+    let (requests_total, errors_total, results) = result_counts(slot);
+    let attempts = slot.attempts();
+    ChainApiUpstreamView {
+        name: slot.name.to_string(),
+        endpoint: slot.endpoint.to_string(),
+        ship_endpoint: slot.ship_endpoint.clone(),
+        role: slot.role.as_str(),
+        status: api_backend_status(operator_disabled, probe_up, chain_mismatch),
+        usable: !operator_disabled && probe_up && !chain_mismatch && verified != Some(false),
+        operator_disabled,
+        chain_mismatch,
+        busy,
+        verified,
+        in_flight: slot.in_flight(),
+        max_in_flight: slot.cap(),
+        requests_total,
+        errors_total,
+        results,
+        latency_last_us: attempts.last_us,
+        latency_avg_us: attempts.avg_us,
+        latency_p50_us: attempts.p50_us,
+        latency_p95_us: attempts.p95_us,
+        last_success_ms: attempts.last_success_ms,
+        last_error_ms: attempts.last_error_ms,
+        head_block,
+        blocks,
+    }
+}
+
+fn range_view(range: Range) -> RangeView {
+    RangeView {
+        begin: range.begin,
+        end: range.end,
+    }
+}
+
+fn result_counts(slot: &ApiSlot) -> (u64, u64, ChainApiResultCounts) {
+    let mut counts = ChainApiResultCounts {
+        ok: 0,
+        unknown_block: 0,
+        not_found: 0,
+        busy: 0,
+        error: 0,
+        connect: 0,
+        timeout: 0,
+    };
+    let mut requests = 0u64;
+    let mut errors = 0u64;
+    for (result, n) in slot.results.values() {
+        requests = requests.saturating_add(n);
+        if result.is_failure() {
+            errors = errors.saturating_add(n);
+        }
+        match result {
+            UpstreamResult::Ok => counts.ok = n,
+            UpstreamResult::UnknownBlock => counts.unknown_block = n,
+            UpstreamResult::NotFound => counts.not_found = n,
+            UpstreamResult::Busy => counts.busy = n,
+            UpstreamResult::Error => counts.error = n,
+            UpstreamResult::Connect => counts.connect = n,
+            UpstreamResult::Timeout => counts.timeout = n,
+        }
+    }
+    (requests, errors, counts)
 }
 
 pub async fn status_view(app: &AppState) -> StatusView {
@@ -1008,6 +1239,15 @@ mod tests {
         assert_eq!(upstream_status(&mut state, now), "stale");
         state.operator_disabled = true;
         assert_eq!(upstream_status(&mut state, now), "disabled");
+    }
+
+    #[test]
+    fn chain_api_status_prefers_an_operator_disable() {
+        assert_eq!(api_backend_status(true, true, false), "disabled");
+        assert_eq!(api_backend_status(true, false, true), "disabled");
+        assert_eq!(api_backend_status(false, false, false), "down");
+        assert_eq!(api_backend_status(false, true, true), "down");
+        assert_eq!(api_backend_status(false, true, false), "up");
     }
 
     /// A stitched listener whose archives are online but whose live node is

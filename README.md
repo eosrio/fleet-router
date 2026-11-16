@@ -37,7 +37,7 @@ Clients open a single WebSocket connection to the router. The router picks a hea
 - **Several networks in one process.** Each listener has its own port, upstream pool, `chain_id`, connection cap, and `/ready/<name>` check.
 - **`chain_id` verification.** Upstreams that report the wrong chain stay offline. Older nodes that omit `chain_id` (FIO and other EOSIO 2.0-based builds) stay usable unless you require it.
 - **Operable.** Prometheus metrics, health and readiness endpoints, `tracing` logs, graceful shutdown, upstream `wss://`, and connection, timeout and message-size limits.
-- **Live dashboard and control API (opt-in).** See every upstream's block range, load and health in real time, and drain a node for maintenance: its sessions move to other nodes without the clients reconnecting.
+- **Live dashboard and control API (opt-in).** See every SHiP upstream's block range, load and health, and each chain API backend's status, errors and latency, in real time. Drain a node for maintenance: its sessions move to other nodes without the clients reconnecting.
 
 ## Installation
 

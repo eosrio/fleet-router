@@ -406,6 +406,11 @@ impl ChainApiCtx {
         self.cfg.max_connections
     }
 
+    /// The listener's current fleet view, for operator-disabled state.
+    pub(crate) fn fleet_view(&self) -> Arc<crate::fleet::FleetView> {
+        self.hub.view()
+    }
+
     /// Start one probe per upstream API and serve `listener` until the
     /// shutdown broadcast. The returned task ends once the listener stops
     /// accepting; open connections finish their request and close.
@@ -883,11 +888,12 @@ impl ChainApiCtx {
             // The deadline leaves this attempt less than its own timeout: a
             // timeout is then the request's, not the upstream's.
             let cut_short = remaining < head_timeout;
+            let started = Instant::now();
             let attempt = self.client.send(request, head_timeout.min(remaining)).await;
             let response = match attempt {
                 Attempt::Response(response) => response,
                 Attempt::Connect => {
-                    self.transport_failed(&slot, Answer::Connect, UpstreamResult::Connect);
+                    self.transport_failed(&slot, Answer::Connect, UpstreamResult::Connect, started);
                     continue;
                 }
                 Attempt::Lost | Attempt::Timeout if policy == Policy::Exec => {
@@ -897,25 +903,28 @@ impl ChainApiCtx {
                     } else {
                         UpstreamResult::Connect
                     };
-                    slot.results.inc(result);
+                    slot.record(result, started.elapsed());
                     lost_after_send = true;
                     break;
                 }
                 Attempt::ConnectTimeout | Attempt::Timeout if cut_short => {
                     // The deadline passed: no attempt is left, and the API
                     // is not taken down for it.
-                    slot.results.inc(UpstreamResult::Timeout);
+                    slot.record(UpstreamResult::Timeout, started.elapsed());
                     break;
                 }
                 Attempt::Lost => {
-                    self.transport_failed(&slot, Answer::Connect, UpstreamResult::Connect);
+                    self.transport_failed(&slot, Answer::Connect, UpstreamResult::Connect, started);
                     continue;
                 }
                 Attempt::ConnectTimeout | Attempt::Timeout => {
-                    self.transport_failed(&slot, Answer::Timeout, UpstreamResult::Timeout);
+                    self.transport_failed(&slot, Answer::Timeout, UpstreamResult::Timeout, started);
                     continue;
                 }
             };
+            // Latency is time-to-head. A later body peek or relay is not
+            // part of it; a failure while reading the body uses its own time.
+            let head_elapsed = started.elapsed();
             let status = response.status().as_u16();
             let (region, claimed, id_holders) = match policy {
                 Policy::Block {
@@ -928,7 +937,7 @@ impl ChainApiCtx {
             let more = order.iter().any(|i| !tried.contains(i));
             // get_info fails over on any 5xx while another node may answer.
             if policy == Policy::Info && status >= 500 && more {
-                slot.results.inc(result_of(status, None));
+                slot.record(result_of(status, None), head_elapsed);
                 let reason = if status == 503 {
                     RetryReason::Busy
                 } else {
@@ -938,7 +947,7 @@ impl ChainApiCtx {
                 continue;
             }
             if policy == Policy::Exec {
-                slot.results.inc(result_of(status, None));
+                slot.record(result_of(status, None), head_elapsed);
                 return self.relayed(
                     response,
                     self.hold(permit, Some(guard)),
@@ -951,7 +960,7 @@ impl ChainApiCtx {
             if !needs_peek(region, status, length) {
                 match classify(region, Answer::Response { status, body: None }) {
                     Outcome::Final => {
-                        slot.results.inc(result_of(status, None));
+                        slot.record(result_of(status, None), head_elapsed);
                         return self.relayed(
                             response,
                             self.hold(permit, Some(guard)),
@@ -961,7 +970,7 @@ impl ChainApiCtx {
                         );
                     }
                     Outcome::Next { reason, .. } => {
-                        slot.results.inc(result_of(status, Some(reason)));
+                        slot.record(result_of(status, Some(reason)), head_elapsed);
                         self.moved_on(&slot, reason, reason.marks_busy());
                         continue;
                     }
@@ -974,7 +983,7 @@ impl ChainApiCtx {
                 Ok(Ok(Peeked::Whole(bytes))) => bytes,
                 Ok(Ok(Peeked::Partial { prefix, rest })) => {
                     // Larger than anything worth classifying: final.
-                    slot.results.inc(result_of(status, None));
+                    slot.record(result_of(status, None), head_elapsed);
                     // Of unknown length (a known one would not need the
                     // peek): `max_response_bytes` can only cut it off.
                     let mut out = Response::new(upstream::Held::body(
@@ -990,12 +999,12 @@ impl ChainApiCtx {
                 }
                 // The connection broke while the body was read.
                 Ok(Err(_)) => {
-                    self.transport_failed(&slot, Answer::Connect, UpstreamResult::Connect);
+                    self.transport_failed(&slot, Answer::Connect, UpstreamResult::Connect, started);
                     continue;
                 }
                 // The request's deadline passed: no attempt is left.
                 Err(_) => {
-                    slot.results.inc(UpstreamResult::Timeout);
+                    slot.record(UpstreamResult::Timeout, started.elapsed());
                     break;
                 }
             };
@@ -1012,7 +1021,7 @@ impl ChainApiCtx {
                 },
             ) {
                 Outcome::Final => {
-                    slot.results.inc(result_of(status, None));
+                    slot.record(result_of(status, None), head_elapsed);
                     return self.answered(
                         buffered.into_response(self.hold(permit, Some(guard))),
                         &slot,
@@ -1020,7 +1029,7 @@ impl ChainApiCtx {
                     );
                 }
                 Outcome::Next { reason, keep } => {
-                    slot.results.inc(result_of(status, Some(reason)));
+                    slot.record(result_of(status, Some(reason)), head_elapsed);
                     if settles(reason, id_holders.contains(&slot.index)) {
                         // An archive that holds the block refused the id:
                         // no upstream holds a block with that id.
@@ -1130,9 +1139,15 @@ impl ChainApiCtx {
 
     /// A connect error or a timeout on a real request (`answer` is
     /// [`Answer::Connect`] or [`Answer::Timeout`]): the API is down until
-    /// its next good probe.
-    fn transport_failed(&self, slot: &ApiSlot, answer: Answer<'_>, result: UpstreamResult) {
-        slot.results.inc(result);
+    /// its next good probe. `started` is the instant the attempt was sent.
+    fn transport_failed(
+        &self,
+        slot: &ApiSlot,
+        answer: Answer<'_>,
+        result: UpstreamResult,
+        started: Instant,
+    ) {
+        slot.record(result, started.elapsed());
         let Outcome::Next { reason, .. } = classify(Region::Reversible, answer) else {
             return;
         };
@@ -1195,10 +1210,11 @@ impl ChainApiCtx {
             tries += 1;
             let remaining = deadline.saturating_duration_since(Instant::now());
             let cut_short = remaining < head_timeout;
+            let started = Instant::now();
             match self.client.send(request, head_timeout.min(remaining)).await {
                 Attempt::Response(response) => {
                     let status = response.status().as_u16();
-                    slot.results.inc(result_of(status, None));
+                    slot.record(result_of(status, None), started.elapsed());
                     self.stats.pushes.inc(if (200..300).contains(&status) {
                         PushResult::Ok
                     } else {
@@ -1220,18 +1236,18 @@ impl ChainApiCtx {
                     );
                 }
                 Attempt::Connect => {
-                    self.transport_failed(slot, Answer::Connect, UpstreamResult::Connect);
+                    self.transport_failed(slot, Answer::Connect, UpstreamResult::Connect, started);
                 }
                 // Nothing was written, and the deadline passed.
                 Attempt::ConnectTimeout if cut_short => {
-                    slot.results.inc(UpstreamResult::Timeout);
+                    slot.record(UpstreamResult::Timeout, started.elapsed());
                     break;
                 }
                 Attempt::ConnectTimeout => {
-                    self.transport_failed(slot, Answer::Timeout, UpstreamResult::Timeout);
+                    self.transport_failed(slot, Answer::Timeout, UpstreamResult::Timeout, started);
                 }
                 Attempt::Lost | Attempt::Timeout => {
-                    slot.results.inc(UpstreamResult::Connect);
+                    slot.record(UpstreamResult::Connect, started.elapsed());
                     self.stats.pushes.inc(PushResult::Ambiguous);
                     tracing::warn!(
                         server = %slot.name,

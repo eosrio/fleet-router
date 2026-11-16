@@ -1624,6 +1624,7 @@ async fn chain_api_series_name_their_listener_and_readiness_follows_the_live_cha
             }],
         },
     ]);
+    cfg["dashboard"] = json!({ "enabled": true });
     let (router, ports) = start_with_chain_api(cfg).await;
     let (port, metrics) = (ports[0], router.metrics());
     let labels = upstream_labels(Some("main"), &node);
@@ -1657,6 +1658,23 @@ async fn chain_api_series_name_their_listener_and_readiness_follows_the_live_cha
     )
     .await;
 
+    let status: Value =
+        serde_json::from_str(&http_get(metrics, "/api/v1/status").await.unwrap().1).unwrap();
+    let api = &status["listeners"][0]["chain_api"];
+    assert_eq!(api["listening"], true);
+    assert_eq!(api["ready"], false);
+    assert_eq!(api["usable_upstreams"], 0);
+    assert_eq!(api["upstreams_total"], 1);
+    assert_eq!(
+        api["readiness_reasons"],
+        json!(["no live chain API upstream up"])
+    );
+    assert_eq!(api["upstreams"][0]["status"], "down");
+    assert_eq!(api["upstreams"][0]["chain_mismatch"], true);
+    assert_eq!(api["upstreams"][0]["usable"], false);
+    assert_eq!(api["upstreams"][0]["ship_endpoint"], node.ship_ep);
+    assert!(status["listeners"][1].get("chain_api").is_none());
+
     node.api.set_chain_id(CHAIN);
     wait_http(
         metrics,
@@ -1674,6 +1692,14 @@ async fn chain_api_series_name_their_listener_and_readiness_follows_the_live_cha
     .await;
     // The SHiP side of `main` never answers: its tip readiness is apart.
     assert_eq!(http_get(metrics, "/ready/main").await.unwrap().0, 503);
+    let status: Value =
+        serde_json::from_str(&http_get(metrics, "/api/v1/status").await.unwrap().1).unwrap();
+    assert_eq!(status["listeners"][0]["ready"], false);
+    let api = &status["listeners"][0]["chain_api"];
+    assert_eq!(api["ready"], true);
+    assert_eq!(api["usable_upstreams"], 1);
+    assert_eq!(api["readiness_reasons"], json!([]));
+    assert_eq!(api["upstreams"][0]["usable"], true);
 
     assert_eq!(
         served_by(&post(port, GET_INFO, "").await).as_deref(),
@@ -1734,4 +1760,99 @@ async fn chain_api_series_name_their_listener_and_readiness_follows_the_live_cha
     assert_eq!(api["frozen"], json!([]));
     assert_eq!(doc["listeners"][1]["name"], "plain");
     assert_eq!(doc["listeners"][1]["chain_api"], Value::Null);
+}
+
+/// The dashboard status JSON counts a backend's successes, failures and
+/// the latency of the attempts. Probes are not attempts.
+#[tokio::test]
+async fn dashboard_status_reports_chain_api_successes_failures_and_latency() {
+    let live = live_node("live-1", 1, 2000).await;
+    let mut cfg = config(&[live.live()], json!({}));
+    cfg["dashboard"] = json!({ "enabled": true });
+    let (router, port) = start(cfg).await;
+    let metrics = router.metrics();
+
+    wait_served(port, GET_INFO, "", "live-1").await;
+
+    live.api.set_fault(
+        Some(GET_ACCOUNT),
+        Some(Fault::Respond {
+            status: 500,
+            body: br#"{"code":500}"#.to_vec().into(),
+        }),
+    );
+    let failed = post(port, GET_ACCOUNT, r#"{"account_name":"eosio"}"#).await;
+    assert_eq!(failed.status, 500, "{}", failed.text());
+    live.api.set_fault(Some(GET_ACCOUNT), None);
+
+    live.api.set_fault(
+        Some(GET_INFO),
+        Some(Fault::Delay(Duration::from_millis(80))),
+    );
+    let slow = post(port, GET_INFO, "").await;
+    assert_eq!(slow.status, 200, "{}", slow.text());
+    live.api.set_fault(Some(GET_INFO), None);
+
+    let backend = wait_backend(metrics, |b| {
+        b["errors_total"].as_u64().unwrap_or(0) >= 1
+            && b["latency_last_us"].as_u64().unwrap_or(0) >= 50_000
+    })
+    .await;
+
+    assert_eq!(backend["name"], "live-1");
+    assert_eq!(backend["role"], "live");
+    assert_eq!(backend["status"], "up");
+    let endpoint = backend["endpoint"].as_str().unwrap();
+    assert!(!endpoint.contains("://"), "{endpoint}");
+    assert!(!endpoint.contains('@'), "{endpoint}");
+    assert!(endpoint.starts_with("127.0.0.1:"), "{endpoint}");
+    assert!(backend["requests_total"].as_u64().unwrap() >= 3);
+    assert!(backend["results"]["ok"].as_u64().unwrap() >= 2);
+    assert!(backend["results"]["error"].as_u64().unwrap() >= 1);
+    assert_eq!(
+        backend["errors_total"].as_u64().unwrap(),
+        backend["results"]["busy"].as_u64().unwrap()
+            + backend["results"]["error"].as_u64().unwrap()
+            + backend["results"]["connect"].as_u64().unwrap()
+            + backend["results"]["timeout"].as_u64().unwrap()
+    );
+    assert!(backend["latency_avg_us"].as_u64().unwrap() > 0);
+    assert!(backend["latency_p50_us"].is_u64() || backend["latency_p50_us"].is_null());
+    assert!(
+        backend["last_success_ms"].as_u64().unwrap() >= backend["last_error_ms"].as_u64().unwrap()
+    );
+    assert!(backend["head_block"].as_u64().unwrap() >= 2000);
+    assert_eq!(backend["in_flight"], 0);
+    assert!(backend["verified"].is_null());
+    assert_eq!(backend["operator_disabled"], false);
+
+    let (_, body) = http_get(metrics, "/api/v1/status").await.unwrap();
+    let doc: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        doc["listeners"][0]["chain_api"]["listen"],
+        format!("127.0.0.1:{port}")
+    );
+    assert!(!body.contains("http://"), "{body}");
+}
+
+/// Poll `/api/v1/status` until `ready` accepts the only chain API backend.
+async fn wait_backend(metrics: u16, ready: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + WAIT;
+    let mut last = String::new();
+    loop {
+        if let Some((200, body)) = http_get(metrics, "/api/v1/status").await {
+            last = body.clone();
+            if let Ok(doc) = serde_json::from_str::<Value>(&body) {
+                let backend = &doc["listeners"][0]["chain_api"]["upstreams"][0];
+                if backend.is_object() && ready(backend) {
+                    return backend.clone();
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "dashboard status did not record the attempts; last body:\n{last}"
+        );
+        sleep(POLL).await;
+    }
 }

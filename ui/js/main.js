@@ -103,7 +103,7 @@ on((kind, payload) => {
   if (kind === "dashboard") {
     const status = store.status;
     syncControlState(status);
-    renderFleet(status);
+    renderFleet(status, { reset: payload.reset });
     renderConfig(status);
     syncSessionFilters(status);
     renderSessions();

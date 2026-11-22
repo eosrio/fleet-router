@@ -67,16 +67,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::stream::{SplitSink, SplitStream};
-use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, watch};
 use tokio::time::{sleep_until, timeout, Instant};
+use tokio_tungstenite::accept_async_with_config;
 use tokio_tungstenite::tungstenite::error::CapacityError;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{accept_async_with_config, WebSocketStream};
 
 use crate::abi::abi_fingerprint;
 use crate::fleet::planner::{
@@ -96,6 +94,7 @@ use crate::ship::wire::{self, BlocksRequest, ClientMsg, DecodeError, ResultHead,
 use crate::ship::BlockPos;
 use crate::telemetry::{self, Event, EventKind, Level, SessionRegistration};
 use crate::tls::{ClientStream, TlsAcceptorHandle};
+use crate::ws_fast::{FastWs, FastWsConfig, HandshakeTap, WsRole};
 
 use client::{
     commit, head_lib_for, judge, request_is_empty, ClientSide, Forward, Judgement, Lacks,
@@ -114,7 +113,7 @@ use link::{
 };
 use status::{router_status, status_ready, StatusFlow, StatusStep};
 
-type ClientWs = WebSocketStream<ClientStream>;
+type ClientWs = FastWs<ClientStream>;
 
 /// A link whose upstream the monitor marked offline is failed over after
 /// this much silence while it owes blocks.
@@ -361,15 +360,13 @@ pub async fn handle_client(
     ctx: Arc<ListenerCtx>,
     shutdown: broadcast::Receiver<()>,
 ) {
-    let Some(client_websocket) = accept_client(client_stream, ctx.limits, ctx.tls.as_ref()).await
-    else {
+    let Some(client_ws) = accept_client(client_stream, ctx.limits, ctx.tls.as_ref()).await else {
         return;
     };
     tracing::info!("client connected");
 
-    let (client_tx, client_rx) = client_websocket.split();
     let stitched = ctx.stitched();
-    let mut session = Session::new(ctx, client_tx, client_rx, shutdown, client_address);
+    let mut session = Session::new(ctx, client_ws, shutdown, client_address);
     let started = if stitched {
         session.send_canonical_abi().await
     } else {
@@ -389,6 +386,7 @@ async fn accept_client(
     limits: ProxyLimits,
     tls: Option<&TlsAcceptorHandle>,
 ) -> Option<ClientWs> {
+    let _ = client_stream.set_nodelay(true);
     let stream = match tls {
         Some(acceptor) => {
             let hs_timeout = if limits.handshake_timeout_ms > 0 {
@@ -407,36 +405,51 @@ async fn accept_client(
         None => ClientStream::Plain(client_stream),
     };
     let mut client_config = WebSocketConfig::default();
+    client_config.read_buffer_size = 4 * 1024;
+    client_config.write_buffer_size = 4 * 1024;
     client_config.max_message_size = Some(limits.max_client_message_bytes);
     client_config.max_frame_size = Some(limits.max_client_message_bytes);
 
-    let accept_fut = accept_async_with_config(stream, Some(client_config));
-    if limits.handshake_timeout_ms > 0 {
+    // The upgrade runs over a tap: a client frame read along with the
+    // request head is handed to the session's reader, not dropped.
+    let accept_fut = accept_async_with_config(HandshakeTap::new(stream), Some(client_config));
+    let ws = if limits.handshake_timeout_ms > 0 {
         match timeout(
             Duration::from_millis(limits.handshake_timeout_ms),
             accept_fut,
         )
         .await
         {
-            Ok(Ok(ws)) => Some(ws),
+            Ok(Ok(ws)) => ws,
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "client websocket handshake failed");
-                None
+                return None;
             }
             Err(_) => {
                 tracing::warn!("client websocket handshake timed out");
-                None
+                return None;
             }
         }
     } else {
         match accept_fut.await {
-            Ok(ws) => Some(ws),
+            Ok(ws) => ws,
             Err(e) => {
                 tracing::warn!(error = %e, "client websocket handshake failed");
-                None
+                return None;
             }
         }
-    }
+    };
+    let (stream, early) = ws.into_inner().into_parts();
+    Some(FastWs::with_prefix(
+        stream,
+        FastWsConfig {
+            role: WsRole::Server,
+            read_buf_cap: 4 * 1024,
+            max_message_size: limits.max_client_message_bytes,
+            max_frame_size: limits.max_client_message_bytes,
+        },
+        &early,
+    ))
 }
 
 /// Planner and fleet-view deadlines use the std clock.
@@ -490,8 +503,7 @@ struct Session {
     epoch: Instant,
     shutdown: broadcast::Receiver<()>,
 
-    client_tx: SplitSink<ClientWs, Message>,
-    client_rx: SplitStream<ClientWs>,
+    client_ws: ClientWs,
     /// When the client last sent a frame (`idle_timeout_ms`).
     client_seen: Instant,
 
@@ -567,13 +579,16 @@ struct Session {
     /// no upstream continues it and the session forwards the discontinuity
     /// after all: they are not to blame then.
     seam_excluded: Vec<Arc<str>>,
+    /// Session-local cache of `(view.generation, hub.tip_seq(), (head, lib))`
+    /// so hot-path checks avoid locking `hub.mem` / `ObservedTip` while the
+    /// fleet tip is unchanged.
+    cached_tip: (u64, u64, (Option<BlockPos>, Option<BlockPos>)),
 }
 
 impl Session {
     fn new(
         ctx: Arc<ListenerCtx>,
-        client_tx: SplitSink<ClientWs, Message>,
-        client_rx: SplitStream<ClientWs>,
+        client_ws: ClientWs,
         shutdown: broadcast::Receiver<()>,
         client: SocketAddr,
     ) -> Self {
@@ -592,8 +607,7 @@ impl Session {
             id,
             epoch: now,
             shutdown,
-            client_tx,
-            client_rx,
+            client_ws,
             client_seen: now,
             view_rx,
             view,
@@ -626,7 +640,20 @@ impl Session {
             blockless_moves: 0,
             blockless_moved_at: None,
             seam_excluded: Vec::new(),
+            cached_tip: (u64::MAX, 0, (None, None)),
         }
+    }
+
+    #[inline]
+    fn fresh_tip_cached(&mut self) -> (Option<BlockPos>, Option<BlockPos>) {
+        let gen = self.view.generation;
+        let seq = self.ctx.hub.tip_seq();
+        if self.cached_tip.0 == gen && self.cached_tip.1 == seq {
+            return self.cached_tip.2;
+        }
+        let tip = self.ctx.hub.fresh_tip(&self.view);
+        self.cached_tip = (gen, seq, tip);
+        tip
     }
 
     fn set_phase(&mut self, phase: Phase) {
@@ -721,8 +748,8 @@ impl Session {
         };
         self.c.abi_fp = abi_fingerprint(&est.abi);
         if let Err(e) = self
-            .client_tx
-            .send(Message::Text(est.abi.as_str().into()))
+            .client_ws
+            .send_message(Message::Text(est.abi.as_str().into()))
             .await
         {
             tracing::warn!(error = %e, "error sending ABI to client");
@@ -746,7 +773,7 @@ impl Session {
                 if let Some(abi) = self.view.abi.clone() {
                     self.c.abi_fp = abi.fp;
                     let text = Message::Text(abi.text.as_ref().into());
-                    if let Err(e) = self.client_tx.send(text).await {
+                    if let Err(e) = self.client_ws.send_message(text).await {
                         tracing::warn!(error = %e, "error sending ABI to client");
                         self.end_reason = "client write failed";
                         return Flow::Stop;
@@ -777,6 +804,14 @@ impl Session {
     async fn run(&mut self) {
         // The idle timer starts once the ABI has been forwarded.
         self.client_seen = Instant::now();
+        // Operator requests for this session (hoisted out of the loop to avoid
+        // per-frame Arc refcount churn).
+        let control_info = self.registry.info.clone();
+        // Reusable pinned timer: only re-armed lazily when a deadline moves
+        // earlier or when the armed instant fires before the current deadline.
+        let timer = sleep_until(Instant::now() + Duration::from_secs(86_400));
+        tokio::pin!(timer);
+        let mut armed_deadline: Option<Instant> = None;
         loop {
             if self.view_unseen || self.view_rx.has_changed().unwrap_or(false) {
                 self.sync_view();
@@ -786,6 +821,20 @@ impl Session {
             }
             self.update_owed();
             let deadline = self.next_deadline();
+            match (deadline, armed_deadline) {
+                (Some(d), None) => {
+                    timer.as_mut().reset(d);
+                    armed_deadline = Some(d);
+                }
+                (Some(d), Some(cur)) if d < cur => {
+                    timer.as_mut().reset(d);
+                    armed_deadline = Some(d);
+                }
+                (None, Some(_)) => {
+                    armed_deadline = None;
+                }
+                _ => {}
+            }
             // A new view can answer waiting status requests. It also makes
             // the next pass re-check whether a link with a request and credit
             // owes blocks: the fleet head may have moved past what a silent
@@ -807,8 +856,6 @@ impl Session {
                 )
                 || self.standby.is_some()
                 || self.standby_dial.is_some();
-            // Operator requests for this session.
-            let info = self.registry.info.clone();
             // The monitor losing the link's upstream starts a probe.
             let probe_on: Option<Arc<UpstreamCounters>> = self
                 .link
@@ -821,8 +868,8 @@ impl Session {
             let flow = tokio::select! {
                 biased;
                 _ = self.shutdown.recv() => self.on_shutdown().await,
-                next = self.client_rx.next() => self.on_client(next).await,
-                () = info.control.notified() => self.on_control().await,
+                next = self.client_ws.read_message() => self.on_client(next).await,
+                () = control_info.control.notified() => self.on_control().await,
                 outcome = dial_outcome(&mut self.dial), if self.dial.is_some() => {
                     self.on_dial(outcome).await
                 }
@@ -830,7 +877,7 @@ impl Session {
                     self.on_standby(outcome)
                 }
                 next = next_frame(&mut self.link), if self.link.is_some() => {
-                    self.on_upstream(next).await
+                    self.on_upstream_batch(next).await
                 }
                 // Before the view: the monitor publishes the view that shows
                 // the upstream offline right after this notification.
@@ -846,7 +893,21 @@ impl Session {
                         Flow::Continue
                     }
                 }
-                () = wait_until(deadline), if deadline.is_some() => self.on_timer().await,
+                () = &mut timer, if armed_deadline.is_some() => {
+                    armed_deadline = None;
+                    let now = Instant::now();
+                    if let Some(real) = self.next_deadline() {
+                        if now < real {
+                            timer.as_mut().reset(real);
+                            armed_deadline = Some(real);
+                            Flow::Continue
+                        } else {
+                            self.on_timer().await
+                        }
+                    } else {
+                        Flow::Continue
+                    }
+                }
             };
             if let Flow::Stop = flow {
                 break;
@@ -1122,12 +1183,16 @@ impl Session {
         let payload: Bytes = match msg {
             Message::Binary(bytes) => bytes,
             Message::Text(text) => text.into(),
-            Message::Close(_) => {
+            Message::Close(frame) => {
                 tracing::debug!("client stream ended");
+                let _ = self.client_ws.send_message(Message::Close(frame)).await;
                 return Flow::Stop;
             }
-            // Pings are answered by tungstenite; nothing else needs a reply.
-            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => return Flow::Continue,
+            Message::Ping(p) => {
+                let _ = self.client_ws.send_pong(&p).await;
+                return Flow::Continue;
+            }
+            Message::Pong(_) | Message::Frame(_) => return Flow::Continue,
         };
         match wire::decode_client(&payload) {
             Ok(ClientMsg::Status { v1 }) => self.on_status_request(v1).await,
@@ -1163,10 +1228,7 @@ impl Session {
         if let Some(link) = self.link.as_mut() {
             if link.st.req.is_some() {
                 // A failed write shows up as the end of the link's stream.
-                let _ = link
-                    .tx
-                    .send(Message::Binary(wire::encode_ack(raised).into()))
-                    .await;
+                let _ = link.ws.send_binary_slice(&wire::encode_ack(raised)).await;
             }
         }
         Flow::Continue
@@ -1195,7 +1257,7 @@ impl Session {
         tracing::debug!(variant, "forwarding an unknown client request variant");
         let msg = Message::Binary(payload);
         if let Some(link) = self.link.as_mut() {
-            if link.tx.send(msg.clone()).await.is_ok() {
+            if link.ws.send_message(msg.clone()).await.is_ok() {
                 link.st.unknown_forwarded_at = Some(Instant::now());
                 return Flow::Continue;
             }
@@ -1443,11 +1505,7 @@ impl Session {
                             "no chain_id is known for this listener; get_status_result_v1 carries zeros (pin chain_id in the config)"
                         );
                     }
-                    if let Err(e) = self
-                        .client_tx
-                        .send(Message::Binary(reply.bytes.into()))
-                        .await
-                    {
+                    if let Err(e) = self.client_ws.send_binary_slice(&reply.bytes).await {
                         tracing::warn!(error = %e, "error sending status to client");
                         self.end_reason = "client write failed";
                         return Flow::Stop;
@@ -1458,8 +1516,12 @@ impl Session {
                     let Some(link) = self.link.as_mut() else {
                         return Flow::Continue;
                     };
-                    let request = Message::Binary(wire::encode_status_request(v1).into());
-                    if link.tx.send(request).await.is_err() {
+                    if link
+                        .ws
+                        .send_binary_slice(&wire::encode_status_request(v1))
+                        .await
+                        .is_err()
+                    {
                         // The link's end returns the request to the queue.
                         return Flow::Continue;
                     }
@@ -1477,12 +1539,16 @@ impl Session {
         let Some(up) = self.link.as_ref().map(|l| l.st.up) else {
             return Flow::Continue;
         };
-        let out = match wire::read_head_lib(&frame) {
-            Some((head, lib)) => self.apply_head_lib(frame, head, lib, Role::Live, up),
-            None => frame,
-        };
-        let len = out.len();
-        if let Err(e) = self.client_tx.send(Message::Binary(out)).await {
+        let patch = wire::read_head_lib(&frame)
+            .and_then(|(head, lib)| self.compute_head_lib_patch(head, lib, Role::Live, up));
+        let len = frame.len();
+        if let Err(e) = self.client_ws.queue_binary_patched(&frame, patch).await {
+            tracing::warn!(error = %e, "error sending status to client");
+            self.end_reason = "client write failed";
+            return Flow::Stop;
+        }
+        drop(frame);
+        if let Err(e) = self.client_ws.flush_writes().await {
             tracing::warn!(error = %e, "error sending status to client");
             self.end_reason = "client write failed";
             return Flow::Stop;
@@ -1495,6 +1561,41 @@ impl Session {
     // ------------------------------------------------------------------
     // Upstream side
     // ------------------------------------------------------------------
+
+    /// Handle an upstream frame and greedily drain up to 31 more frames
+    /// already buffered in `link.ws.in_buf` (up to 64 KiB) before issuing a
+    /// single coalesced flush to the client. When only one frame is buffered
+    /// (live streaming), `try_read_buffered()` returns `None` immediately and
+    /// flushes at once with zero added latency.
+    async fn on_upstream_batch(&mut self, first: Option<Result<Message, WsError>>) -> Flow {
+        const MAX_BATCH_FRAMES: usize = 32;
+        const MAX_BATCH_BYTES: usize = 64 * 1024;
+
+        let mut flow = self.on_upstream(first).await;
+        if matches!(flow, Flow::Stop) {
+            return Flow::Stop;
+        }
+        let mut count = 1usize;
+        while count < MAX_BATCH_FRAMES
+            && self.client_ws.buffered_write_len() < MAX_BATCH_BYTES
+            && !self.view_unseen
+        {
+            let Some(next) = self.link.as_mut().and_then(|l| l.ws.try_read_buffered()) else {
+                break;
+            };
+            flow = self.on_upstream(Some(next)).await;
+            if matches!(flow, Flow::Stop) {
+                return Flow::Stop;
+            }
+            count += 1;
+        }
+        if let Err(e) = self.client_ws.flush_writes().await {
+            tracing::warn!(error = %e, "error flushing message to client");
+            self.end_reason = "client write failed";
+            return Flow::Stop;
+        }
+        Flow::Continue
+    }
 
     async fn on_upstream(&mut self, next: Option<Result<Message, WsError>>) -> Flow {
         let Some(link) = self.link.as_mut() else {
@@ -1530,15 +1631,19 @@ impl Session {
         link.st.note_frame(read_ms, liveness_pong);
         match msg {
             Message::Binary(frame) => self.on_upstream_binary(frame).await,
-            // Never forwarded: the stream end that follows is a clean
-            // failover.
+            // Never forwarded: complete the RFC 6455 closing handshake so the
+            // upstream closes its side promptly, and the stream end that
+            // follows is a clean failover.
             Message::Close(frame) => {
-                link.st.close_code = Some(frame.map_or(1005, |f| u16::from(f.code)));
+                link.st.close_code = Some(frame.as_ref().map_or(1005, |f| u16::from(f.code)));
+                link.reply(Message::Close(frame)).await;
                 Flow::Continue
             }
-            Message::Text(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
+            Message::Ping(p) => {
+                link.reply(Message::Pong(p)).await;
                 Flow::Continue
             }
+            Message::Text(_) | Message::Pong(_) | Message::Frame(_) => Flow::Continue,
         }
     }
 
@@ -1564,11 +1669,12 @@ impl Session {
             UpstreamMsg::Other if self.ctx.topology == ResolvedTopology::Pool => {
                 // Unknown to this router: passed through, as before.
                 let len = frame.len();
-                if let Err(e) = self.client_tx.send(Message::Binary(frame)).await {
+                if let Err(e) = self.client_ws.queue_binary_patched(&frame, None).await {
                     tracing::warn!(error = %e, "error sending message to client");
                     self.end_reason = "client write failed";
                     return Flow::Stop;
                 }
+                drop(frame);
                 self.note_forwarded(len, None);
                 Flow::Continue
             }
@@ -1828,66 +1934,79 @@ impl Session {
             "replayed result dropped; refunding its credit upstream"
         );
         // A failed write shows up as the end of the link's stream.
-        let _ = link
-            .tx
-            .send(Message::Binary(wire::encode_ack(1).into()))
-            .await;
+        let _ = link.ws.send_binary_slice(&wire::encode_ack(1)).await;
         Flow::Continue
     }
 
     async fn forward_result(&mut self, frame: Bytes, h: ResultHead, fw: Forward) -> Flow {
-        let Some((up, role, endpoint)) = self
-            .link
-            .as_ref()
-            .map(|l| (l.st.up, l.st.role, l.endpoint.clone()))
-        else {
+        let Some((up, role)) = self.link.as_ref().map(|l| (l.st.up, l.st.role)) else {
             return Flow::Continue;
         };
-        let stats = self.ctx.hub.stats.clone();
         let block = fw.cls.n;
         if fw.fork {
-            stats.fork_redeliveries.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(upstream = %endpoint, block, "fork re-delivery forwarded");
+            self.ctx
+                .hub
+                .stats
+                .fork_redeliveries
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(link) = self.link.as_ref() {
+                tracing::debug!(upstream = %link.endpoint, block, "fork re-delivery forwarded");
+            }
         }
         if fw.jump {
-            if let Some(u) = stats.upstream(up) {
+            if let Some(u) = self.ctx.hub.stats.upstream(up) {
                 u.sequence_jumps.fetch_add(1, Ordering::Relaxed);
             }
-            self.log_jump(&endpoint, self.c.cursor, block);
+            if let Some(endpoint) = self.link.as_ref().map(|l| l.endpoint.clone()) {
+                self.log_jump(&endpoint, self.c.cursor, block);
+            }
         }
         if fw.discontinuity {
-            tracing::error!(
-                upstream = %endpoint,
-                block,
-                "upstream result does not continue the last delivered block"
-            );
+            if let Some(link) = self.link.as_ref() {
+                tracing::error!(
+                    upstream = %link.endpoint,
+                    block,
+                    "upstream result does not continue the last delivered block"
+                );
+            }
             // No upstream continues the block: those left at this seam for
             // not continuing it are usable again.
             let released = std::mem::take(&mut self.seam_excluded);
             if !released.is_empty() {
                 self.ex.hard.retain(|(ep, _)| !released.contains(ep));
             }
-        } else {
+        } else if !self.seam_excluded.is_empty() {
             self.seam_excluded.clear();
         }
         if fw.variant_mismatch {
-            tracing::debug!(upstream = %endpoint, "result variant differs from the request version");
+            if let Some(link) = self.link.as_ref() {
+                tracing::debug!(upstream = %link.endpoint, "result variant differs from the request version");
+            }
         }
         if self.c.charge() {
-            stats.credit_overruns.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(upstream = %endpoint, block, "result forwarded with no client credit");
+            self.ctx
+                .hub
+                .stats
+                .credit_overruns
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(link) = self.link.as_ref() {
+                tracing::debug!(upstream = %link.endpoint, block, "result forwarded with no client credit");
+            }
         }
         let frame = match role {
             Role::Frozen => self.fill_prev_block(frame, &h, up),
             Role::Live => frame,
         };
-        let out = self.apply_head_lib(frame, h.head, h.lib, role, up);
-        let len = out.len();
-        if let Err(e) = self.client_tx.send(Message::Binary(out)).await {
+        let patch = self.compute_head_lib_patch(h.head, h.lib, role, up);
+        let len = frame.len();
+        if let Err(e) = self.client_ws.queue_binary_patched(&frame, patch).await {
             tracing::warn!(error = %e, "error sending message to client");
             self.end_reason = "client write failed";
             return Flow::Stop;
         }
+        // Drop input `Bytes` immediately so `link.ws.in_buf` reclaims its
+        // backing capacity before draining more buffered frames.
+        drop(frame);
         self.note_forwarded(len, block);
         let Some(link) = self.link.as_mut() else {
             return Flow::Continue;
@@ -1895,9 +2014,15 @@ impl Session {
         let first = link.st.first_result_pending;
         let leg = link.st.req.as_ref().map(|r| (r.end, r.clamped));
         commit(&mut self.c, &mut link.st, &h, &fw);
+        // After the client write: the time a slow client took to accept the
+        // frame is not upstream silence.
         link.st.became_owed_at = Instant::now();
         if fw.cls.kind == ResultKind::KeepAlive {
-            stats.keepalives.fetch_add(1, Ordering::Relaxed);
+            self.ctx
+                .hub
+                .stats
+                .keepalives
+                .fetch_add(1, Ordering::Relaxed);
             self.counts.keepalives += 1;
         }
         self.counts.results += 1;
@@ -1908,7 +2033,11 @@ impl Session {
         }
         if first {
             if let Some(started) = self.handoff_started.take() {
-                stats.handoff_latency.observe(started.elapsed());
+                self.ctx
+                    .hub
+                    .stats
+                    .handoff_latency
+                    .observe(started.elapsed());
             }
         }
         if self.ctx.stitched() {
@@ -1983,18 +2112,16 @@ impl Session {
         }
     }
 
-    /// Report a live frame's head/LIB into the fleet tip, then give the
-    /// client a head and LIB that never go backwards for this session
-    /// (frozen frames take the fleet tip). The frame is patched in place only
-    /// when the values change.
-    fn apply_head_lib(
+    /// Report a live frame's head/LIB into the fleet tip, then compute whether
+    /// this frame's 72-byte head/LIB needs to be rewritten inline on write
+    /// (zero payload copy).
+    fn compute_head_lib_patch(
         &mut self,
-        frame: Bytes,
         head: BlockPos,
         lib: BlockPos,
         role: Role,
         up: usize,
-    ) -> Bytes {
+    ) -> Option<(BlockPos, BlockPos)> {
         if role == Role::Live {
             if let Some(tip) = self.ctx.hub.tips.get(up) {
                 tip.observe(head, lib);
@@ -2003,7 +2130,7 @@ impl Session {
         let patch =
             self.ctx.topology == ResolvedTopology::Pool || self.ctx.stitching.patch_head_lib;
         let fleet = match role {
-            Role::Frozen => match self.ctx.hub.fresh_tip(&self.view) {
+            Role::Frozen => match self.fresh_tip_cached() {
                 (Some(h), Some(l)) => Some((h, l)),
                 _ => None,
             },
@@ -2017,9 +2144,9 @@ impl Session {
                     .patched_results
                     .fetch_add(1, Ordering::Relaxed);
                 self.counts.patched += 1;
-                wire::patch_head_lib(frame, head, lib)
+                Some((head, lib))
             }
-            None => frame,
+            None => None,
         }
     }
 
@@ -2063,7 +2190,7 @@ impl Session {
             "upstream get_blocks"
         );
         let bytes = wire::encode_blocks_request(&req);
-        match timeout(write_timeout, link.tx.send(Message::Binary(bytes.into()))).await {
+        match timeout(write_timeout, link.ws.send_binary_slice(&bytes)).await {
             Ok(Ok(())) => {
                 self.hold = None;
                 let phase = if self.c.in_progress() {
@@ -2501,7 +2628,7 @@ impl Session {
             let Some(link) = self.link.as_mut() else {
                 return;
             };
-            if let Err(e) = link.tx.send(frame).await {
+            if let Err(e) = link.ws.send_message(frame).await {
                 tracing::warn!(error = %e, "error flushing buffered client frame after failover");
                 return;
             }
@@ -3221,14 +3348,24 @@ impl Session {
     /// credit, and an upstream cursor below its end and at or below what the
     /// upstream (or the fleet) can send.
     fn update_owed(&mut self) {
+        let credit = self.c.credit;
+        if self.link.is_none() {
+            return;
+        }
+        let gen = self.view.generation;
+        let seq = self.ctx.hub.tip_seq();
         let hub = &self.ctx.hub;
         let view = &self.view;
-        let credit = self.c.credit;
-        let Some(link) = self.link.as_mut() else {
-            return;
-        };
+        let cached_tip = &mut self.cached_tip;
+        let link = self.link.as_mut().unwrap();
         let is_owed = owed(&link.st, credit, |irreversible_only| {
-            let (head, lib) = hub.fresh_tip(view);
+            let (head, lib) = if cached_tip.0 == gen && cached_tip.1 == seq {
+                cached_tip.2
+            } else {
+                let tip = hub.fresh_tip(view);
+                *cached_tip = (gen, seq, tip);
+                tip
+            };
             if irreversible_only { lib } else { head }.map(|p| p.num)
         });
         if is_owed && !link.st.was_owed {
@@ -3478,10 +3615,13 @@ impl Session {
         let linger = self.link.as_ref().and_then(|l| l.st.linger_until);
         let standby = self.standby.as_ref().map(|s| s.until);
         let liveness = self.link.as_ref().and_then(|l| self.liveness_deadline(l));
-        [client, status, phase, hold, link, linger, standby, liveness]
-            .into_iter()
-            .flatten()
-            .min()
+        let shrink = self.link.as_ref().and_then(|l| l.ws.shrink_deadline());
+        [
+            client, status, phase, hold, link, linger, standby, liveness, shrink,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     async fn on_timer(&mut self) -> Flow {
@@ -3616,13 +3756,16 @@ impl Session {
             tracing::debug!("dropping an unused standby link");
             self.discard_standby();
         }
+        if let Some(link) = self.link.as_mut() {
+            link.ws.shrink_if_idle(now);
+        }
         Flow::Continue
     }
 
     async fn close_client(&mut self, code: CloseCode, reason: &str) {
         let _ = self
-            .client_tx
-            .send(Message::Close(Some(CloseFrame {
+            .client_ws
+            .send_message(Message::Close(Some(CloseFrame {
                 code,
                 reason: reason.into(),
             })))
@@ -3639,7 +3782,7 @@ async fn dial_outcome(dial: &mut Option<DialTask>) -> Result<Established, DialEr
 
 async fn next_frame(link: &mut Option<Link>) -> Option<Result<Message, WsError>> {
     match link {
-        Some(link) => link.rx.next().await,
+        Some(link) => link.ws.read_message().await,
         None => std::future::pending().await,
     }
 }
@@ -3652,24 +3795,18 @@ async fn went_offline(counters: Option<&UpstreamCounters>) {
     }
 }
 
-async fn wait_until(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => sleep_until(deadline).await,
-        None => std::future::pending().await,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fleet::{FailoverReason, FleetHub};
     use crate::models::{build_config_db, build_state_db, Server};
+    use futures::{SinkExt, StreamExt};
     use mock_ship::client::{BlockView, StatusView};
     use mock_ship::{MockShipConfig, MockShipServer};
     use std::sync::atomic::AtomicUsize;
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
-    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::{connect_async, WebSocketStream};
 
     type TestClient = WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 

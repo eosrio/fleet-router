@@ -10,7 +10,6 @@ use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::header::{
@@ -28,8 +27,60 @@ use super::RequestPermit;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The body of every chain API answer.
-pub type ApiBody = UnsyncBoxBody<Bytes, BoxError>;
+/// The body of every chain API answer. Inline variants avoid triple-boxing
+/// (`Incoming -> StallGuard -> Held -> UnsyncBoxBody`) on the hot path.
+pub enum ApiBody {
+    Full(Full<Bytes>),
+    HeldFull {
+        body: Full<Bytes>,
+        hold: Option<Hold>,
+    },
+    Streamed(StreamedBody<Incoming>),
+    Replay(Box<ReplayBody>),
+}
+
+impl Body for ApiBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        match self.get_mut() {
+            ApiBody::Full(body) => Pin::new(body)
+                .poll_frame(cx)
+                .map_err(|never| match never {}),
+            ApiBody::HeldFull { body, hold } => {
+                let polled = Pin::new(body)
+                    .poll_frame(cx)
+                    .map_err(|never| match never {});
+                if matches!(polled, Poll::Ready(None)) {
+                    *hold = None;
+                }
+                polled
+            }
+            ApiBody::Streamed(streamed) => Pin::new(streamed).poll_frame(cx),
+            ApiBody::Replay(replay) => Pin::new(&mut **replay).poll_frame(cx),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            ApiBody::Full(body) | ApiBody::HeldFull { body, .. } => body.is_end_stream(),
+            ApiBody::Streamed(streamed) => streamed.is_end_stream(),
+            ApiBody::Replay(replay) => replay.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match self {
+            ApiBody::Full(body) | ApiBody::HeldFull { body, .. } => body.size_hint(),
+            ApiBody::Streamed(streamed) => streamed.size_hint(),
+            ApiBody::Replay(replay) => replay.size_hint(),
+        }
+    }
+}
 
 /// How long an idle pooled upstream connection is kept. Below the 10 s a
 /// frozen range server (like hyper's own servers) keeps an idle connection
@@ -60,7 +111,7 @@ fn dropped_response_header(name: &HeaderName) -> bool {
 pub struct Call {
     pub method: Method,
     /// The origin-form target, query string included.
-    pub target: String,
+    pub target: Arc<str>,
     pub headers: HeaderMap,
     pub body: Bytes,
 }
@@ -75,7 +126,7 @@ impl Call {
         }
         Call {
             method,
-            target: target.to_string(),
+            target: Arc::from(target),
             headers,
             body,
         }
@@ -87,9 +138,12 @@ impl Call {
     /// nodeos writes a body even for HEAD, and those bytes must not reach
     /// the next request on a pooled connection.
     pub fn request_for(&self, slot: &ApiSlot) -> Result<Request<Full<Bytes>>, hyper::http::Error> {
+        let mut uri = String::with_capacity(slot.base.len() + self.target.len());
+        uri.push_str(&slot.base);
+        uri.push_str(&self.target);
         let mut builder = Request::builder()
             .method(self.method.clone())
-            .uri(format!("{}{}", slot.base, self.target))
+            .uri(uri)
             .header(HOST, slot.authority.clone());
         for (name, value) in &self.headers {
             builder = builder.header(name, value);
@@ -173,7 +227,10 @@ pub struct Buffered {
 impl Buffered {
     /// The client's copy, holding `hold` until it is sent.
     pub fn into_response(self, hold: Hold) -> Response<ApiBody> {
-        let body = Held::body(full(self.body), hold);
+        let body = ApiBody::HeldFull {
+            body: Full::new(self.body),
+            hold: Some(hold),
+        };
         let mut response = Response::new(body);
         *response.status_mut() =
             hyper::StatusCode::from_u16(self.status).unwrap_or(hyper::StatusCode::BAD_GATEWAY);
@@ -185,21 +242,39 @@ impl Buffered {
 /// The relayed head of an upstream answer: its status and every header
 /// but hop-by-hop ones and `Date`. `Server` passes through. CORS headers
 /// are left for the listener to strip or replace.
-pub fn relay_headers(upstream: &HeaderMap) -> HeaderMap {
-    let mut out = HeaderMap::with_capacity(upstream.len());
+///
+/// Mutates/moves the owned `HeaderMap` with zero allocations on the common
+/// path where no hop-by-hop or `Date` headers are present, while preserving
+/// exact header order whenever any header is stripped.
+pub fn relay_headers_owned(upstream: HeaderMap) -> HeaderMap {
+    let has_connection = upstream.contains_key(CONNECTION);
+    if !has_connection && !upstream.keys().any(dropped_response_header) {
+        return upstream;
+    }
     // Names a `Connection` header lists are hop-by-hop too.
-    let listed: Vec<String> = upstream
-        .get_all(CONNECTION)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(|name| name.trim().to_ascii_lowercase())
-        .collect();
+    let listed: Vec<String> = if has_connection {
+        upstream
+            .get_all(CONNECTION)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(|name| name.trim().to_ascii_lowercase())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut out = HeaderMap::with_capacity(upstream.len());
+    let mut current: Option<HeaderName> = None;
     for (name, value) in upstream {
-        if dropped_response_header(name) || listed.iter().any(|l| l == name.as_str()) {
-            continue;
+        if name.is_some() {
+            current = name;
         }
-        out.append(name.clone(), value.clone());
+        if let Some(ref key) = current {
+            if dropped_response_header(key) || listed.iter().any(|l| l == key.as_str()) {
+                continue;
+            }
+            out.append(key.clone(), value);
+        }
     }
     out
 }
@@ -207,13 +282,34 @@ pub fn relay_headers(upstream: &HeaderMap) -> HeaderMap {
 /// An upstream answer streamed to the client. It ends with an error, which
 /// closes the client connection, when the upstream sends nothing for
 /// `relay.stall` while the client waits for more, or passes
-/// `relay.max_bytes` ([`StallGuard`]).
+/// `relay.max_bytes` ([`StreamedBody`]).
 pub fn streamed(response: Response<Incoming>, hold: Hold, relay: Relay) -> Response<ApiBody> {
     let (parts, body) = response.into_parts();
-    let body = StallGuard::body(body.map_err(BoxError::from).boxed_unsync(), relay);
-    let mut out = Response::new(Held::body(body, hold));
+    let mut out = Response::new(ApiBody::Streamed(StreamedBody::new(
+        body,
+        relay,
+        Some(hold),
+    )));
     *out.status_mut() = parts.status;
-    *out.headers_mut() = relay_headers(&parts.headers);
+    *out.headers_mut() = relay_headers_owned(parts.headers);
+    out
+}
+
+/// An upstream answer whose prefix was peeked past `PEEK_LIMIT` and is now
+/// replayed followed by the remaining upstream stream.
+pub fn replayed(
+    parts: hyper::http::response::Parts,
+    prefix: VecDeque<Bytes>,
+    rest: Incoming,
+    hold: Hold,
+    relay: Relay,
+) -> Response<ApiBody> {
+    let mut out = Response::new(ApiBody::Replay(Box::new(ReplayBody {
+        prefix,
+        inner: StreamedBody::new(rest, relay, Some(hold)),
+    })));
+    *out.status_mut() = parts.status;
+    *out.headers_mut() = relay_headers_owned(parts.headers);
     out
 }
 
@@ -231,9 +327,17 @@ pub struct Relay {
     /// The upstream server's name.
     pub server: Arc<str>,
     /// The upstream API's base URL.
-    pub api: String,
-    /// The request path, without its query.
-    pub path: String,
+    pub api: Arc<str>,
+    /// The request target (path + optional query). Only split on `?` if a
+    /// warning/debug log fires.
+    pub target: Arc<str>,
+}
+
+impl Relay {
+    #[inline]
+    pub fn path(&self) -> &str {
+        self.target.split('?').next().unwrap_or_default()
+    }
 }
 
 /// Why an upstream answer was cut off: the upstream sent its head and then
@@ -261,18 +365,16 @@ impl std::fmt::Display for ResponseTooLarge {
 
 impl std::error::Error for ResponseTooLarge {}
 
-/// A body that fails with [`UpstreamStalled`] once a poll has waited
-/// `relay.stall` for its next frame, or with [`ResponseTooLarge`] once the
-/// streamed bytes pass `relay.max_bytes`. The timer runs only while the
-/// listener waits for the upstream: a client that reads slowly keeps hyper
-/// from asking for more, which never counts against the upstream.
+/// Inline stall-guarded, size-bounded, slot-holding streaming body.
 ///
-/// Every frame within the stall time keeps the answer going, so an upstream
-/// that trickles bytes holds its permit and slot until it is done or the
-/// client leaves; only `max_bytes` bounds how much it sends.
-pub struct StallGuard {
-    inner: ApiBody,
+/// Fails with [`UpstreamStalled`] once a poll has waited `relay.stall` for
+/// its next frame, or with [`ResponseTooLarge`] once the streamed bytes pass
+/// `relay.max_bytes`. Releases `hold` as soon as the stream finishes, fails,
+/// or is dropped.
+pub struct StreamedBody<B = Incoming> {
+    inner: B,
     relay: Relay,
+    hold: Option<Hold>,
     timer: Option<Pin<Box<Sleep>>>,
     /// A poll found no frame and `timer` runs.
     waiting: bool,
@@ -280,20 +382,24 @@ pub struct StallGuard {
     streamed: u64,
 }
 
-impl StallGuard {
-    pub fn body(inner: ApiBody, relay: Relay) -> ApiBody {
-        StallGuard {
+impl<B> StreamedBody<B> {
+    pub fn new(inner: B, relay: Relay, hold: Option<Hold>) -> Self {
+        Self {
             inner,
             relay,
+            hold,
             timer: None,
             waiting: false,
             streamed: 0,
         }
-        .boxed_unsync()
     }
 }
 
-impl Body for StallGuard {
+impl<B> Body for StreamedBody<B>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
     type Data = Bytes;
     type Error = BoxError;
 
@@ -305,24 +411,37 @@ impl Body for StallGuard {
         let polled = Pin::new(&mut this.inner).poll_frame(cx);
         if let Poll::Ready(item) = polled {
             this.waiting = false;
-            if let (Some(Ok(frame)), Some(max)) = (&item, this.relay.max_bytes) {
-                if let Some(data) = frame.data_ref() {
-                    this.streamed = this.streamed.saturating_add(data.len() as u64);
-                    if this.streamed > max {
-                        let r = &this.relay;
-                        tracing::warn!(
-                            listener = %r.listener,
-                            server = %r.server,
-                            api = %r.api,
-                            path = %r.path,
-                            max_bytes = max,
-                            "chain API upstream answer passed max_response_bytes; closing the client connection"
-                        );
-                        return Poll::Ready(Some(Err(ResponseTooLarge.into())));
+            match item {
+                None => {
+                    this.hold = None;
+                    return Poll::Ready(None);
+                }
+                Some(Err(e)) => {
+                    this.hold = None;
+                    return Poll::Ready(Some(Err(e.into())));
+                }
+                Some(Ok(frame)) => {
+                    if let Some(max) = this.relay.max_bytes {
+                        if let Some(data) = frame.data_ref() {
+                            this.streamed = this.streamed.saturating_add(data.len() as u64);
+                            if this.streamed > max {
+                                let r = &this.relay;
+                                tracing::warn!(
+                                    listener = %r.listener,
+                                    server = %r.server,
+                                    api = %r.api,
+                                    path = %r.path(),
+                                    max_bytes = max,
+                                    "chain API upstream answer passed max_response_bytes; closing the client connection"
+                                );
+                                this.hold = None;
+                                return Poll::Ready(Some(Err(ResponseTooLarge.into())));
+                            }
+                        }
                     }
+                    return Poll::Ready(Some(Ok(frame)));
                 }
             }
-            return Poll::Ready(item);
         }
         let stall = this.relay.stall;
         let timer = this.timer.get_or_insert_with(|| Box::pin(sleep(stall)));
@@ -336,10 +455,11 @@ impl Body for StallGuard {
             listener = %r.listener,
             server = %r.server,
             api = %r.api,
-            path = %r.path,
+            path = %r.path(),
             stall_ms = u64::try_from(stall.as_millis()).unwrap_or(u64::MAX),
             "chain API upstream stopped sending its answer; closing the client connection"
         );
+        this.hold = None;
         Poll::Ready(Some(Err(UpstreamStalled.into())))
     }
 
@@ -363,40 +483,66 @@ pub enum Peeked {
     },
 }
 
-/// Read `body` whole if it is at most `limit` bytes.
+/// Read `body` whole if it is at most `limit` bytes. Single-chunk responses
+/// are returned directly with zero copy.
 pub async fn peek(mut body: Incoming, limit: usize) -> Result<Peeked, hyper::Error> {
-    let mut whole = BytesMut::new();
-    let mut prefix = VecDeque::new();
+    let mut first: Option<Bytes> = None;
+    let mut prefix: Option<VecDeque<Bytes>> = None;
     let mut read = 0usize;
     while let Some(frame) = body.frame().await {
         let Ok(data) = frame?.into_data() else {
             continue;
         };
+        if data.is_empty() {
+            continue;
+        }
         read += data.len();
-        prefix.push_back(data);
+        if let Some(q) = prefix.as_mut() {
+            q.push_back(data);
+        } else if let Some(prev) = first.take() {
+            let mut q = VecDeque::with_capacity(4);
+            q.push_back(prev);
+            q.push_back(data);
+            prefix = Some(q);
+        } else {
+            first = Some(data);
+        }
         if read > limit {
-            return Ok(Peeked::Partial { prefix, rest: body });
+            let q = match prefix {
+                Some(q) => q,
+                None => {
+                    let mut q = VecDeque::with_capacity(1);
+                    if let Some(chunk) = first {
+                        q.push_back(chunk);
+                    }
+                    q
+                }
+            };
+            return Ok(Peeked::Partial {
+                prefix: q,
+                rest: body,
+            });
         }
     }
-    for chunk in prefix {
-        whole.extend_from_slice(&chunk);
+    if let Some(q) = prefix {
+        let mut whole = BytesMut::with_capacity(read);
+        for chunk in q {
+            whole.extend_from_slice(&chunk);
+        }
+        Ok(Peeked::Whole(whole.freeze()))
+    } else {
+        Ok(Peeked::Whole(first.unwrap_or_default()))
     }
-    Ok(Peeked::Whole(whole.freeze()))
 }
 
-/// A body of already-read chunks followed by the rest of an upstream body.
-pub struct Replay {
+/// A body of already-read prefix chunks followed by the stall-guarded rest of
+/// an upstream body.
+pub struct ReplayBody {
     prefix: VecDeque<Bytes>,
-    rest: Incoming,
+    inner: StreamedBody<Incoming>,
 }
 
-impl Replay {
-    pub fn body(prefix: VecDeque<Bytes>, rest: Incoming) -> ApiBody {
-        Replay { prefix, rest }.boxed_unsync()
-    }
-}
-
-impl Body for Replay {
+impl Body for ReplayBody {
     type Data = Bytes;
     type Error = BoxError;
 
@@ -405,11 +551,39 @@ impl Body for Replay {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         if let Some(chunk) = self.prefix.pop_front() {
+            if let Some(max) = self.inner.relay.max_bytes {
+                self.inner.streamed = self.inner.streamed.saturating_add(chunk.len() as u64);
+                if self.inner.streamed > max {
+                    let r = &self.inner.relay;
+                    tracing::warn!(
+                        listener = %r.listener,
+                        server = %r.server,
+                        api = %r.api,
+                        path = %r.path(),
+                        max_bytes = max,
+                        "chain API upstream answer passed max_response_bytes; closing the client connection"
+                    );
+                    self.inner.hold = None;
+                    return Poll::Ready(Some(Err(ResponseTooLarge.into())));
+                }
+            }
             return Poll::Ready(Some(Ok(Frame::data(chunk))));
         }
-        Pin::new(&mut self.rest)
-            .poll_frame(cx)
-            .map_err(BoxError::from)
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.prefix.is_empty() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let mut hint = self.inner.size_hint();
+        let extra: u64 = self.prefix.iter().map(|b| b.len() as u64).sum();
+        hint.set_lower(hint.lower().saturating_add(extra));
+        if let Some(upper) = hint.upper() {
+            hint.set_upper(upper.saturating_add(extra));
+        }
+        hint
     }
 }
 
@@ -430,51 +604,9 @@ impl Hold {
     }
 }
 
-/// A body that keeps its [`Hold`] until it ends or is dropped.
-pub struct Held {
-    inner: ApiBody,
-    hold: Option<Hold>,
-}
-
-impl Held {
-    pub fn body(inner: ApiBody, hold: Hold) -> ApiBody {
-        Held {
-            inner,
-            hold: Some(hold),
-        }
-        .boxed_unsync()
-    }
-}
-
-impl Body for Held {
-    type Data = Bytes;
-    type Error = BoxError;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
-        let polled = Pin::new(&mut self.inner).poll_frame(cx);
-        if matches!(polled, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
-            self.hold = None;
-        }
-        polled
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
 /// A complete body.
 pub fn full(bytes: impl Into<Bytes>) -> ApiBody {
-    Full::new(bytes.into())
-        .map_err(|never| match never {})
-        .boxed_unsync()
+    ApiBody::Full(Full::new(bytes.into()))
 }
 
 #[cfg(test)]
@@ -498,7 +630,11 @@ mod tests {
         }
     }
 
-    async fn next(body: &mut ApiBody) -> Result<Bytes, BoxError> {
+    async fn next<B>(body: &mut StreamedBody<B>) -> Result<Bytes, BoxError>
+    where
+        B: Body<Data = Bytes> + Unpin,
+        B::Error: Into<BoxError>,
+    {
         let frame = body.frame().await.expect("a frame")?;
         Ok(frame.into_data().expect("data"))
     }
@@ -509,8 +645,8 @@ mod tests {
             max_bytes,
             listener: Arc::from("default"),
             server: Arc::from("live-1"),
-            api: "http://127.0.0.1:1".to_string(),
-            path: "/v1/chain/get_table_rows".to_string(),
+            api: Arc::from("http://127.0.0.1:1"),
+            target: Arc::from("/v1/chain/get_table_rows"),
         }
     }
 
@@ -521,7 +657,7 @@ mod tests {
     async fn an_upstream_body_that_stops_sending_fails_after_the_stall_time() {
         let stall = Duration::from_millis(200);
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let mut body = StallGuard::body(Fed(rx).boxed_unsync(), relay(stall, None));
+        let mut body = StreamedBody::new(Fed(rx), relay(stall, None), None);
         tx.send(Bytes::from_static(b"a")).await.unwrap();
         tokio::time::sleep(stall * 2).await;
         assert_eq!(next(&mut body).await.unwrap(), "a");
@@ -554,7 +690,7 @@ mod tests {
     async fn an_upstream_body_past_max_bytes_fails_with_response_too_large() {
         let stall = Duration::from_secs(5);
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let mut body = StallGuard::body(Fed(rx).boxed_unsync(), relay(stall, Some(5)));
+        let mut body = StreamedBody::new(Fed(rx), relay(stall, Some(5)), None);
         tx.send(Bytes::from_static(b"abc")).await.unwrap();
         tx.send(Bytes::from_static(b"de")).await.unwrap();
         tx.send(Bytes::from_static(b"f")).await.unwrap();
@@ -565,7 +701,7 @@ mod tests {
 
         // Without a limit, any length goes through.
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let mut body = StallGuard::body(Fed(rx).boxed_unsync(), relay(stall, None));
+        let mut body = StreamedBody::new(Fed(rx), relay(stall, None), None);
         let chunk = Bytes::from(vec![b'x'; 1 << 20]);
         for _ in 0..3 {
             tx.send(chunk.clone()).await.unwrap();
@@ -593,7 +729,7 @@ mod tests {
                 HeaderValue::from_static(value),
             );
         }
-        let relayed = relay_headers(&upstream);
+        let relayed = relay_headers_owned(upstream);
         let names: Vec<&str> = relayed.keys().map(|n| n.as_str()).collect();
         assert_eq!(
             names,

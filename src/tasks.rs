@@ -187,6 +187,11 @@ fn session_reconnect(sent_v1: bool, saw_status: bool) -> SessionEnd {
 /// Without this, tungstenite defaults to a 64 MiB message cap and no caller-supplied bound.
 pub(crate) fn upstream_ws_config(max_message_bytes: usize) -> WebSocketConfig {
     let mut config = WebSocketConfig::default();
+    // Monitor connections only receive small status replies (and the initial ABI)
+    // and send 1-byte status requests; 8 KiB / 4 KiB avoids 128 KiB idle buffers
+    // per upstream monitor.
+    config.read_buffer_size = 8 * 1024;
+    config.write_buffer_size = 4 * 1024;
     config.max_message_size = Some(max_message_bytes);
     config.max_frame_size = Some(max_message_bytes);
     config

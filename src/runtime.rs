@@ -208,6 +208,7 @@ enum Binding {
 
 struct Live {
     app: SharedState,
+    http_router: axum::Router,
     bindings: HashMap<SocketAddr, Binding>,
     draining: Vec<Arc<Generation>>,
 }
@@ -292,10 +293,12 @@ impl Runtime {
             streams: Arc::new(Semaphore::new(api::MAX_STREAMS)),
             dashboard_feed: Arc::default(),
         });
+        let http_router = crate::http::router(app.clone());
         let runtime = Arc::new(Self {
             path,
             live: RwLock::new(Arc::new(Live {
                 app,
+                http_router,
                 bindings: HashMap::new(),
                 draining: Vec::new(),
             })),
@@ -344,6 +347,9 @@ impl Runtime {
     }
     pub fn app(&self) -> SharedState {
         self.snapshot().app.clone()
+    }
+    pub fn http_router(&self) -> axum::Router {
+        self.snapshot().http_router.clone()
     }
 
     async fn prepare(&self, engine: &Engine, config: ServerConfig) -> Result<Prepared> {
@@ -509,8 +515,10 @@ impl Runtime {
             // retire immediately, avoiding duplicate idle monitors on reload.
             engine.draining.retain(|g| !g.empty());
             let app = self.make_app(engine, token, &old.app);
+            let http_router = crate::http::router(app.clone());
             *live = Arc::new(Live {
                 app,
+                http_router,
                 bindings,
                 draining: engine.draining.clone(),
             });
@@ -713,8 +721,10 @@ impl Runtime {
             let _change = telemetry::global().begin_change();
             let live = self.snapshot();
             let app = self.make_app(&engine, live.app.control_token.clone(), &live.app);
+            let http_router = crate::http::router(app.clone());
             *self.live.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(Live {
                 app,
+                http_router,
                 bindings: live.bindings.clone(),
                 draining: engine.draining.clone(),
             });

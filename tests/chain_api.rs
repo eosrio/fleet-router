@@ -720,14 +720,38 @@ async fn a_live_api_on_another_chain_is_not_used() {
 async fn busy_archives_are_skipped_and_their_limits_kept() {
     let first = frozen_node("archive-1", (2, 1001), (1, 1001), 4).await;
     let second = frozen_node("archive-2", (2, 1001), (1, 1001), 4).await;
-    let (_router, port) = start(config(
+    let mut cfg = config(
         &[
             Node::with(first.frozen((2, 1001)), json!({ "priority": 0 })),
             Node::with(second.frozen((2, 1001)), json!({ "priority": 1 })),
         ],
         json!({}),
-    ))
-    .await;
+    );
+    cfg["dashboard"] = json!({ "enabled": true });
+    let (router, port) = start(cfg).await;
+    // Wait until both archives pass startup verification so faulting archive-1
+    // cannot race with archive-2's initial probe.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Some((200, body)) = http_get(router.metrics(), "/api/v1/status").await {
+            if let Ok(doc) = serde_json::from_str::<Value>(&body) {
+                if let Some(upstreams) = doc["listeners"][0]["chain_api"]["upstreams"].as_array() {
+                    if upstreams.len() == 2
+                        && upstreams
+                            .iter()
+                            .all(|u| u["status"] == "up" && u["verified"] == true)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both archives never became verified"
+        );
+        sleep(POLL).await;
+    }
     wait_served(port, RAW_BLOCK, &raw(500), "archive-1").await;
     // A 503 moves on to the replica, and the busy archive is skipped for
     // 2 s.

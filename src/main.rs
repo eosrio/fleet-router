@@ -56,6 +56,7 @@ mod telemetry;
 #[cfg(test)]
 mod test_log;
 mod tls;
+mod ws_fast;
 mod zcd;
 
 #[tokio::main]

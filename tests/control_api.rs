@@ -22,9 +22,15 @@ type WsReader = futures::stream::SplitStream<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 >;
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+fn free_port_pair() -> (u16, u16) {
+    // Hold both listeners simultaneously so the OS cannot hand back the same
+    // ephemeral port for listen_port and metrics_port.
+    let listen = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let metrics = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    (
+        listen.local_addr().unwrap().port(),
+        metrics.local_addr().unwrap().port(),
+    )
 }
 
 struct Router {
@@ -32,6 +38,7 @@ struct Router {
     listen_port: u16,
     metrics_port: u16,
     _config: tempfile::NamedTempFile,
+    _stderr: tempfile::NamedTempFile,
 }
 
 impl Drop for Router {
@@ -42,9 +49,8 @@ impl Drop for Router {
 }
 
 impl Router {
-    fn start(endpoints: &[String], dashboard: Value) -> Self {
-        let listen_port = free_port();
-        let metrics_port = free_port();
+    fn spawn(endpoints: &[String], dashboard: &Value) -> Self {
+        let (listen_port, metrics_port) = free_port_pair();
         let servers: Vec<Value> = endpoints
             .iter()
             .enumerate()
@@ -72,13 +78,15 @@ impl Router {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(config.to_string().as_bytes()).unwrap();
         file.flush().unwrap();
+        let stderr_file = tempfile::NamedTempFile::new().unwrap();
+        let stderr_handle = stderr_file.reopen().unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_fleet-router"))
             .arg("run")
             .arg("--config")
             .arg(file.path())
             .env_remove("FLEET_ROUTER_CONTROL_TOKEN")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(stderr_handle))
             .spawn()
             .expect("failed to spawn fleet-router");
         Router {
@@ -86,7 +94,45 @@ impl Router {
             listen_port,
             metrics_port,
             _config: file,
+            _stderr: stderr_file,
         }
+    }
+
+    fn stderr_contents(&self) -> String {
+        std::fs::read_to_string(self._stderr.path()).unwrap_or_default()
+    }
+
+    async fn start(endpoints: &[String], dashboard: Value) -> Self {
+        let client = reqwest::Client::new();
+        for attempt in 0..3 {
+            let mut router = Self::spawn(endpoints, &dashboard);
+            for _ in 0..200 {
+                if client.get(router.url("/health")).send().await.is_ok() {
+                    return router;
+                }
+                if let Some(status) = router.child.try_wait().unwrap() {
+                    let stderr = router.stderr_contents();
+                    let addr_in_use = stderr.contains("Address already in use")
+                        || stderr.contains("AddrInUse")
+                        || stderr.contains("os error 98")
+                        || stderr.contains("os error 48")
+                        || stderr.contains("os error 10048");
+                    if addr_in_use && attempt < 2 {
+                        break;
+                    }
+                    panic!("fleet-router exited early ({status}):\n{stderr}");
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            if router.child.try_wait().unwrap().is_none() {
+                panic!(
+                    "fleet-router never answered /health on port {}:\n{}",
+                    router.metrics_port,
+                    router.stderr_contents()
+                );
+            }
+        }
+        panic!("fleet-router failed to bind ephemeral ports after 3 attempts");
     }
 
     fn url(&self, path: &str) -> String {
@@ -188,7 +234,8 @@ async fn restarted_synced_nodes_do_not_alternate_dashboard_lag() {
     let router = Router::start(
         &[ep_a.clone(), ep_b.clone()],
         serde_json::json!({ "enabled": true }),
-    );
+    )
+    .await;
     let http = reqwest::Client::new();
     router.wait_until_all_up(&http, 2).await;
 
@@ -280,7 +327,8 @@ async fn drain_moves_a_live_session_without_a_reconnect_and_close_ends_it() {
     let router = Router::start(
         &[ep1.clone(), ep2.clone()],
         serde_json::json!({ "enabled": true, "control_token": TOKEN }),
-    );
+    )
+    .await;
     let http = reqwest::Client::new();
     router.wait_until_all_up(&http, 2).await;
 
@@ -380,14 +428,8 @@ async fn dashboard_is_off_unless_enabled_and_control_is_off_without_a_token() {
     let ep1 = mock1.endpoint();
     let h1 = mock1.start();
 
-    let router = Router::start(std::slice::from_ref(&ep1), serde_json::json!({}));
+    let router = Router::start(std::slice::from_ref(&ep1), serde_json::json!({})).await;
     let http = reqwest::Client::new();
-    for _ in 0..100 {
-        if http.get(router.url("/health")).send().await.is_ok() {
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
     let resp = http.get(router.url("/api/v1/status")).send().await.unwrap();
     assert_eq!(resp.status(), 404);
     let resp = http.get(router.url("/ui/")).send().await.unwrap();
@@ -397,7 +439,8 @@ async fn dashboard_is_off_unless_enabled_and_control_is_off_without_a_token() {
     let router = Router::start(
         std::slice::from_ref(&ep1),
         serde_json::json!({ "enabled": true }),
-    );
+    )
+    .await;
     router.wait_until_all_up(&http, 1).await;
     let status: Value = http
         .get(router.url("/api/v1/status"))
@@ -442,7 +485,8 @@ async fn drain_keeps_a_history_reader_that_no_other_upstream_can_serve() {
     let router = Router::start(
         &[archive_ep.clone(), pruned_ep],
         serde_json::json!({ "enabled": true, "control_token": TOKEN }),
-    );
+    )
+    .await;
     let http = reqwest::Client::new();
     router.wait_until_all_up(&http, 2).await;
 

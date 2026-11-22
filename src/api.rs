@@ -100,6 +100,7 @@ pub const MAX_STREAMS: usize = 32;
 pub struct StateHandle {
     runtime: std::sync::Weak<crate::runtime::Runtime>,
     fallback: Option<SharedState>,
+    fallback_router: Option<Router>,
 }
 
 impl StateHandle {
@@ -109,13 +110,22 @@ impl StateHandle {
             .map(|r| r.app())
             .or_else(|| self.fallback.clone())
     }
+
+    pub fn current_router(&self) -> Option<Router> {
+        self.runtime
+            .upgrade()
+            .map(|r| r.http_router())
+            .or_else(|| self.fallback_router.clone())
+    }
 }
 
 impl AppState {
     pub fn handle(self: &Arc<Self>) -> StateHandle {
+        let standalone = self.runtime.strong_count() == 0;
         StateHandle {
             runtime: self.runtime.clone(),
-            fallback: (self.runtime.strong_count() == 0).then(|| self.clone()),
+            fallback: standalone.then(|| self.clone()),
+            fallback_router: standalone.then(|| crate::http::router(self.clone())),
         }
     }
 

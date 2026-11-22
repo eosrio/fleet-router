@@ -12,7 +12,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::abi::fnv1a64;
 use crate::models::{HistoryPreference, Role, StitchingPolicy};
 use crate::ship::{wire, BlockPos};
 
@@ -146,10 +145,16 @@ pub enum Step {
 
 /// Deterministic tie-break: `fnv1a64(session_id.to_le_bytes() ++ endpoint)`.
 pub fn rendezvous(session_id: u64, endpoint: &str) -> u64 {
-    let mut bytes = Vec::with_capacity(8 + endpoint.len());
-    bytes.extend_from_slice(&session_id.to_le_bytes());
-    bytes.extend_from_slice(endpoint.as_bytes());
-    fnv1a64(&bytes)
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for byte in session_id.to_le_bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(PRIME);
+    }
+    for &byte in endpoint.as_bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(PRIME);
+    }
+    hash
 }
 
 /// Whether `u` may serve block `n` of a request that needs `need`.
@@ -2561,5 +2566,20 @@ mod tests {
             }
         );
         assert_eq!(v.online, 1, "a disabled upstream is not counted online");
+    }
+
+    #[test]
+    fn streaming_rendezvous_matches_concatenated_fnv1a64() {
+        for (sid, ep) in [
+            (0u64, ""),
+            (1, "127.0.0.1:8080"),
+            (u64::MAX, "node-a.example.com:9000"),
+            (0x0123_4567_89ab_cdef, "[::1]:8080"),
+        ] {
+            let mut bytes = Vec::with_capacity(8 + ep.len());
+            bytes.extend_from_slice(&sid.to_le_bytes());
+            bytes.extend_from_slice(ep.as_bytes());
+            assert_eq!(rendezvous(sid, ep), crate::abi::fnv1a64(&bytes));
+        }
     }
 }

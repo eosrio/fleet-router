@@ -86,7 +86,7 @@ pub fn hint(ep: BlockEndpoint, body: &[u8]) -> Option<Hint> {
 /// fits in u64. fc reads such a string as a number whatever its length
 /// (boost `lexical_cast` skips leading zeros), so `"0000000000000000000005"`
 /// is block 5, not an id. Truncated to u32, as nodeos looks the block up.
-fn decimal(value: &Value) -> Option<u32> {
+fn decimal(value: &Value<'_>) -> Option<u32> {
     match value {
         Value::UInt(v) => Some(*v as u32),
         Value::Str(s) if (1..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()) => {
@@ -114,9 +114,11 @@ fn hex_block_num(s: &str) -> Option<u32> {
 
 /// The hint key's value, as far as the hint rules care.
 #[derive(Debug, PartialEq, Eq)]
-enum Value {
+enum Value<'a> {
     UInt(u64),
-    Str(String),
+    /// Borrowed directly from the request body (zero allocation; the body has
+    /// already been verified to contain no backslash escapes).
+    Str(&'a str),
     /// Anything else: negative, bool, null, object, array.
     Other,
 }
@@ -124,7 +126,7 @@ enum Value {
 /// The value of top-level `key` in a strict JSON object, or `None` when the
 /// body is not one, repeats a top-level key, holds a non-integer number
 /// anywhere, nests deeper than fc parses, or has no `key`.
-fn top_level_value(body: &[u8], key: &'static str) -> Option<Value> {
+fn top_level_value<'a>(body: &'a [u8], key: &'static str) -> Option<Value<'a>> {
     let mut de = serde_json::Deserializer::from_slice(body);
     let value = TopLevel { key }.deserialize(&mut de).ok()?;
     de.end().ok()?;
@@ -146,7 +148,7 @@ struct TopLevel {
 }
 
 impl<'de> DeserializeSeed<'de> for TopLevel {
-    type Value = Option<Value>;
+    type Value = Option<Value<'de>>;
 
     fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
         d.deserialize_map(self)
@@ -154,20 +156,38 @@ impl<'de> DeserializeSeed<'de> for TopLevel {
 }
 
 impl<'de> Visitor<'de> for TopLevel {
-    type Value = Option<Value>;
+    type Value = Option<Value<'de>>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a JSON object")
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let mut seen: HashSet<&'de str> = HashSet::new();
+        // Most block-endpoint bodies carry 1–2 top-level keys; track up to 8
+        // on the stack and spill to a HashSet only for larger objects.
+        let mut small: [&'de str; 8] = [""; 8];
+        let mut small_len = 0usize;
+        let mut overflow: Option<HashSet<&'de str>> = None;
         let mut found = None;
         // Keys borrow from the body: they hold no escapes, as the body holds
         // no backslash.
         while let Some(key) = map.next_key::<&'de str>()? {
-            if !seen.insert(key) {
+            if let Some(set) = overflow.as_mut() {
+                if !set.insert(key) {
+                    return Err(de::Error::custom("repeated top-level key"));
+                }
+            } else if small[..small_len].contains(&key) {
                 return Err(de::Error::custom("repeated top-level key"));
+            } else if small_len < small.len() {
+                small[small_len] = key;
+                small_len += 1;
+            } else {
+                let mut set = HashSet::with_capacity(16);
+                for &prev in &small {
+                    set.insert(prev);
+                }
+                set.insert(key);
+                overflow = Some(set);
             }
             // A member value that is a container opens level 2.
             if key == self.key {
@@ -265,9 +285,9 @@ struct HintValue {
 }
 
 impl<'de> DeserializeSeed<'de> for HintValue {
-    type Value = Value;
+    type Value = Value<'de>;
 
-    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Value<'de>, D::Error> {
         d.deserialize_any(HintValueVisitor { level: self.level })
     }
 }
@@ -277,16 +297,16 @@ struct HintValueVisitor {
 }
 
 impl<'de> Visitor<'de> for HintValueVisitor {
-    type Value = Value;
+    type Value = Value<'de>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("a JSON value without non-integer numbers")
     }
 
-    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Value, E> {
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Value<'de>, E> {
         Ok(Value::Other)
     }
-    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Value, E> {
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Value<'de>, E> {
         // serde_json reports non-negative integers through `visit_u64`; this
         // is a negative one.
         Ok(match u64::try_from(v) {
@@ -294,23 +314,28 @@ impl<'de> Visitor<'de> for HintValueVisitor {
             Err(_) => Value::Other,
         })
     }
-    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value<'de>, E> {
         Ok(Value::UInt(v))
     }
-    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Value, E> {
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Value<'de>, E> {
         Err(E::custom("non-integer number"))
     }
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<Value, E> {
-        Ok(Value::Str(v.to_owned()))
+    fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Value<'de>, E> {
+        Ok(Value::Str(v))
     }
-    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Value<'de>, E> {
+        // Bodies containing `\` were already rejected above, so `serde_json`
+        // always dispatches to `visit_borrowed_str`.
         Ok(Value::Other)
     }
-    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Value, A::Error> {
+    fn visit_unit<E: de::Error>(self) -> Result<Value<'de>, E> {
+        Ok(Value::Other)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Value<'de>, A::Error> {
         Nested { level: self.level }.visit_seq(seq)?;
         Ok(Value::Other)
     }
-    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Value, A::Error> {
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Value<'de>, A::Error> {
         Nested { level: self.level }.visit_map(map)?;
         Ok(Value::Other)
     }
@@ -668,5 +693,18 @@ mod tests {
         }
         // The same short id is routable for the other endpoints.
         assert_eq!(h(RAW, r#"{"block_num_or_id":"0a"}"#), Some(0x0a00_0000));
+    }
+
+    #[test]
+    fn many_top_level_keys_spill_from_stack_and_still_detect_duplicates() {
+        let ok =
+            r#"{"k1":1,"k2":2,"k3":3,"k4":4,"k5":5,"k6":6,"k7":7,"k8":8,"k9":9,"block_num":42}"#;
+        assert_eq!(h(INFO, ok), Some(42));
+        // Duplicate of a key that was inserted before spilling past 8 keys.
+        let dup_early = r#"{"k1":1,"k2":2,"k3":3,"k4":4,"k5":5,"k6":6,"k7":7,"k8":8,"k9":9,"k1":10,"block_num":42}"#;
+        assert_eq!(h(INFO, dup_early), None);
+        // Duplicate of a key inserted after spilling past 8 keys.
+        let dup_late = r#"{"k1":1,"k2":2,"k3":3,"k4":4,"k5":5,"k6":6,"k7":7,"k8":8,"k9":9,"k9":10,"block_num":42}"#;
+        assert_eq!(h(INFO, dup_late), None);
     }
 }

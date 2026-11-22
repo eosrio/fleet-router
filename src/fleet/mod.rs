@@ -449,9 +449,19 @@ pub struct ObservedTip {
     head_num: AtomicU32,
     lib_num: AtomicU32,
     inner: Mutex<Option<(BlockPos, BlockPos)>>,
+    tip_seq: Option<Arc<AtomicU64>>,
 }
 
 impl ObservedTip {
+    fn with_seq(tip_seq: Arc<AtomicU64>) -> Self {
+        Self {
+            head_num: AtomicU32::new(0),
+            lib_num: AtomicU32::new(0),
+            inner: Mutex::new(None),
+            tip_seq: Some(tip_seq),
+        }
+    }
+
     /// Record a frame's head and LIB. Locks only when head or LIB grows.
     pub fn observe(&self, head: BlockPos, lib: BlockPos) {
         if head.num <= self.head_num.load(Ordering::Relaxed)
@@ -460,7 +470,8 @@ impl ObservedTip {
             return;
         }
         let mut inner = lock(&self.inner);
-        let (head, lib) = match *inner {
+        let prev = *inner;
+        let (head, lib) = match prev {
             Some((seen_head, seen_lib)) => (
                 if head.num > seen_head.num {
                     head
@@ -475,14 +486,25 @@ impl ObservedTip {
             ),
             None => (head, lib),
         };
-        *inner = Some((head, lib));
-        self.head_num.store(head.num, Ordering::Relaxed);
-        self.lib_num.store(lib.num, Ordering::Relaxed);
+        if prev != Some((head, lib)) {
+            *inner = Some((head, lib));
+            self.head_num.store(head.num, Ordering::Relaxed);
+            self.lib_num.store(lib.num, Ordering::Relaxed);
+            if let Some(seq) = &self.tip_seq {
+                seq.fetch_add(1, Ordering::Release);
+            }
+        }
     }
 
     /// The highest `(head, lib)` observed so far.
     pub fn get(&self) -> Option<(BlockPos, BlockPos)> {
         *lock(&self.inner)
+    }
+
+    /// Lock-free read of the highest observed head block number, if any.
+    pub fn head_num(&self) -> Option<u32> {
+        let n = self.head_num.load(Ordering::Relaxed);
+        (n > 0).then_some(n)
     }
 }
 
@@ -505,6 +527,9 @@ pub struct FleetHub {
     statics: Vec<UpstreamStatic>,
     view_tx: watch::Sender<Arc<FleetView>>,
     mem: Mutex<HubMemory>,
+    /// Monotonic counter bumped whenever any `ObservedTip` advances or a new
+    /// `FleetView` is published, allowing sessions to cache `fresh_tip`.
+    tip_seq: Arc<AtomicU64>,
 }
 
 impl FleetHub {
@@ -525,9 +550,10 @@ impl FleetHub {
                 url: Arc::from(s.ws_url()),
             })
             .collect();
+        let tip_seq = Arc::new(AtomicU64::new(1));
         let tips: Vec<Arc<ObservedTip>> = statics
             .iter()
-            .map(|_| Arc::new(ObservedTip::default()))
+            .map(|_| Arc::new(ObservedTip::with_seq(tip_seq.clone())))
             .collect();
         let (view_tx, _) = watch::channel(Arc::new(FleetView::empty(
             resolved.topology,
@@ -549,6 +575,7 @@ impl FleetHub {
             statics,
             view_tx,
             mem: Mutex::new(HubMemory::new(Instant::now())),
+            tip_seq,
         });
         // The maps were just built, so nothing else holds the lock.
         if let Ok(states) = hub.state.try_lock() {
@@ -582,6 +609,13 @@ impl FleetHub {
         mem.generation += 1;
         view.generation = mem.generation;
         self.view_tx.send_replace(Arc::new(view));
+        self.tip_seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// Current sequence number for [`Self::fresh_tip`] caching.
+    #[inline]
+    pub fn tip_seq(&self) -> u64 {
+        self.tip_seq.load(Ordering::Acquire)
     }
 
     /// Lock the state map and [`Self::rebuild`] from it.

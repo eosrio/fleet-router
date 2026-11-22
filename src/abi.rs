@@ -23,11 +23,70 @@
 //! `request` / `result` variants line up with Spring's. Two upstreams with the
 //! same fingerprint send the same ABI. A mismatch is reported, never rejected.
 
+use std::collections::VecDeque;
 use std::ffi::CString;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use rs_abieos::{AbiHandle, AbieosError};
 use serde_json::Value;
+
+/// Upper bound on distinct raw ABI texts cached in-process.
+/// In practice a fleet serves 1–4 distinct ABI payloads across all upstreams.
+const ABI_CACHE_CAP: usize = 32;
+
+struct CachedAbi {
+    raw_hash: u64,
+    raw: Box<str>,
+    fp: u64,
+    valid: Result<(), String>,
+}
+
+fn abi_cache() -> &'static RwLock<VecDeque<CachedAbi>> {
+    static CACHE: OnceLock<RwLock<VecDeque<CachedAbi>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(VecDeque::with_capacity(ABI_CACHE_CAP)))
+}
+
+fn lookup_or_insert_abi(text: &str) -> (u64, Result<(), String>) {
+    let raw_hash = fnv1a64(text.as_bytes());
+    {
+        let cache = abi_cache().read().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = cache
+            .iter()
+            .find(|e| e.raw_hash == raw_hash && &*e.raw == text)
+        {
+            return (entry.fp, entry.valid.clone());
+        }
+    }
+
+    let valid = match CString::new(text) {
+        Err(_) => Err("interior NUL byte in input".to_string()),
+        Ok(_) => parse_upstream_abi(text)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+    };
+    let fp = match serde_json::from_str::<Value>(text) {
+        Ok(value) => fingerprint_value(&value),
+        Err(_) => raw_hash,
+    };
+
+    let mut cache = abi_cache().write().unwrap_or_else(|p| p.into_inner());
+    if let Some(entry) = cache
+        .iter()
+        .find(|e| e.raw_hash == raw_hash && &*e.raw == text)
+    {
+        return (entry.fp, entry.valid.clone());
+    }
+    if cache.len() >= ABI_CACHE_CAP {
+        cache.pop_front();
+    }
+    cache.push_back(CachedAbi {
+        raw_hash,
+        raw: text.into(),
+        fp,
+        valid: valid.clone(),
+    });
+    (fp, valid)
+}
 
 /// Spring's `request` variant, in index order. Older nodes serve a prefix.
 const SPRING_REQUEST_TYPES: [&str; 5] = [
@@ -92,9 +151,19 @@ pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
 /// The text is parsed as JSON and written back with object keys sorted, then
 /// hashed with [`fnv1a64`]. Text that is not JSON is hashed as raw bytes.
 pub fn abi_fingerprint(text: &str) -> u64 {
+    let raw_hash = fnv1a64(text.as_bytes());
+    {
+        let cache = abi_cache().read().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = cache
+            .iter()
+            .find(|e| e.raw_hash == raw_hash && &*e.raw == text)
+        {
+            return entry.fp;
+        }
+    }
     match serde_json::from_str::<Value>(text) {
         Ok(value) => fingerprint_value(&value),
-        Err(_) => fnv1a64(text.as_bytes()),
+        Err(_) => raw_hash,
     }
 }
 
@@ -188,8 +257,10 @@ pub(crate) fn parse_upstream_abi(abi_json: &str) -> Result<AbiHandle, AbieosErro
 /// [`AbieosError::SetAbi`]). On the rust backend a failed `set_abi*` is
 /// `Err`, never `Ok(false)`.
 pub(crate) fn accept_upstream_abi(abi_json: &str) -> Result<(), AbieosError> {
-    CString::new(abi_json).map_err(|_| AbieosError::SetAbi("interior NUL byte in input".into()))?;
-    parse_upstream_abi(abi_json).map(|_| ())
+    match lookup_or_insert_abi(abi_json).1 {
+        Ok(()) => Ok(()),
+        Err(msg) => Err(AbieosError::SetAbi(msg)),
+    }
 }
 
 #[cfg(test)]
@@ -378,5 +449,26 @@ mod tests {
         let garbage = AbiEntry::new("{");
         assert_eq!(garbage.fp, fnv1a64(b"{"));
         assert!(!garbage.compatible);
+    }
+
+    #[test]
+    fn abi_cache_is_bounded_and_matches_uncached_validation_and_fingerprint() {
+        // Fill past ABI_CACHE_CAP with distinct valid ABIs and verify both
+        // cached and evicted entries stay exact.
+        for i in 0..40 {
+            let text = abi_with_action(&format!("act{i}"));
+            assert!(accept_upstream_abi(&text).is_ok());
+            assert!(accept_upstream_abi(&text).is_ok());
+            let expected_fp = AbiEntry::new(&text).fp;
+            assert_eq!(abi_fingerprint(&text), expected_fp);
+        }
+        assert!(accept_upstream_abi("not valid json").is_err());
+        assert!(accept_upstream_abi("not valid json").is_err());
+        assert!(accept_upstream_abi("{\0}").is_err());
+        let len = super::abi_cache()
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        assert!(len <= super::ABI_CACHE_CAP, "cache exceeded cap: {len}");
     }
 }

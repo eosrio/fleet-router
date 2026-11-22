@@ -14,15 +14,13 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures::stream::{SplitSink, SplitStream};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, timeout_at, Instant};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{client_async_tls_with_config, MaybeTlsStream, WebSocketStream};
 use tracing::Instrument;
@@ -33,12 +31,15 @@ use crate::fleet::{DialFailure, FleetHub, LinkPurpose};
 use crate::models::{ProxyLimits, ResolvedTopology, Role, UpstreamCounters};
 use crate::ship::wire::BlocksRequest;
 use crate::ship::BlockPos;
+use crate::ws_fast::{FastWs, FastWsConfig, WsRole};
 
 use super::client::{ClientSide, RESUME_POSITIONS};
 use super::failover::UpEnd;
 
 /// An upstream WebSocket whose transport reads are timestamped.
-pub(super) type UpstreamWs = WebSocketStream<MaybeTlsStream<ActivityStream<TcpStream>>>;
+pub(super) type UpstreamStream = MaybeTlsStream<ActivityStream<TcpStream>>;
+pub(super) type UpstreamWs = FastWs<UpstreamStream>;
+type HandshakeWs = WebSocketStream<UpstreamStream>;
 
 /// Upstream picks per connect or failover before the client is closed. A pick
 /// that finds no candidate ends the attempts.
@@ -708,6 +709,9 @@ async fn dial(
     let stream = ActivityStream::new(tcp, activity.clone(), epoch);
 
     let mut config = WebSocketConfig::default();
+    // Upstream SHiP links read blocks and write tiny ACKs/requests.
+    config.read_buffer_size = 64 * 1024;
+    config.write_buffer_size = 4 * 1024;
     config.max_message_size = Some(limits.max_message_bytes);
     config.max_frame_size = Some(limits.max_message_bytes);
     let upgrade = client_async_tls_with_config(&*url, stream, Some(config), None);
@@ -736,8 +740,17 @@ async fn dial(
         let _ = ws.close(None).await;
         return Err(DialError::AbiInvalid(e.to_string()));
     }
+    let fast_ws = FastWs::new(
+        ws.into_inner(),
+        FastWsConfig {
+            role: WsRole::Client,
+            read_buf_cap: 64 * 1024,
+            max_message_size: limits.max_message_bytes,
+            max_frame_size: limits.max_message_bytes,
+        },
+    );
     Ok(Established {
-        ws,
+        ws: fast_ws,
         abi,
         activity,
         guard,
@@ -747,7 +760,7 @@ async fn dial(
 /// Read the upstream's first meaningful frame, which must be the Text ABI.
 /// Leading Ping/Pong control frames are skipped. One deadline covers the
 /// whole read, so a peer that drips control frames cannot extend it.
-async fn read_first_abi(ws: &mut UpstreamWs, wait: Duration) -> Result<String, DialError> {
+async fn read_first_abi(ws: &mut HandshakeWs, wait: Duration) -> Result<String, DialError> {
     let read = async {
         loop {
             match ws.next().await {
@@ -776,8 +789,7 @@ pub(super) struct Link {
     pub st: LinkState,
     pub endpoint: Arc<str>,
     pub name: Arc<str>,
-    pub tx: SplitSink<UpstreamWs, Message>,
-    pub rx: SplitStream<UpstreamWs>,
+    pub ws: UpstreamWs,
     /// Milliseconds since the session epoch of the last transport read.
     pub activity: Arc<AtomicU64>,
     /// The upstream's cumulative counters.
@@ -787,15 +799,13 @@ pub(super) struct Link {
 
 impl Link {
     pub fn new(target: &DialTarget, est: Established, now: Instant) -> Self {
-        let (tx, rx) = est.ws.split();
         let mut st = LinkState::new(target.up, target.role, now);
         st.data_ms = est.activity.load(Ordering::Relaxed);
         Link {
             st,
             endpoint: target.endpoint.clone(),
             name: target.name.clone(),
-            tx,
-            rx,
+            ws: est.ws,
             activity: est.activity,
             counters: target.counters.clone(),
             guard: est.guard,
@@ -810,7 +820,7 @@ impl Link {
     /// Send a liveness ping. Bounded, so a stuck socket cannot hold the
     /// session loop.
     pub async fn ping(&mut self) {
-        let ping = self.tx.send(Message::Ping(LIVENESS_PING.into()));
+        let ping = self.ws.send_message(Message::Ping(LIVENESS_PING.into()));
         if !matches!(timeout(Duration::from_secs(1), ping).await, Ok(Ok(()))) {
             tracing::debug!(upstream = %self.endpoint, "liveness ping to upstream not sent");
         }
@@ -819,21 +829,9 @@ impl Link {
     /// Close the socket in the background (Close 1000, at most 1 s) and keep
     /// only the connection slot.
     pub fn close_quietly(self) -> ConnectionGuard {
-        let Link {
-            mut tx, rx, guard, ..
-        } = self;
+        let Link { mut ws, guard, .. } = self;
         tokio::spawn(async move {
-            let _ = timeout(Duration::from_secs(1), async {
-                let _ = tx
-                    .send(Message::Close(Some(CloseFrame {
-                        code: CloseCode::Normal,
-                        reason: "".into(),
-                    })))
-                    .await;
-                let _ = tx.close().await;
-            })
-            .await;
-            drop(rx);
+            let _ = timeout(Duration::from_secs(1), ws.close_quietly_now()).await;
         });
         guard
     }

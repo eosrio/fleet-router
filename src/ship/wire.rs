@@ -371,6 +371,7 @@ pub fn read_head_lib(frame: &[u8]) -> Option<(BlockPos, BlockPos)> {
 /// Valid for get_blocks_result_v0/v1 and get_status_result_v0/v1 (identical
 /// offsets; variant indices < 128). A frame shorter than 73 bytes cannot hold
 /// both positions and is returned unchanged.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn patch_head_lib(frame: Bytes, head: BlockPos, lib: BlockPos) -> Bytes {
     if frame.len() < HEAD_LIB_END {
         return frame;

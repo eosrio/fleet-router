@@ -87,11 +87,11 @@ pub async fn connection(
     let state = app.handle();
     drop(app);
     let service = hyper::service::service_fn(move |request| {
-        let app = state.current();
+        let router = state.current_router();
         async move {
-            match app {
-                Some(app) => {
-                    let service = TowerToHyperService::new(router(app));
+            match router {
+                Some(router) => {
+                    let service = TowerToHyperService::new(router);
                     hyper::service::Service::call(&service, request).await
                 }
                 None => Ok(StatusCode::SERVICE_UNAVAILABLE.into_response()),

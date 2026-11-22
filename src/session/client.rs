@@ -97,6 +97,9 @@ impl DeliveredRing {
             while self.buf.len() > 1 && self.buf.front().is_some_and(|f| f.num <= lib.num) {
                 self.buf.pop_front();
             }
+            if self.buf.len() <= 32 && self.buf.capacity() > 512 {
+                self.buf.shrink_to(128);
+            }
         }
         while self.buf.len() > DELIVERED_CAP {
             self.buf.pop_front();
@@ -1231,5 +1234,23 @@ mod tests {
         assert!(request_is_empty(&r(100, 50, vec![60])));
         assert!(!request_is_empty(&r(100, 50, vec![40])));
         assert!(!request_is_empty(&r(100, 101, vec![])));
+    }
+
+    #[test]
+    fn delivered_ring_shrinks_after_lib_catches_up() {
+        let mut ring = DeliveredRing::default();
+        for n in 1..=1_000 {
+            ring.push(pos(n), Some(pos(1)));
+        }
+        assert!(ring.buf.capacity() > 512);
+        ring.push(pos(1_001), Some(pos(999)));
+        assert_eq!(ring.len(), 2);
+        assert!(
+            ring.buf.capacity() <= 256,
+            "expected ring capacity to shrink after LIB catch-up, got {}",
+            ring.buf.capacity()
+        );
+        assert_eq!(ring.get(1_000), Some(pos(1_000).id));
+        assert_eq!(ring.get(1_001), Some(pos(1_001).id));
     }
 }

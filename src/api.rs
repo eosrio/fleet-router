@@ -100,6 +100,7 @@ pub const MAX_STREAMS: usize = 32;
 pub struct StateHandle {
     runtime: std::sync::Weak<crate::runtime::Runtime>,
     fallback: Option<SharedState>,
+    fallback_router: Option<Router>,
 }
 
 impl StateHandle {
@@ -109,13 +110,22 @@ impl StateHandle {
             .map(|r| r.app())
             .or_else(|| self.fallback.clone())
     }
+
+    pub fn current_router(&self) -> Option<Router> {
+        self.runtime
+            .upgrade()
+            .map(|r| r.http_router())
+            .or_else(|| self.fallback_router.clone())
+    }
 }
 
 impl AppState {
     pub fn handle(self: &Arc<Self>) -> StateHandle {
+        let standalone = self.runtime.strong_count() == 0;
         StateHandle {
             runtime: self.runtime.clone(),
-            fallback: (self.runtime.strong_count() == 0).then(|| self.clone()),
+            fallback: standalone.then(|| self.clone()),
+            fallback_router: standalone.then(|| crate::http::router(self.clone())),
         }
     }
 
@@ -408,7 +418,7 @@ fn upstream_view(
 }
 
 async fn listener_view(ctx: &ListenerContext, now: Instant, sessions: usize) -> ListenerView {
-    let configs = ctx.config_db.lock().await.clone();
+    let configs = ctx.config_db.lock().await;
     let mut db = ctx.health.state_db.lock().await;
     let mut upstreams = Vec::with_capacity(db.len());
     for endpoint in &ctx.order {
@@ -423,6 +433,7 @@ async fn listener_view(ctx: &ListenerContext, now: Instant, sessions: usize) -> 
         }
     }
     drop(db);
+    drop(configs);
     // The verdict of `/ready`: a stitched listener needs a live upstream.
     let ready = crate::health::tip_ready(&ctx.health).await;
     ListenerView {

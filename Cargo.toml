@@ -68,3 +68,8 @@ mock-ship = { path = "mock-ship" }
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 reqwest = { version = "0.13", features = ["json"] }
 serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

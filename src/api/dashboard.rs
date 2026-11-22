@@ -79,6 +79,10 @@ impl Default for Feed {
 }
 
 impl Feed {
+    pub(crate) fn has_subscribers(&self) -> bool {
+        self.updates.receiver_count() > 0
+    }
+
     fn cache(&self) -> MutexGuard<'_, Cache> {
         self.cache.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -92,15 +96,19 @@ impl Feed {
     ) -> Result<(), serde_json::Error> {
         let mut cache = self.cache();
         let revision = cache.latest.as_ref().map_or(1, |s| s.revision + 1);
-        let data = serde_json::to_string(&Frame {
-            revision,
-            bootstrap: false,
-            status: &status,
-            sessions: &sessions,
-            events: &events,
-            sample: sample.as_ref(),
-            history: None,
-        })?;
+        let encoded = if self.updates.receiver_count() > 0 {
+            Some(serde_json::to_string(&Frame {
+                revision,
+                bootstrap: false,
+                status: &status,
+                sessions: &sessions,
+                events: &events,
+                sample: sample.as_ref(),
+                history: None,
+            })?)
+        } else {
+            None
+        };
         if let Some(sample) = sample {
             cache.history.push_back(sample);
             if cache.history.len() > HISTORY_SAMPLES {
@@ -116,7 +124,9 @@ impl Feed {
             sessions,
         }));
         drop(cache);
-        let _ = self.updates.send(Arc::new(Update { revision, data }));
+        if let Some(data) = encoded {
+            let _ = self.updates.send(Arc::new(Update { revision, data }));
+        }
         Ok(())
     }
 
@@ -296,6 +306,24 @@ pub async fn run(app: SharedState, mut shutdown: broadcast::Receiver<()>) {
     let mut next_sample = Instant::now();
     let mut next_publish = next_sample;
     loop {
+        let Some(cur) = state.current() else {
+            break;
+        };
+        if !cur.dashboard && !cur.dashboard_feed.has_subscribers() {
+            // Dashboard is off and no legacy SSE stream is still open: stay
+            // completely quiet (no 1 Hz snapshots or history allocations)
+            // until shutdown or a reload wakes telemetry.
+            drop(cur);
+            tokio::select! {
+                _ = shutdown.recv() => break,
+                _ = telemetry.changed.notified() => {
+                    next_sample = Instant::now();
+                    next_publish = next_sample;
+                    continue;
+                }
+            }
+        }
+        drop(cur);
         tokio::select! {
             _ = shutdown.recv() => break,
             _ = sleep_until(next_sample) => {},
@@ -308,6 +336,9 @@ pub async fn run(app: SharedState, mut shutdown: broadcast::Receiver<()>) {
         let Some(app) = state.current() else {
             break;
         };
+        if !app.dashboard && !app.dashboard_feed.has_subscribers() {
+            continue;
+        }
         let Capture {
             status,
             sessions,

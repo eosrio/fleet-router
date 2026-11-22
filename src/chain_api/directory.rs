@@ -151,7 +151,7 @@ pub struct ApiSlot {
     /// `host:port` as configured: the upstream `Host`.
     pub authority: HeaderValue,
     /// `http://host:port`.
-    pub base: String,
+    pub base: Arc<str>,
     /// A frozen server's configured `range`.
     pub declared: Option<Range>,
     /// Requests this API may have in flight (`max_in_flight_per_upstream`,
@@ -190,7 +190,7 @@ impl ApiSlot {
             endpoint: Arc::from(upstream.api.canonical()),
             authority: HeaderValue::from_str(&authority)
                 .expect("a validated api_endpoint is a valid Host value"),
-            base: upstream.api.base_url(),
+            base: Arc::from(upstream.api.base_url()),
             declared: upstream.range.filter(|_| upstream.role == Role::Frozen),
             cap: AtomicUsize::new(cap.max(1)),
             in_flight: AtomicUsize::new(0),
@@ -410,11 +410,7 @@ impl ApiDirectory {
                 let state = slot.state();
                 let ship_head = || {
                     let reported = upstream.and_then(|u| u.head).map(|p| p.num);
-                    let streamed = hub
-                        .tips
-                        .get(slot.index)
-                        .and_then(|tip| tip.get())
-                        .map(|(head, _)| head.num);
+                    let streamed = hub.tips.get(slot.index).and_then(|tip| tip.head_num());
                     reported.max(streamed)
                 };
                 let head = match slot.role {
@@ -563,7 +559,7 @@ mod tests {
         assert!(dir.slot(4).is_none());
         assert_eq!(&*slot.endpoint, "node-3.example:8888");
         assert_eq!(slot.authority, "Node-3.Example:8888");
-        assert_eq!(slot.base, "http://Node-3.Example:8888");
+        assert_eq!(&*slot.base, "http://Node-3.Example:8888");
         assert_eq!(slot.weight, 1, "a zero weight counts as 1");
         assert_eq!(
             slot.declared,

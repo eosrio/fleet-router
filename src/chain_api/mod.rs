@@ -77,8 +77,8 @@ use route::{BlockEndpoint, Route};
 use socket::Socket;
 use stats::{AnswerRole, ApiStats, BlockRegion, PushResult, Rejection, UpstreamResult};
 use upstream::{
-    full, peek, streamed, ApiBody, Attempt, Buffered, Call, Hold, Peeked, Relay, Replay,
-    StallGuard, UpstreamClient,
+    full, peek, replayed, streamed, ApiBody, Attempt, Buffered, Call, Hold, Peeked, Relay,
+    UpstreamClient,
 };
 
 /// Largest request head and buffered body chunk read from a client.
@@ -316,6 +316,8 @@ fn answer_role(role: Option<Role>) -> AnswerRole {
 /// One listener's chain API.
 pub struct ChainApiCtx {
     pub listener: Option<Arc<str>>,
+    /// Cached label for logs and relays (`listener` name or `"default"`).
+    listener_label: Arc<str>,
     /// `host:port` it is bound to.
     pub bind: String,
     cfg: ChainApiConfig,
@@ -375,8 +377,11 @@ impl ChainApiCtx {
         tls: Option<TlsAcceptorHandle>,
     ) -> Arc<ChainApiCtx> {
         let cfg = api.cfg.clone();
+        let listener: Option<Arc<str>> = api.listener.as_deref().map(Arc::from);
+        let listener_label = listener.clone().unwrap_or_else(|| Arc::from("default"));
         Arc::new(ChainApiCtx {
-            listener: api.listener.as_deref().map(Arc::from),
+            listener,
+            listener_label,
             bind: api.bind.clone(),
             hub,
             directory: Arc::new(ApiDirectory::new(
@@ -627,7 +632,7 @@ impl ChainApiCtx {
         parts: hyper::http::request::Parts,
         body: Bytes,
     ) -> Answered {
-        let target = route::origin_target(&parts.uri).unwrap_or("/").to_string();
+        let target = route::origin_target(&parts.uri).unwrap_or("/");
         let Ok(permit) = self.in_flight.clone().try_acquire_owned() else {
             self.stats.rejected.inc(Rejection::InFlight);
             return Answered::router(busy(Busy::InFlight(self.cfg.max_in_flight)), 0);
@@ -637,7 +642,7 @@ impl ChainApiCtx {
             _permit: permit,
             stats: self.stats.clone(),
         });
-        let call = Call::new(parts.method, &target, &parts.headers, body);
+        let call = Call::new(parts.method, target, &parts.headers, body);
         let deadline = Instant::now() + Duration::from_millis(self.cfg.request_deadline_ms);
         match route {
             Route::Block(ep) => self.block(ep, &call, deadline, &mut permit).await,
@@ -657,28 +662,49 @@ impl ChainApiCtx {
 
     /// The whole body, within `max_body_bytes` and the read timeout. Without
     /// `keep` it is read and dropped: the router answers such a request
-    /// itself.
+    /// itself. Fast-paths empty bodies (skipping timeout timer registration)
+    /// and single-chunk bodies (zero copy).
     async fn read_body(&self, mut body: Incoming, keep: bool) -> Result<Bytes, BodyError> {
+        if body.is_end_stream() {
+            return Ok(Bytes::new());
+        }
         let max = self.cfg.max_body_bytes;
         if body.size_hint().exact().is_some_and(|len| len > max as u64) {
             return Err(BodyError::TooLarge);
         }
         let read = async {
-            let mut buf = BytesMut::new();
+            let mut single: Option<Bytes> = None;
+            let mut buf: Option<BytesMut> = None;
             let mut len = 0usize;
             while let Some(frame) = body.frame().await {
                 let frame = frame.map_err(|_| BodyError::Failed)?;
                 if let Ok(data) = frame.into_data() {
+                    if data.is_empty() {
+                        continue;
+                    }
                     len += data.len();
                     if len > max {
                         return Err(BodyError::TooLarge);
                     }
                     if keep {
-                        buf.extend_from_slice(&data);
+                        if let Some(b) = buf.as_mut() {
+                            b.extend_from_slice(&data);
+                        } else if let Some(prev) = single.take() {
+                            let mut b = BytesMut::with_capacity(prev.len() + data.len());
+                            b.extend_from_slice(&prev);
+                            b.extend_from_slice(&data);
+                            buf = Some(b);
+                        } else {
+                            single = Some(data);
+                        }
                     }
                 }
             }
-            Ok(buf.freeze())
+            if let Some(b) = buf {
+                Ok(b.freeze())
+            } else {
+                Ok(single.unwrap_or_default())
+            }
         };
         let deadline = tokio::time::Instant::now() + self.read_timeout;
         timeout_at(deadline, read)
@@ -986,15 +1012,13 @@ impl ChainApiCtx {
                     slot.record(result_of(status, None), head_elapsed);
                     // Of unknown length (a known one would not need the
                     // peek): `max_response_bytes` can only cut it off.
-                    let mut out = Response::new(upstream::Held::body(
-                        StallGuard::body(
-                            Replay::body(prefix, rest),
-                            self.relay_for(&slot, call, head_timeout),
-                        ),
+                    let out = replayed(
+                        parts,
+                        prefix,
+                        rest,
                         self.hold(permit, Some(guard)),
-                    ));
-                    *out.status_mut() = parts.status;
-                    *out.headers_mut() = upstream::relay_headers(&parts.headers);
+                        self.relay_for(&slot, call, head_timeout),
+                    );
                     return self.answered(out, &slot, tried.len());
                 }
                 // The connection broke while the body was read.
@@ -1010,7 +1034,7 @@ impl ChainApiCtx {
             };
             let buffered = Buffered {
                 status,
-                headers: upstream::relay_headers(&parts.headers),
+                headers: upstream::relay_headers_owned(parts.headers),
                 body: bytes,
             };
             match classify(
@@ -1082,18 +1106,10 @@ impl ChainApiCtx {
         Relay {
             stall,
             max_bytes: (max > 0).then_some(max),
-            listener: self
-                .listener
-                .clone()
-                .unwrap_or_else(|| Arc::from("default")),
+            listener: self.listener_label.clone(),
             server: slot.name.clone(),
             api: slot.base.clone(),
-            path: call
-                .target
-                .split('?')
-                .next()
-                .unwrap_or_default()
-                .to_string(),
+            target: call.target.clone(),
         }
     }
 
@@ -1116,7 +1132,7 @@ impl ChainApiCtx {
                     listener = %relay.listener,
                     server = %relay.server,
                     api = %relay.api,
-                    path = %relay.path,
+                    path = %relay.path(),
                     length,
                     max_bytes = max,
                     "chain API upstream answer is longer than max_response_bytes; answering 502"

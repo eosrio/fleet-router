@@ -641,10 +641,13 @@ async fn unframed_api(chunks: usize) -> String {
         while let Ok((stream, _)) = listener.accept().await {
             let service = service_fn(move |request: Request<Incoming>| async move {
                 let mut response = match request.uri().path() {
-                    "/v1/chain/get_info" => Response::new(full(format!(
-                        r#"{{"chain_id":"{}","head_block_num":1000,"last_irreversible_block_num":990,"earliest_available_block_num":1}}"#,
-                        "5a".repeat(32)
-                    ))),
+                    "/v1/chain/get_info" => Response::new(
+                        full(format!(
+                            r#"{{"chain_id":"{}","head_block_num":1000,"last_irreversible_block_num":990,"earliest_available_block_num":1}}"#,
+                            "5a".repeat(32)
+                        ))
+                        .boxed_unsync(),
+                    ),
                     "/v1/chain/get_account" => {
                         let chunk = Bytes::from(vec![b'x'; 64 * 1024]);
                         let body =
@@ -653,7 +656,7 @@ async fn unframed_api(chunks: usize) -> String {
                             }));
                         Response::new(StreamBody::new(body).boxed_unsync())
                     }
-                    _ => router_error(RouterError::NotFound),
+                    _ => router_error(RouterError::NotFound).map(|b| b.boxed_unsync()),
                 };
                 response
                     .headers_mut()
@@ -824,17 +827,20 @@ async fn stalling_api() -> String {
         while let Ok((stream, _)) = listener.accept().await {
             let service = service_fn(|request: Request<Incoming>| async move {
                 let mut response = match request.uri().path() {
-                    "/v1/chain/get_info" => Response::new(full(format!(
-                        r#"{{"chain_id":"{}","head_block_num":1000,"last_irreversible_block_num":990,"earliest_available_block_num":1}}"#,
-                        "5a".repeat(32)
-                    ))),
+                    "/v1/chain/get_info" => Response::new(
+                        full(format!(
+                            r#"{{"chain_id":"{}","head_block_num":1000,"last_irreversible_block_num":990,"earliest_available_block_num":1}}"#,
+                            "5a".repeat(32)
+                        ))
+                        .boxed_unsync(),
+                    ),
                     "/v1/chain/get_account" => {
                         let first: Result<Frame<Bytes>, upstream::BoxError> =
                             Ok(Frame::data(Bytes::from_static(br#"{"account_name":"#)));
                         let body = stream::iter([first]).chain(stream::pending());
                         Response::new(StreamBody::new(body).boxed_unsync())
                     }
-                    _ => router_error(RouterError::NotFound),
+                    _ => router_error(RouterError::NotFound).map(|b| b.boxed_unsync()),
                 };
                 response
                     .headers_mut()

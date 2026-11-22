@@ -9,39 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.10.0] - 2026-11-22
 
+### Highlights
+
+`v0.10.0` delivers major throughput, latency, and memory-efficiency improvements
+across the SHiP WebSocket data plane, Chain API HTTP reverse proxy, and control
+plane—while keeping configuration files, wire behavior, metrics, and APIs 100%
+compatible with `0.9.x`.
+
+Measured improvements against `v0.9.1` (release builds):
+
+| Area / Workload | `v0.9.1` | `v0.10.0` | Benefit |
+|---|---:|---:|---|
+| Idle SHiP memory (100 sessions) | `347.9 KiB/sess` | **`29.9 KiB/sess`** | **-91.4%** memory (11.6× smaller) |
+| 6 MiB block spike retention (20 sessions) | `+239.4 MiB` retained (`245.9 MiB` peak) | **`+0.0 MiB`** retained (**`7.1 MiB`** peak) | **No post-spike leak**, **-97.1%** peak heap |
+| Frozen stitched streaming (12–192 KiB blocks) | `323–632 MiB` allocs | **`4.5–9.1 MiB`** allocs | **-97% to -99.3%** allocs, **2.2×–3.1×** CPU efficiency |
+| High-FPS small-block stitched (900 B, 16c) | `100,671 blk/s` | **`146,992 blk/s`** | **+46.0%** throughput, **-99.8%** allocs |
+| Large-block streaming (1.5 MiB, 4c) | `1,327 MiB/s` (`0.359 s` CPU) | **`1,437 MiB/s`** (**`0.203 s`** CPU) | **+8.3%** throughput, **-43.5%** CPU |
+| Handshake / reconnect burst (100 pool conns) | `295 conn/s` (`7,859 allocs/conn`) | **`861–928 conn/s`** (`79 allocs/conn`) | **~3× faster** reconnects, **-99.0%** allocs |
+| Chain API proxy (`get_info` / `get_block_info` / `get_table_rows`) | `27.3–31.4k req/s` (`8,047` reallocs) | **`32.9–35.8k req/s`** (`14–21` reallocs) | **+10–21%** req/s, **-99.8%** reallocs, **-18–43%** CPU |
+| Multi-listener idle overhead (14 listeners, dashboard off) | `574 allocs/s`, `7.78 MiB` heap | **`80 allocs/s`**, **`6.10 MiB`** heap | **-86.1%** idle allocs, **-21.6%** idle heap |
+| Release binary size | `10.49 MiB` | **`8.61 MiB`** | **-18.0%** smaller binary |
+
 ### Changed
 
-- Replace `tungstenite` on the SHiP data plane with a custom zero-copy RFC 6455
-  framer (`FastWs`) that parses frames directly out of a reusable `BytesMut`
-  read buffer and writes headers and payloads via vectored I/O (`write_vectored`),
-  shrinking oversized read buffers back down after 5 seconds of idle time.
-- Eliminate per-frame and per-session hot-path allocations on SHiP streams:
-  peek block headers and patch `head`/`LIB` in place on uniquely owned buffers,
-  share `Rc<SessionConfig>` and `Arc<str>` across sessions, cache validated
-  handshake ABIs and fingerprints (bounded 32-entry LRU), select upstreams in a
-  single pass without intermediate candidate vectors, and shrink `DeliveredRing`
-  initial slab footprint (`82 KiB` → `32 KiB`) with idle shrinkage once LIB
-  catches up.
-- Eliminate per-request heap allocations on the `/v1/chain/*` proxy: replace
-  layered boxed response bodies with an inline `ApiBody` enum (`Full`,
-  `Streamed`, `Prefixed`), parse block-routing hints zero-copy with stack-backed
-  duplicate-key tracking, sanitize upstream `HeaderMap`s in place, and store
-  upstream URL metadata as `Arc<str>`.
-- Gate idle dashboard 1 Hz status sampling and JSON serialization when the
-  dashboard is disabled or no SSE subscribers are connected, and cache the
-  compiled `axum::Router` per configuration generation instead of rebuilding it
-  on every HTTP request.
-- Enable release thin LTO (`lto = "thin"`, `codegen-units = 1`) for faster
-  hot-path execution and smaller release binaries.
-- Remove the unused `chrono` dependency (resolving `RUSTSEC-2026-0543`) and
-  refresh the pinned Docker builder (`rust:1.100-trixie`) and runtime
-  (`debian:trixie-slim`) base images.
+- **SHiP data plane (`FastWs`):** Replace `tungstenite`'s frame codec on
+  post-handshake SHiP sockets with a custom zero-copy RFC 6455 framer that reads
+  into uninitialized `BytesMut` capacity, keeps idle buffers small (`<= 4 KiB`),
+  shrinks reusable `<= 2 MiB` buffers after 2 seconds of idle time, immediately
+  frees dedicated `> 2 MiB` spike buffers on drop, batches small frames
+  (`<= 16 KiB`), and patches 72-byte `head`/`LIB` headers inline via vectored
+  I/O (`write_vectored`) without copying block payloads.
+- **SHiP latency, reconnects, and session loop:** Enable `TCP_NODELAY` on client
+  SHiP sockets (eliminating Nagle/Delayed-ACK stalls on low-window live
+  streams), cache validated handshake ABIs and fingerprints in a bounded
+  32-entry cache, make fleet tip checks lock-free via a monotonic sequence
+  counter and session-local cache, reuse a single lazily re-armed `Sleep` in the
+  session loop, and shrink `DeliveredRing` once LIB catches up after a stall.
+- **Chain API `/v1/chain/*` proxy:** Replace triple-boxed response bodies with
+  an inline `ApiBody` enum (`Full`, `HeldFull`, `Streamed`, `Replay`), skip
+  timer registration on empty request bodies (`get_info`), parse block-routing
+  hints zero-copy with stack-backed duplicate-key detection, stream FNV-1a64 in
+  `rendezvous()`, sanitize upstream `HeaderMap`s in place, and share upstream
+  URL/label metadata via `Arc<str>`.
+- **Control plane & build profile:** Gate idle 1 Hz dashboard sampling and JSON
+  serialization when the dashboard is disabled or has no SSE viewers, cache the
+  compiled `axum::Router` per configuration revision, and enable release thin
+  LTO (`lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`).
+- **Dependencies & Docker images:** Remove the unused `chrono` dependency
+  (resolving `RUSTSEC-2026-0543`) and refresh the pinned Docker builder
+  (`rust:1.100-trixie`) and runtime (`debian:trixie-slim`) base images.
 
 ### Upgrade notes
 
 - Install the new binary or container image and restart the router. Existing
-  0.9.x configuration files, metrics, dashboard API endpoints, and SHiP / Chain
-  API wire behavior remain unchanged.
+  `0.9.x` configuration files, metrics, dashboard API endpoints, and SHiP /
+  Chain API wire behavior remain unchanged.
 
 ## [0.9.1] - 2026-11-16
 

@@ -1,7 +1,7 @@
 # Fleet Router — multi-stage build.
 # aws-lc-rs (upstream wss://) needs the image's C compiler plus CMake.
 # rs_abieos stays on its pure-Rust backend; libclang is not required.
-# rust:1.99-trixie
+# rust:1.100-trixie
 FROM rust:1.100-trixie@sha256:e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31 AS builder
 WORKDIR /build
 RUN apt-get update && \

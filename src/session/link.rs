@@ -14,15 +14,18 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use futures::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, timeout_at, Instant};
+use tokio_tungstenite::tungstenite::client::uri_mode;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::error::{TlsError, UrlError};
+use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::stream::Mode;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{client_async_tls_with_config, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{client_async_with_config, MaybeTlsStream};
 use tracing::Instrument;
 
 use crate::abi::accept_upstream_abi;
@@ -31,7 +34,7 @@ use crate::fleet::{DialFailure, FleetHub, LinkPurpose};
 use crate::models::{ProxyLimits, ResolvedTopology, Role, UpstreamCounters};
 use crate::ship::wire::BlocksRequest;
 use crate::ship::BlockPos;
-use crate::ws_fast::{FastWs, FastWsConfig, WsRole};
+use crate::ws_fast::{FastWs, FastWsConfig, HandshakeTap, WsRole};
 
 use super::client::{ClientSide, RESUME_POSITIONS};
 use super::failover::UpEnd;
@@ -39,7 +42,6 @@ use super::failover::UpEnd;
 /// An upstream WebSocket whose transport reads are timestamped.
 pub(super) type UpstreamStream = MaybeTlsStream<ActivityStream<TcpStream>>;
 pub(super) type UpstreamWs = FastWs<UpstreamStream>;
-type HandshakeWs = WebSocketStream<UpstreamStream>;
 
 /// Upstream picks per connect or failover before the client is closed. A pick
 /// that finds no candidate ends the attempts.
@@ -708,14 +710,20 @@ async fn dial(
     let activity = Arc::new(AtomicU64::new(0));
     let stream = ActivityStream::new(tcp, activity.clone(), epoch);
 
+    // tungstenite only runs the HTTP upgrade. It runs over a tap, so the
+    // frames it read along with the response head (the ABI, as a rule) are
+    // handed to the link's own reader instead of staying in its buffer.
     let mut config = WebSocketConfig::default();
-    // Upstream SHiP links read blocks and write tiny ACKs/requests.
-    config.read_buffer_size = 64 * 1024;
+    config.read_buffer_size = 4 * 1024;
     config.write_buffer_size = 4 * 1024;
     config.max_message_size = Some(limits.max_message_bytes);
     config.max_frame_size = Some(limits.max_message_bytes);
-    let upgrade = client_async_tls_with_config(&*url, stream, Some(config), None);
-    let mut ws = match timeout_at(deadline, upgrade).await {
+    let upgrade = async {
+        let request = (&*url).into_client_request()?;
+        let stream = wrap_upstream(&request, stream).await?;
+        client_async_with_config(request, HandshakeTap::new(stream), Some(config)).await
+    };
+    let ws = match timeout_at(deadline, upgrade).await {
         Ok(Ok((ws, _))) => ws,
         Ok(Err(WsError::Http(response))) if response.status().as_u16() == 503 => {
             return Err(DialError::Busy)
@@ -728,44 +736,95 @@ async fn dial(
         0 => limits.connect_timeout_ms.max(1),
         ms => ms,
     };
-    let abi = match read_first_abi(&mut ws, Duration::from_millis(abi_wait)).await {
-        Ok(abi) => abi,
-        Err(e) => {
-            let _ = ws.close(None).await;
-            return Err(e);
-        }
-    };
-    // Validate on a fresh handle and drop it. The parsed model is not kept.
-    if let Err(e) = accept_upstream_abi(&abi) {
-        let _ = ws.close(None).await;
-        return Err(DialError::AbiInvalid(e.to_string()));
-    }
-    let fast_ws = FastWs::new(
-        ws.into_inner(),
+    let (stream, early) = ws.into_inner().into_parts();
+    let mut ws = FastWs::with_prefix(
+        stream,
         FastWsConfig {
             role: WsRole::Client,
             read_buf_cap: 64 * 1024,
             max_message_size: limits.max_message_bytes,
             max_frame_size: limits.max_message_bytes,
         },
+        &early,
     );
+    let abi = match read_first_abi(&mut ws, Duration::from_millis(abi_wait)).await {
+        Ok(abi) => abi,
+        Err(e) => {
+            let _ = timeout(Duration::from_secs(1), ws.close_quietly_now()).await;
+            return Err(e);
+        }
+    };
+    // Validate on a fresh handle and drop it. The parsed model is not kept.
+    if let Err(e) = accept_upstream_abi(&abi) {
+        let _ = timeout(Duration::from_secs(1), ws.close_quietly_now()).await;
+        return Err(DialError::AbiInvalid(e.to_string()));
+    }
     Ok(Established {
-        ws: fast_ws,
+        ws,
         abi,
         activity,
         guard,
     })
 }
 
+/// TLS for a `wss://` upstream, verified against the OS trust store
+/// (`SSL_CERT_FILE` / `SSL_CERT_DIR` replace it when set); the plain socket
+/// for `ws://`. What tokio-tungstenite's `client_async_tls` does before the
+/// upgrade, done here so that the upgrade can run over a [`HandshakeTap`].
+async fn wrap_upstream(
+    request: &Request,
+    socket: ActivityStream<TcpStream>,
+) -> Result<UpstreamStream, WsError> {
+    if let Mode::Plain = uri_mode(request.uri())? {
+        return Ok(MaybeTlsStream::Plain(socket));
+    }
+    let host = request
+        .uri()
+        .host()
+        .ok_or(WsError::Url(UrlError::NoHostName))?;
+    // rustls expects an IPv6 address without the brackets of the URI.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let rustls_native_certs::CertificateResult { certs, errors, .. } =
+        rustls_native_certs::load_native_certs();
+    if !errors.is_empty() {
+        tracing::warn!(?errors, "native root CA certificate loading errors");
+    }
+    if certs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no native root CA certificates found (errors: {errors:?})"),
+        )
+        .into());
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(certs);
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from(host)
+        .map_err(|_| WsError::Tls(TlsError::InvalidDnsName))?
+        .to_owned();
+    let connected = tokio_rustls::TlsConnector::from(Arc::new(tls))
+        .connect(name, socket)
+        .await?;
+    Ok(MaybeTlsStream::Rustls(connected))
+}
+
 /// Read the upstream's first meaningful frame, which must be the Text ABI.
 /// Leading Ping/Pong control frames are skipped. One deadline covers the
 /// whole read, so a peer that drips control frames cannot extend it.
-async fn read_first_abi(ws: &mut HandshakeWs, wait: Duration) -> Result<String, DialError> {
+async fn read_first_abi(ws: &mut UpstreamWs, wait: Duration) -> Result<String, DialError> {
     let read = async {
         loop {
-            match ws.next().await {
+            match ws.read_message().await {
                 Some(Ok(Message::Text(text))) => return Ok(text.to_string()),
-                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+                Some(Ok(Message::Ping(ping))) => {
+                    let _ = ws.send_pong(&ping).await;
+                }
+                Some(Ok(Message::Pong(_))) => continue,
                 Some(Ok(Message::Binary(_))) => {
                     return Err(DialError::AbiInvalid("binary first frame".to_string()))
                 }
@@ -826,6 +885,15 @@ impl Link {
         }
     }
 
+    /// Answer an upstream control frame: a Pong, or the echo of its Close.
+    /// Bounded like [`Self::ping`].
+    pub async fn reply(&mut self, msg: Message) {
+        let reply = self.ws.send_message(msg);
+        if !matches!(timeout(Duration::from_secs(1), reply).await, Ok(Ok(()))) {
+            tracing::debug!(upstream = %self.endpoint, "control frame reply to upstream not sent");
+        }
+    }
+
     /// Close the socket in the background (Close 1000, at most 1 s) and keep
     /// only the connection slot.
     pub fn close_quietly(self) -> ConnectionGuard {
@@ -873,6 +941,7 @@ mod tests {
     use super::*;
     use crate::models::{build_config_db, build_state_db, ResolvedListener, Server};
     use futures::SinkExt;
+    use futures::StreamExt;
     use tokio::net::TcpListener;
 
     const ABI: &str = include_str!("../../mock-ship/src/ship_abi.json");

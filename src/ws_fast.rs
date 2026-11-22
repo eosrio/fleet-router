@@ -46,6 +46,8 @@ const SMALL_COALESCE_THRESHOLD: usize = 16 * 1024;
 /// on drop.
 const MAX_REUSABLE_READ_CAP: usize = 2 * 1024 * 1024;
 const LARGE_BUF_IDLE_SHRINK: Duration = Duration::from_secs(2);
+/// Bytes of masking keys drawn from the CSPRNG at once (64 keys).
+const MASK_POOL_LEN: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WsRole {
@@ -71,7 +73,7 @@ struct FrameHdr {
     hdr_len: usize,
 }
 
-/// Generate a non-zero per-connection initial masking seed without syscalls.
+/// A non-zero per-connection seed for the fallback masking sequence.
 fn initial_mask_seed() -> u32 {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -106,8 +108,13 @@ pub struct FastWs<S> {
     /// Reassembly state for fragmented data messages (`FIN = 0`).
     frag_opcode: Option<u8>,
     frag_buf: Vec<u8>,
-    /// Per-connection masking PRNG state (xorshift32) for `Client` frames.
+    /// Fallback masking state (xorshift32), used only if the CSPRNG fails.
     mask_state: u32,
+    /// Masking keys for `Client` frames, drawn from the CSPRNG in batches
+    /// (RFC 6455 section 5.3: keys must not be predictable).
+    mask_pool: [u8; MASK_POOL_LEN],
+    /// Next unused byte of `mask_pool`; `MASK_POOL_LEN` when it is used up.
+    mask_pos: usize,
 }
 
 impl<S> FastWs<S>
@@ -129,11 +136,40 @@ where
             frag_opcode: None,
             frag_buf: Vec::new(),
             mask_state: initial_mask_seed(),
+            mask_pool: [0; MASK_POOL_LEN],
+            mask_pos: MASK_POOL_LEN,
         }
+    }
+
+    /// Like [`Self::new`], with `prefix` as the first bytes read: what the
+    /// upgrade handshake read from `stream` past the HTTP head.
+    pub fn with_prefix(stream: S, cfg: FastWsConfig, prefix: &[u8]) -> Self {
+        let mut ws = Self::new(stream, cfg);
+        ws.in_buf.extend_from_slice(prefix);
+        ws
     }
 
     #[inline]
     fn next_mask(&mut self) -> [u8; 4] {
+        if self.mask_pos + 4 > MASK_POOL_LEN {
+            let random = rustls::crypto::aws_lc_rs::default_provider().secure_random;
+            if random.fill(&mut self.mask_pool).is_err() {
+                return self.fallback_mask();
+            }
+            self.mask_pos = 0;
+        }
+        let at = self.mask_pos;
+        self.mask_pos += 4;
+        [
+            self.mask_pool[at],
+            self.mask_pool[at + 1],
+            self.mask_pool[at + 2],
+            self.mask_pool[at + 3],
+        ]
+    }
+
+    /// A xorshift32 key, for when the CSPRNG reports a failure.
+    fn fallback_mask(&mut self) -> [u8; 4] {
         let mut x = self.mask_state;
         x ^= x << 13;
         x ^= x >> 17;
@@ -168,8 +204,11 @@ where
         if self.shrink_at.is_some_and(|at| now >= at) {
             if self.in_buf.is_empty() {
                 self.in_buf = BytesMut::with_capacity(self.cfg.read_buf_cap);
+                self.shrink_at = None;
+            } else {
+                // Part of a frame is buffered: try again once it is read.
+                self.shrink_at = Some(now + LARGE_BUF_IDLE_SHRINK);
             }
-            self.shrink_at = None;
         }
     }
 
@@ -581,6 +620,65 @@ where
             })))
             .await;
         let _ = self.stream.shutdown().await;
+    }
+}
+
+/// A stream that keeps a copy of every byte read through it. The upgrade
+/// handshake runs over it, so what the handshake read past the HTTP head can
+/// be handed to [`FastWs::with_prefix`] instead of being lost.
+pub struct HandshakeTap<S> {
+    inner: S,
+    seen: Vec<u8>,
+}
+
+impl<S> HandshakeTap<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            seen: Vec::new(),
+        }
+    }
+
+    /// The stream, and the bytes read after the end of the HTTP head.
+    pub fn into_parts(self) -> (S, Vec<u8>) {
+        let mut seen = self.seen;
+        let rest = match seen.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(end) => seen.split_off(end + 4),
+            None => Vec::new(),
+        };
+        (self.inner, rest)
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for HandshakeTap<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
+        this.seen.extend_from_slice(&buf.filled()[before..]);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for HandshakeTap<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
@@ -1032,6 +1130,67 @@ mod tests {
         assert!(client.shrink_deadline().is_none());
         client.in_buf.reserve(1);
         assert!(client.in_buf.capacity() <= client.cfg.read_buf_cap);
+    }
+
+    #[tokio::test]
+    async fn bytes_read_past_the_http_head_reach_the_first_read() {
+        let (mut tx, rx) = duplex(4096);
+        let mut wire_bytes =
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n".to_vec();
+        // A whole Ping and the start of a Text frame, in the same read.
+        let rest_sent = [&[0x89, 2][..], b"pi", &[0x81, 5], b"he"].concat();
+        wire_bytes.extend_from_slice(&rest_sent);
+        tx.write_all(&wire_bytes).await.unwrap();
+
+        let mut tap = HandshakeTap::new(rx);
+        let mut head = vec![0u8; wire_bytes.len()];
+        tap.read_exact(&mut head).await.unwrap();
+        let (rx, rest) = tap.into_parts();
+        assert_eq!(rest, rest_sent);
+
+        let mut client = FastWs::with_prefix(rx, cfg(WsRole::Client, 1024), &rest);
+        assert_eq!(
+            client.read_message().await.unwrap().unwrap(),
+            Message::Ping(Bytes::from_static(b"pi"))
+        );
+        tx.write_all(b"llo").await.unwrap();
+        assert_eq!(
+            client.read_message().await.unwrap().unwrap(),
+            Message::Text("hello".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn client_masking_keys_differ_and_frames_still_unmask() {
+        let (a, b) = duplex(64 * 1024);
+        let mut server = FastWs::new(a, cfg(WsRole::Server, 1 << 20));
+        let mut client = FastWs::new(b, cfg(WsRole::Client, 1 << 20));
+        let keys: Vec<[u8; 4]> = (0..100).map(|_| client.next_mask()).collect();
+        let distinct: std::collections::HashSet<_> = keys.iter().collect();
+        assert!(
+            distinct.len() > 90,
+            "masking keys repeat: {}",
+            distinct.len()
+        );
+        client.send_binary_slice(b"masked payload").await.unwrap();
+        assert_eq!(
+            server.read_message().await.unwrap().unwrap(),
+            Message::Binary(Bytes::from_static(b"masked payload"))
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_shrink_waits_while_part_of_a_frame_is_buffered() {
+        let (_tx, rx) = duplex(1024);
+        let mut client = FastWs::new(rx, cfg(WsRole::Client, 1024));
+        let now = Instant::now();
+        client.shrink_at = Some(now);
+        client.in_buf.extend_from_slice(&[0x82]);
+        client.shrink_if_idle(now);
+        assert_eq!(client.shrink_deadline(), Some(now + LARGE_BUF_IDLE_SHRINK));
+        client.in_buf.clear();
+        client.shrink_if_idle(now + LARGE_BUF_IDLE_SHRINK);
+        assert!(client.shrink_deadline().is_none());
     }
 
     #[tokio::test]

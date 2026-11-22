@@ -56,6 +56,10 @@ tokio = { version = "1.37.0", features = ["full"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "aws-lc-rs"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+# The OS trust store for `wss://` upstreams. Already in the tree through
+# tokio-tungstenite, which no longer sets up that TLS itself: the upgrade
+# runs over a tap that keeps what it reads past the HTTP head.
+rustls-native-certs = "0.8"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
@@ -71,4 +75,5 @@ serde_json = "1"
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
+# Keeps function names, so a release backtrace is readable.
+strip = "debuginfo"

@@ -94,7 +94,7 @@ use crate::ship::wire::{self, BlocksRequest, ClientMsg, DecodeError, ResultHead,
 use crate::ship::BlockPos;
 use crate::telemetry::{self, Event, EventKind, Level, SessionRegistration};
 use crate::tls::{ClientStream, TlsAcceptorHandle};
-use crate::ws_fast::{FastWs, FastWsConfig, WsRole};
+use crate::ws_fast::{FastWs, FastWsConfig, HandshakeTap, WsRole};
 
 use client::{
     commit, head_lib_for, judge, request_is_empty, ClientSide, Forward, Judgement, Lacks,
@@ -410,7 +410,9 @@ async fn accept_client(
     client_config.max_message_size = Some(limits.max_client_message_bytes);
     client_config.max_frame_size = Some(limits.max_client_message_bytes);
 
-    let accept_fut = accept_async_with_config(stream, Some(client_config));
+    // The upgrade runs over a tap: a client frame read along with the
+    // request head is handed to the session's reader, not dropped.
+    let accept_fut = accept_async_with_config(HandshakeTap::new(stream), Some(client_config));
     let ws = if limits.handshake_timeout_ms > 0 {
         match timeout(
             Duration::from_millis(limits.handshake_timeout_ms),
@@ -437,14 +439,16 @@ async fn accept_client(
             }
         }
     };
-    Some(FastWs::new(
-        ws.into_inner(),
+    let (stream, early) = ws.into_inner().into_parts();
+    Some(FastWs::with_prefix(
+        stream,
         FastWsConfig {
             role: WsRole::Server,
             read_buf_cap: 4 * 1024,
             max_message_size: limits.max_client_message_bytes,
             max_frame_size: limits.max_client_message_bytes,
         },
+        &early,
     ))
 }
 
@@ -1632,11 +1636,11 @@ impl Session {
             // follows is a clean failover.
             Message::Close(frame) => {
                 link.st.close_code = Some(frame.as_ref().map_or(1005, |f| u16::from(f.code)));
-                let _ = link.ws.send_message(Message::Close(frame)).await;
+                link.reply(Message::Close(frame)).await;
                 Flow::Continue
             }
             Message::Ping(p) => {
-                let _ = link.ws.send_pong(&p).await;
+                link.reply(Message::Pong(p)).await;
                 Flow::Continue
             }
             Message::Text(_) | Message::Pong(_) | Message::Frame(_) => Flow::Continue,
@@ -2010,8 +2014,9 @@ impl Session {
         let first = link.st.first_result_pending;
         let leg = link.st.req.as_ref().map(|r| (r.end, r.clamped));
         commit(&mut self.c, &mut link.st, &h, &fw);
-        // Reuse ActivityStream's read timestamp instead of an extra clock read.
-        link.st.became_owed_at = self.epoch + Duration::from_millis(link.read_ms());
+        // After the client write: the time a slow client took to accept the
+        // frame is not upstream silence.
+        link.st.became_owed_at = Instant::now();
         if fw.cls.kind == ResultKind::KeepAlive {
             self.ctx
                 .hub

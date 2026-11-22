@@ -418,7 +418,7 @@ fn upstream_view(
 }
 
 async fn listener_view(ctx: &ListenerContext, now: Instant, sessions: usize) -> ListenerView {
-    let configs = ctx.config_db.lock().await;
+    let configs = ctx.config_db.lock().await.clone();
     let mut db = ctx.health.state_db.lock().await;
     let mut upstreams = Vec::with_capacity(db.len());
     for endpoint in &ctx.order {
@@ -433,7 +433,6 @@ async fn listener_view(ctx: &ListenerContext, now: Instant, sessions: usize) -> 
         }
     }
     drop(db);
-    drop(configs);
     // The verdict of `/ready`: a stitched listener needs a live upstream.
     let ready = crate::health::tip_ready(&ctx.health).await;
     ListenerView {

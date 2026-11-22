@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-22
+
+### Changed
+
+- Replace `tungstenite` on the SHiP data plane with a custom zero-copy RFC 6455
+  framer (`FastWs`) that parses frames directly out of a reusable `BytesMut`
+  read buffer and writes headers and payloads via vectored I/O (`write_vectored`),
+  shrinking oversized read buffers back down after 5 seconds of idle time.
+- Eliminate per-frame and per-session hot-path allocations on SHiP streams:
+  peek block headers and patch `head`/`LIB` in place on uniquely owned buffers,
+  share `Rc<SessionConfig>` and `Arc<str>` across sessions, cache validated
+  handshake ABIs and fingerprints (bounded 32-entry LRU), select upstreams in a
+  single pass without intermediate candidate vectors, and shrink `DeliveredRing`
+  initial slab footprint (`82 KiB` → `32 KiB`) with idle shrinkage once LIB
+  catches up.
+- Eliminate per-request heap allocations on the `/v1/chain/*` proxy: replace
+  layered boxed response bodies with an inline `ApiBody` enum (`Full`,
+  `Streamed`, `Prefixed`), parse block-routing hints zero-copy with stack-backed
+  duplicate-key tracking, sanitize upstream `HeaderMap`s in place, and store
+  upstream URL metadata as `Arc<str>`.
+- Gate idle dashboard 1 Hz status sampling and JSON serialization when the
+  dashboard is disabled or no SSE subscribers are connected, and cache the
+  compiled `axum::Router` per configuration generation instead of rebuilding it
+  on every HTTP request.
+- Enable release thin LTO (`lto = "thin"`, `codegen-units = 1`) for faster
+  hot-path execution and smaller release binaries.
+- Remove the unused `chrono` dependency (resolving `RUSTSEC-2026-0543`) and
+  refresh the pinned Docker builder (`rust:1.100-trixie`) and runtime
+  (`debian:trixie-slim`) base images.
+
+### Upgrade notes
+
+- Install the new binary or container image and restart the router. Existing
+  0.9.x configuration files, metrics, dashboard API endpoints, and SHiP / Chain
+  API wire behavior remain unchanged.
+
 ## [0.9.1] - 2026-11-16
 
 ### Changed
@@ -746,7 +782,8 @@ First public release on crates.io and GitHub.
 - Upstream handshake now skips leading control frames and retries against
   another upstream instead of dropping the client on an unexpected first frame.
 
-[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/eosrio/fleet-router/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/eosrio/fleet-router/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/eosrio/fleet-router/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/eosrio/fleet-router/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/eosrio/fleet-router/compare/v0.8.0...v0.8.1

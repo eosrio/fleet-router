@@ -2,7 +2,7 @@
 # aws-lc-rs (upstream wss://) needs the image's C compiler plus CMake.
 # rs_abieos stays on its pure-Rust backend; libclang is not required.
 # rust:1.100-trixie
-FROM rust:1.100-trixie@sha256:e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31 AS builder
+FROM rust:1.100-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS builder
 WORKDIR /build
 RUN apt-get update && \
     apt-get install -y --no-install-recommends cmake && \
